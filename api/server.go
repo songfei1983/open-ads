@@ -12,9 +12,11 @@ import (
 	"github.com/uptrace/opentelemetry-go-extra/otelzap"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/labstack/echo/otelecho"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 )
 
@@ -52,6 +54,7 @@ func getUser(c echo.Context) error {
 	defer span.End()
 	id := c.Param("id")
 	Logger(ctx).Info("getUser", zap.String("id", id))
+	span.AddEvent("getUser", trace.WithAttributes(attribute.String("id", id)))
 	return c.String(http.StatusOK, id)
 }
 
@@ -59,6 +62,7 @@ func saveUser(c echo.Context) error {
 	ctx, span := tracer.Start(c.Request().Context(), "saveUser")
 	defer span.End()
 	Logger(ctx).Info("saveUser")
+	span.AddEvent("saveUser")
 	return c.NoContent(http.StatusCreated)
 }
 
@@ -67,6 +71,7 @@ func updateUser(c echo.Context) error {
 	defer span.End()
 	id := c.Param("id")
 	Logger(ctx).Info("updateUser", zap.String("id", id))
+	span.AddEvent("updateUser", trace.WithAttributes(attribute.String("id", id)))
 	return c.String(http.StatusOK, id)
 }
 
@@ -75,6 +80,7 @@ func deleteUser(c echo.Context) error {
 	defer span.End()
 	id := c.Param("id")
 	Logger(ctx).Info("deleteUser", zap.String("id", id))
+	span.AddEvent("deleteUser", trace.WithAttributes(attribute.String("id", id)))
 	return c.String(http.StatusOK, id)
 }
 
