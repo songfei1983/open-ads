@@ -46,7 +46,7 @@ func main() {
 	e.GET("/users/:id", getUser)
 	e.PUT("/users/:id", updateUser)
 	e.DELETE("/users/:id", deleteUser)
-	e.Logger.Fatal(e.Start(":8000"))
+	e.Logger.Fatal(e.Start(":80"))
 }
 
 func getUser(c echo.Context) error {

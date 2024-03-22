@@ -1,0 +1,20 @@
+_format_version: "1.1"
+
+services:
+  - name: example_service
+    url: http://api/users
+    routes:
+      - name: users
+        paths:
+          - /users
+    plugins:
+      - name: rate-limiting
+        config:
+          second: 5
+          hour: 10000
+          policy: local
+      - name: opentelemetry
+        config:
+          endpoint: http://otel-collector:4318/v1/traces
+          resource_attributes:
+            service.name: kong-dev-users
