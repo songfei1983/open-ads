@@ -28,11 +28,11 @@ services:
       - COLLECTOR_ZIPKIN_HOST_PORT=:9411
       - COLLECTOR_OTLP_ENABLED=true
   # Zipkin
-  zipkin:
-    image: openzipkin/zipkin:latest
-    restart: always
-    ports:
-      - "9411:9411"
+  # zipkin:
+  #   image: openzipkin/zipkin:latest
+  #   restart: always
+  #   ports:
+  #     - "9411:9411"
   # Collector
   otel-collector:
     image: otel/opentelemetry-collector:0.67.0
@@ -46,7 +46,7 @@ services:
       - "55679:55679"
     depends_on:
       - jaeger
-      - zipkin
+      # - zipkin
 
   kong:
     image: kong:latest

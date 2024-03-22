@@ -10,10 +10,10 @@ processors:
 exporters:
  logging:
    loglevel: debug
- zipkin:
-   endpoint: "http://zipkin:9411/api/v2/spans"
-   tls:
-     insecure: true
+#  zipkin:
+#    endpoint: "http://zipkin:9411/api/v2/spans"
+#    tls:
+#      insecure: true
  jaeger:
     endpoint: jaeger:14250
     tls:
@@ -24,4 +24,4 @@ service:
    traces:
      receivers: [otlp]
      processors: [batch]
-     exporters: [logging, jaeger, zipkin]
+     exporters: [logging, jaeger]
