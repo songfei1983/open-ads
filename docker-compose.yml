@@ -49,7 +49,7 @@ services:
       - zipkin
 
   kong:
-    build: ./kong
+    image: kong:latest
     container_name: dbless_kong
     restart: always
     environment:
@@ -59,6 +59,12 @@ services:
       KONG_ADMIN_ERROR_LOG: /dev/stderr
       KONG_ADMIN_LISTEN: 0.0.0.0:8001
       KONG_ADMIN_GUI_LISTEN: 0.0.0.0:8002
+      KONG_DATABASE: off
+      KONG_DECLARATIVE_CONFIG: /kong/declarative/kong.yaml
+      KONG_TRACING_INSTRUMENTATIONS: all
+      KONG_TRACING_SAMPLING_RATE: 1.0
+    volumes:
+      - ./kong/kong.yml:/kong/declarative/kong.yaml
     ports:
       - "8000:8000"
       - "8001:8001"
