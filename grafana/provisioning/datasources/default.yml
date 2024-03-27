@@ -1,0 +1,7 @@
+apiVersion: 1
+
+datasources:
+  - name: kong
+    type: prometheus
+    url: http://prometheus:9090
+    editable: true
