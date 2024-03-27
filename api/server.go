@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/labstack/echo-contrib/echoprometheus"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/uptrace/opentelemetry-go-extra/otelzap"
@@ -38,50 +39,26 @@ func main() {
 	e.Use(middleware.Recover())
 	e.Use(middleware.RequestID())
 	e.Use(otelecho.Middleware("open-ads-api", otelecho.WithTracerProvider(tp)))
-	e.GET("/", func(c echo.Context) error {
-		return c.String(http.StatusOK, "Hello, World!")
-	})
-
-	e.POST("/users", saveUser)
+	e.Use(echoprometheus.NewMiddleware("openadsapi")) // adds middleware to gather metrics
+	e.GET("/metrics", echoprometheus.NewHandler())    // adds route to serve gathered metrics
+	e.GET("/users", listUser)
 	e.GET("/users/:id", getUser)
-	e.PUT("/users/:id", updateUser)
-	e.DELETE("/users/:id", deleteUser)
 	e.Logger.Fatal(e.Start(":80"))
 }
 
 func getUser(c echo.Context) error {
-	ctx, span := tracer.Start(c.Request().Context(), "getUser")
+	_, span := tracer.Start(c.Request().Context(), "getUser")
 	defer span.End()
 	id := c.Param("id")
-	Logger(ctx).Info("getUser", zap.String("id", id))
 	span.AddEvent("getUser", trace.WithAttributes(attribute.String("id", id)))
 	return c.String(http.StatusOK, id)
 }
 
-func saveUser(c echo.Context) error {
-	ctx, span := tracer.Start(c.Request().Context(), "saveUser")
+func listUser(c echo.Context) error {
+	_, span := tracer.Start(c.Request().Context(), "saveUser")
 	defer span.End()
-	Logger(ctx).Info("saveUser")
-	span.AddEvent("saveUser")
+	span.AddEvent("listUser")
 	return c.NoContent(http.StatusCreated)
-}
-
-func updateUser(c echo.Context) error {
-	ctx, span := tracer.Start(c.Request().Context(), "updateUser")
-	defer span.End()
-	id := c.Param("id")
-	Logger(ctx).Info("updateUser", zap.String("id", id))
-	span.AddEvent("updateUser", trace.WithAttributes(attribute.String("id", id)))
-	return c.String(http.StatusOK, id)
-}
-
-func deleteUser(c echo.Context) error {
-	ctx, span := tracer.Start(c.Request().Context(), "deleteUser")
-	defer span.End()
-	id := c.Param("id")
-	Logger(ctx).Info("deleteUser", zap.String("id", id))
-	span.AddEvent("deleteUser", trace.WithAttributes(attribute.String("id", id)))
-	return c.String(http.StatusOK, id)
 }
 
 func initTracer() (*sdktrace.TracerProvider, error) {
