@@ -39,8 +39,8 @@ func main() {
 	e.Use(middleware.Recover())
 	e.Use(middleware.RequestID())
 	e.Use(otelecho.Middleware("open-ads-api", otelecho.WithTracerProvider(tp)))
-	e.Use(echoprometheus.NewMiddleware("openadsapi")) // adds middleware to gather metrics
-	e.GET("/metrics", echoprometheus.NewHandler())    // adds route to serve gathered metrics
+	e.Use(echoprometheus.NewMiddleware("echo"))    // adds middleware to gather metrics
+	e.GET("/metrics", echoprometheus.NewHandler()) // adds route to serve gathered metrics
 	e.GET("/users", listUser)
 	e.GET("/users/:id", getUser)
 	e.Logger.Fatal(e.Start(":80"))
