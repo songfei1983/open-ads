@@ -10,10 +10,10 @@ processors:
 exporters:
   logging:
     loglevel: debug
-  jaeger:
-     endpoint: jaeger:14250
-     tls:
-       insecure: true
+  otlp:
+    endpoint: http://jaeger:4317
+    tls:
+      insecure: true
   prometheus:
     endpoint: "0.0.0.0:8889"
     const_labels:
@@ -24,4 +24,4 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [logging, jaeger]
+      exporters: [logging, otlp]

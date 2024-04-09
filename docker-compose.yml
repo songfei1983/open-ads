@@ -48,6 +48,8 @@ services:
       - "16686:16686"
       - "14250:14250"
       - "14268:14268"
+    volumes:
+      - jaeger-data-tmp:/tmp
     environment:
       - COLLECTOR_ZIPKIN_HOST_PORT=:9411
       - COLLECTOR_OTLP_ENABLED=true
@@ -88,5 +90,14 @@ services:
     links:
       - prometheus:prometheus
 
+  redis:
+    image: "redis:latest"
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
 volumes:
   prometheus-data: {}
+  redis-data: {}
+  jaeger-data-tmp: {}
