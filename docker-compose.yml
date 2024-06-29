@@ -97,7 +97,23 @@ services:
     volumes:
       - redis-data:/data
 
+  mysql:
+    image: mysql:latest
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql/my.cnf:/etc/mysql/conf.d/my.cnf
+      - ./mysql/sql:/docker-entrypoint-initdb.d
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: openads
+      MYSQL_USER: user
+      MYSQL_PASSWORD: user
+    restart: always
+
 volumes:
   prometheus-data: {}
   redis-data: {}
+  mysql-data: {}
   jaeger-data-tmp: {}
