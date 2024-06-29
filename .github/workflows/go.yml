@@ -21,10 +21,14 @@ jobs:
       with:
         go-version: '1.22'
 
-    - name: Build
-      run: go build -v ./...
-      working-directory: ./api
+    - name: Build api
+      run: go build -v ./cmd/api
+
+    - name: Build ad
+      run: go build -v ./cmd/ad
+
+    - name: Build dataflow
+      run: go build -v ./cmd/dataflow
 
     - name: Test
       run: go test -v ./...
-      working-directory: ./api
