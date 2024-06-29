@@ -32,7 +32,10 @@ func main() {
 	defer c.Close()
 
 	topic := KafkaTopic
-	c.SubscribeTopics([]string{topic}, nil)
+	err = c.SubscribeTopics([]string{topic}, nil)
+	if err != nil {
+		panic(err)
+	}
 
 	for {
 		msg, err := c.ReadMessage(-1)
