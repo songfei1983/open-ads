@@ -1,16 +1,16 @@
 version: "3"
 
 services:
-  api:
-    build:
-      context: ./api
-    ports:
-      - 1323:80
-    environment:
-      - EXPORTER_ENDPOINT=otel-collector:4318
-      - OTEL_SERVICE_NAME="open-ads-api"
-    depends_on:
-      - otel-collector
+  # api:
+  #   build:
+  #     context: ./api
+  #   ports:
+  #     - 1323:80
+  #   environment:
+  #     - EXPORTER_ENDPOINT=otel-collector:4318
+  #     - OTEL_SERVICE_NAME="open-ads-api"
+  #   depends_on:
+  #     - otel-collector
 
   kong:
     image: kong:latest
@@ -28,7 +28,7 @@ services:
       KONG_TRACING_INSTRUMENTATIONS: all
       KONG_TRACING_SAMPLING_RATE: 1.0
     volumes:
-      - ./kong/kong.yml:/kong/declarative/kong.yaml
+      - ./deployments/kong/kong.yml:/kong/declarative/kong.yaml
     ports:
       - "8000:8000"
       - "8001:8001"
@@ -39,7 +39,7 @@ services:
       - "8444:8444"
       - "8445:8445"
     depends_on:
-      - api
+      # - api
       - otel-collector
 
   jaeger:
@@ -59,7 +59,7 @@ services:
     restart: always
     command: ["--config=/etc/otel-collector-config.yaml", ""]
     volumes:
-      - ./otel-collector/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+      - ./deployments/otel-collector/otel-collector-config.yaml:/etc/otel-collector-config.yaml
     ports:
       - "4317:4317" # OTLP gRPC receiver
       - "4318:4318"
@@ -73,18 +73,18 @@ services:
     ports:
       - 9090:9090
     links:
-      - api:api
+      # - api:api
       - kong:kong
     volumes:
-     - './prometheus/prometheus.yml:/etc/prometheus/prometheus.yml'
+     - './deployments/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml'
      - 'prometheus-data:/prometheus'
 
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
     volumes:
-      - ./grafana/grafana.ini:/etc/grafana/grafana.ini
-      - ./grafana/provisioning/:/etc/grafana/provisioning/
+      - ./deployments/grafana/grafana.ini:/etc/grafana/grafana.ini
+      - ./deployments/grafana/provisioning/:/etc/grafana/provisioning/
     ports:
       - 3000:3000
     links:
@@ -103,8 +103,8 @@ services:
       - "3306:3306"
     volumes:
       - mysql-data:/var/lib/mysql
-      - ./mysql/my.cnf:/etc/mysql/conf.d/my.cnf
-      - ./mysql/sql:/docker-entrypoint-initdb.d
+      - ./deployments/mysql/my.cnf:/etc/mysql/conf.d/my.cnf
+      - ./deployments/mysql/sql:/docker-entrypoint-initdb.d
     environment:
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: openads
