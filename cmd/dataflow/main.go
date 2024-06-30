@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/confluentinc/confluent-kafka-go/kafka"
+	"github.com/songfei1983/open-ads/internal/model"
 )
 
 const (
@@ -12,13 +13,6 @@ const (
 	KafkaTopic   = "words"
 	KafkaGroupId = "words-service"
 )
-
-type Order struct {
-	ID        string
-	ProductId string
-	UserId    string
-	Amount    int
-}
 
 func main() {
 	c, err := kafka.NewConsumer(&kafka.ConfigMap{
@@ -40,7 +34,7 @@ func main() {
 	for {
 		msg, err := c.ReadMessage(-1)
 		if err == nil {
-			var order Order
+			var order model.Order
 			err := json.Unmarshal(msg.Value, &order)
 			if err != nil {
 				fmt.Printf("Error decoding message: %v\n", err)

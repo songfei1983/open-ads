@@ -5,19 +5,13 @@ import (
 
 	"github.com/confluentinc/confluent-kafka-go/kafka"
 	"github.com/google/uuid"
+	"github.com/songfei1983/open-ads/internal/model"
 )
 
 const (
 	KafkaServer = "localhost:9092"
 	KafkaTopic  = "words"
 )
-
-type Order struct {
-	ID        string
-	ProductId string
-	UserId    string
-	Amount    int
-}
 
 func main() {
 	p, err := kafka.NewProducer(&kafka.ConfigMap{
@@ -29,24 +23,27 @@ func main() {
 	defer p.Close()
 
 	topic := KafkaTopic
-	order := Order{
+	order := model.Order{
 		ID:        uuid.New().String(),
 		ProductId: uuid.New().String(),
 		UserId:    uuid.New().String(),
 		Amount:    456000,
 	}
 
-	value, err := json.Marshal(order)
-	if err != nil {
-		panic(err)
-	}
+	for i := range 100 {
+		order.Amount = i * 100
+		value, err := json.Marshal(order)
+		if err != nil {
+			panic(err)
+		}
 
-	err = p.Produce(&kafka.Message{
-		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
-		Value:          value,
-	}, nil)
+		err = p.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+			Value:          value,
+		}, nil)
 
-	if err != nil {
-		panic(err)
+		if err != nil {
+			panic(err)
+		}
 	}
 }

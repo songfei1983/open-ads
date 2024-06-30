@@ -2,7 +2,7 @@ _format_version: "1.1"
 
 services:
   - name: example_service
-    url: http://api/users
+    url: http://host.docker.internal/users
     routes:
       - name: users
         paths:

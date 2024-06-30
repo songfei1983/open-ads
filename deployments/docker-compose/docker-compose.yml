@@ -14,7 +14,8 @@ services:
 
   kong:
     image: kong:latest
-    container_name: dbless_kong
+    hostname: kong
+    container_name: kong
     restart: always
     environment:
       KONG_PROXY_ACCESS_LOG: /dev/stdout
@@ -28,7 +29,7 @@ services:
       KONG_TRACING_INSTRUMENTATIONS: all
       KONG_TRACING_SAMPLING_RATE: 1.0
     volumes:
-      - ./deployments/kong/kong.yml:/kong/declarative/kong.yaml
+      - ./kong/kong.yml:/kong/declarative/kong.yaml
     ports:
       - "8000:8000"
       - "8001:8001"
@@ -44,6 +45,8 @@ services:
 
   jaeger:
     image: jaegertracing/all-in-one:latest
+    hostname: jaeger
+    container_name: jaeger
     ports:
       - "16686:16686"
       - "14250:14250"
@@ -56,10 +59,12 @@ services:
 
   otel-collector:
     image: otel/opentelemetry-collector:latest
+    hostname: otel-collector
+    container_name: otel-collector
     restart: always
     command: ["--config=/etc/otel-collector-config.yaml", ""]
     volumes:
-      - ./deployments/otel-collector/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+      - ./otel-collector/otel-collector-config.yaml:/etc/otel-collector-config.yaml
     ports:
       - "4317:4317" # OTLP gRPC receiver
       - "4318:4318"
@@ -69,6 +74,7 @@ services:
 
   prometheus:
     image: prom/prometheus:latest
+    hostname: prometheus
     container_name: prometheus
     ports:
       - 9090:9090
@@ -76,15 +82,16 @@ services:
       # - api:api
       - kong:kong
     volumes:
-     - './deployments/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml'
+     - './prometheus/prometheus.yml:/etc/prometheus/prometheus.yml'
      - 'prometheus-data:/prometheus'
 
   grafana:
     image: grafana/grafana:latest
+    hostname: grafana
     container_name: grafana
     volumes:
-      - ./deployments/grafana/grafana.ini:/etc/grafana/grafana.ini
-      - ./deployments/grafana/provisioning/:/etc/grafana/provisioning/
+      - ./grafana/grafana.ini:/etc/grafana/grafana.ini
+      - ./grafana/provisioning/:/etc/grafana/provisioning/
     ports:
       - 3000:3000
     links:
@@ -92,6 +99,8 @@ services:
 
   redis:
     image: "redis:latest"
+    hostname: redis
+    container_name: redis
     ports:
       - "6379:6379"
     volumes:
@@ -99,12 +108,14 @@ services:
 
   mysql:
     image: mysql:latest
+    hostname: mysql
+    container_name: mysql
     ports:
       - "3306:3306"
     volumes:
       - mysql-data:/var/lib/mysql
-      - ./deployments/mysql/my.cnf:/etc/mysql/conf.d/my.cnf
-      - ./deployments/mysql/sql:/docker-entrypoint-initdb.d
+      - ./mysql/my.cnf:/etc/mysql/conf.d/my.cnf
+      - ./mysql/sql:/docker-entrypoint-initdb.d
     environment:
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: openads
