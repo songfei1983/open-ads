@@ -6,6 +6,9 @@ RUNNER=direct-runner
 
 DOCKER_COMPOSE=docker-compose -f ./deployments/docker-compose/docker-compose.yml
 
+setup:
+	./setup.sh
+
 up:
 	$(DOCKER_COMPOSE) up
 

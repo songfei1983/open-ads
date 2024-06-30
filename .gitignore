@@ -61,3 +61,6 @@ go.work.sum
 
 # env file
 .env
+
+deployments/docker-compose/digdag/.digdag/
+*.db

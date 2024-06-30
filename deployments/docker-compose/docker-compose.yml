@@ -159,6 +159,16 @@ services:
     depends_on:
       - zoo1
 
+  digdag:
+    # image: embulk/digdag:latest
+    build:
+      context: ./digdag
+    ports:
+      - "65432:65432"
+    volumes:
+      - ./digdag:/digdag
+    command: ["server", "--config", "/digdag/config.properties", "--bind", "0.0.0.0"]
+
 volumes:
   prometheus-data: {}
   redis-data: {}
