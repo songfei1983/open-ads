@@ -16,22 +16,25 @@ upd:
 	$(DOCKER_COMPOSE) up -d
 
 down:
-	$(DOCKER-COMPOSE) down
+	$(DOCKER_COMPOSE) down
 
 topic:
-	$(DOCKER-COMPOSE) exec kafka1 kafka-topics --create --topic $(TOPIC) --partitions 1 --replication-factor 1 --bootstrap-server $(KAFKA)
+	$(DOCKER_COMPOSE) exec kafka1 kafka-topics --create --topic $(TOPIC) --partitions 1 --replication-factor 1 --bootstrap-server $(KAFKA)
 
 describe:
-	$(DOCKER-COMPOSE) exec kafka1 kafka-topics --describe --topic $(TOPIC) --bootstrap-server $(KAFKA)
+	$(DOCKER_COMPOSE) exec kafka1 kafka-topics --describe --topic $(TOPIC) --bootstrap-server $(KAFKA)
 
 offset:
-	$(DOCKER-COMPOSE) exec kafka1 kafka-run-class kafka.tools.GetOffsetShell --broker-list $(KAFKA) --topic $(TOPIC) --time -1
+	$(DOCKER_COMPOSE) exec kafka1 kafka-run-class kafka.tools.GetOffsetShell --broker-list $(KAFKA) --topic $(TOPIC) --time -1
 
-dump:
-	$(DOCKER-COMPOSE) exec kafka1 kafka-console-consumer --bootstrap-server $(KAFKA) --topic $(TOPIC) --new-consumer --from-beginning --max-messages 5
+pub:
+	$(DOCKER_COMPOSE) exec kafka1 kafka-console-producer --bootstrap-server $(KAFKA) --topic $(TOPIC) --property "parse.key=true" --property "key.separator=:"
+
+sub:
+	$(DOCKER_COMPOSE) exec kafka1 kafka-console-consumer --bootstrap-server $(KAFKA) --topic $(TOPIC) --property "print.key=true" --from-beginning --max-messages 5
 
 clean-docker:
-	$(DOCKER-COMPOSE) rm -f
+	$(DOCKER_COMPOSE) rm -f
 
 clean-files:
 	rm wordcounts*
