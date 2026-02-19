@@ -1,6 +1,6 @@
 module github.com/songfei1983/open-ads
 
-go 1.24.0
+go 1.26
 
 require (
 	github.com/confluentinc/confluent-kafka-go v1.9.2

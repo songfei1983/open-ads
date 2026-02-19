@@ -9,6 +9,16 @@ else
     echo "pre-commit could be found"
 fi
 
+# install golangci-lint if missing, matching CI version
+if ! command -v golangci-lint &> /dev/null
+then
+    echo "installing golangci-lint"
+    curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+        | sh -s -- -b $(go env GOPATH)/bin v1.76.0
+else
+    echo "golangci-lint already installed"
+fi
+
 if ! command -v direnv &> /dev/null
 then
     echo "direnv could not be found"
