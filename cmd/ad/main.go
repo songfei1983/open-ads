@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"os"
@@ -41,13 +42,13 @@ func main() {
 		Amount:    456000,
 	}
 
-	// Handle interrupt signal
-	sigchan := make(chan os.Signal, 1)
-	signal.Notify(sigchan, os.Interrupt)
+	// handle interruption using a context (Go 1.26+ provides NotifyContext)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
 
 	for i := 0; i < 100; i++ {
 		select {
-		case <-sigchan:
+		case <-ctx.Done():
 			return
 		default:
 			order.Amount = i * 100

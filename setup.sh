@@ -9,6 +9,15 @@ else
     echo "pre-commit could be found"
 fi
 
+# install golangci-lint if missing, matching CI version (builds with current Go)
+if ! command -v golangci-lint &> /dev/null
+then
+    echo "installing golangci-lint via go install"
+    go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.61.0
+else
+    echo "golangci-lint already installed"
+fi
+
 if ! command -v direnv &> /dev/null
 then
     echo "direnv could not be found"
