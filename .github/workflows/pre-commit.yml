@@ -10,14 +10,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+
     - uses: actions/setup-python@v5
       with:
         python-version: '3.13'
+
     - uses: actions/setup-go@v5
       with:
         go-version: '1.26'
-    - run: go install golang.org/x/tools/cmd/goimports@latest
-    # build golangci-lint from source so it uses the current Go version (1.26)
-    - run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.61.0
-    - run: echo "PATH=$PATH:/home/runner/go/bin" >> $GITHUB_ENV
+        cache: true # Built-in caching for Go modules
+
+    # Faster: Official action uses pre-compiled binaries and has built-in caching
+    - name: Golangci-lint
+      uses: golangci/golangci-lint-action@v9.2.0
+
+    # goimports is still needed if your pre-commit hook calls it specifically
+    - name: Install tools
+      run: go install golang.org/x/tools/cmd/goimports@latest
+
     - uses: pre-commit/action@v3.0.1
