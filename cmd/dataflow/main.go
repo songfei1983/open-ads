@@ -23,7 +23,11 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer c.Close()
+	defer func() {
+		if cerr := c.Close(); cerr != nil {
+			fmt.Printf("consumer close error: %v\n", cerr)
+		}
+	}()
 
 	topic := KafkaTopic
 	err = c.SubscribeTopics([]string{topic}, nil)

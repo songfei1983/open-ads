@@ -14,11 +14,18 @@ import (
 )
 
 func TestMainKafkaProducer(t *testing.T) {
-	// Set test environment variables
-	os.Setenv("KAFKA_SERVER", "localhost:9092")
-	os.Setenv("KAFKA_TOPIC", "test-topic")
-	defer os.Unsetenv("KAFKA_SERVER")
-	defer os.Unsetenv("KAFKA_TOPIC")
+	// Set test environment variables, ensure errors are handled
+	if err := os.Setenv("KAFKA_SERVER", "localhost:9092"); err != nil {
+		t.Fatalf("failed to set KAFKA_SERVER: %v", err)
+	}
+	if err := os.Setenv("KAFKA_TOPIC", "test-topic"); err != nil {
+		t.Fatalf("failed to set KAFKA_TOPIC: %v", err)
+	}
+	// use t.Cleanup for teardown
+	t.Cleanup(func() {
+		_ = os.Unsetenv("KAFKA_SERVER")
+		_ = os.Unsetenv("KAFKA_TOPIC")
+	})
 
 	// Create test producer
 	p, err := kafka.NewProducer(&kafka.ConfigMap{
@@ -88,6 +95,27 @@ func TestMainOrderSerialization(t *testing.T) {
 	assert.Equal(t, order.ProductId, decodedOrder.ProductId)
 	assert.Equal(t, order.UserId, decodedOrder.UserId)
 	assert.Equal(t, order.Amount, decodedOrder.Amount)
+}
+
+// Fuzz test leveraging Go's built-in fuzzing (supported since 1.18, improved over time)
+func FuzzOrderSerialization(f *testing.F) {
+	// seed with a typical order
+	f.Add("id", "prod", "user", 123)
+
+	f.Fuzz(func(t *testing.T, id, pid, uid string, amount int) {
+		order := model.Order{ID: id, ProductId: pid, UserId: uid, Amount: amount}
+		data, err := json.Marshal(order)
+		if err != nil {
+			t.Skipf("marshal failed: %v", err)
+		}
+		var decoded model.Order
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatalf("unmarshal failed: %v", err)
+		}
+		if decoded != order {
+			t.Errorf("roundtrip mismatch: got %+v, want %+v", decoded, order)
+		}
+	})
 }
 
 func TestMainLoopCounter(t *testing.T) {
