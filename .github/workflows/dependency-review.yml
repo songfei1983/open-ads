@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Harden Runner
         uses: step-security/harden-runner@v2
@@ -40,7 +40,7 @@ jobs:
             api.osv.dev:443
 
       - name: Dependency Review (GitHub Advisory Database)
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
         with:
           comment-summary-in-pr: always
           fail-on-severity: high
@@ -53,7 +53,7 @@ jobs:
           retry-on-snapshot-warnings-timeout: 300
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: '1.26'
           cache: true

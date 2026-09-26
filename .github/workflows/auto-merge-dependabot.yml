@@ -33,7 +33,7 @@ jobs:
     steps:
       - name: Fetch PR metadata
         id: pr-meta
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const prNumber = context.payload.pull_request?.number
@@ -124,7 +124,7 @@ jobs:
 
       - name: Enable Pull Request Auto-Merge
         if: steps.pr-meta.outputs.should_merge == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const prNumber = ${{ steps.pr-meta.outputs.pr_number }};
@@ -198,7 +198,7 @@ jobs:
 
       - name: Approve Dependabot PR
         if: steps.pr-meta.outputs.should_merge == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const prNumber = ${{ steps.pr-meta.outputs.pr_number }};

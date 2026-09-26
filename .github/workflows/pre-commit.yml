@@ -9,20 +9,20 @@ jobs:
   pre-commit:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
-    - uses: actions/setup-python@v5
+    - uses: actions/setup-python@v7
       with:
         python-version: '3.13'
 
-    - uses: actions/setup-go@v5
+    - uses: actions/setup-go@v7
       with:
         go-version: '1.26'
         cache: true # Built-in caching for Go modules
 
     # Faster: Official action uses pre-compiled binaries and has built-in caching
     - name: Golangci-lint
-      uses: golangci/golangci-lint-action@v9.2.0
+      uses: golangci/golangci-lint-action@v9.3.0
 
     # goimports is still needed if your pre-commit hook calls it specifically
     - name: Install tools
