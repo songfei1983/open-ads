@@ -14,41 +14,48 @@ import (
 )
 
 func TestMainKafkaProducer(t *testing.T) {
-	// Set test environment variables, ensure errors are handled
-	if err := os.Setenv("KAFKA_SERVER", "localhost:9092"); err != nil {
-		t.Fatalf("failed to set KAFKA_SERVER: %v", err)
+	kafkaServer := os.Getenv("TEST_KAFKA_SERVER")
+	if kafkaServer == "" {
+		t.Skip("Skipping integration test: TEST_KAFKA_SERVER not set (requires a reachable Kafka broker). " +
+			"Run with TEST_KAFKA_SERVER=host:9092 TEST_KAFKA_TOPIC=test go test -v ./cmd/ad to enable.")
 	}
-	if err := os.Setenv("KAFKA_TOPIC", "test-topic"); err != nil {
-		t.Fatalf("failed to set KAFKA_TOPIC: %v", err)
+	kafkaTopic := os.Getenv("TEST_KAFKA_TOPIC")
+	if kafkaTopic == "" {
+		kafkaTopic = "test-topic"
 	}
-	// use t.Cleanup for teardown
-	t.Cleanup(func() {
-		_ = os.Unsetenv("KAFKA_SERVER")
-		_ = os.Unsetenv("KAFKA_TOPIC")
-	})
 
-	// Create test producer
+	t.Setenv("KAFKA_SERVER", kafkaServer)
+	t.Setenv("KAFKA_TOPIC", kafkaTopic)
+
 	p, err := kafka.NewProducer(&kafka.ConfigMap{
-		"bootstrap.servers": os.Getenv("KAFKA_SERVER"),
-		// Add test-specific configurations
-		"message.timeout.ms": 1000,
+		"bootstrap.servers":        kafkaServer,
+		"message.timeout.ms":       3000,
+		"socket.timeout.ms":        5000,
+		"socket.connection.setup.timeout.ms": 2000,
+		"api.version.request.timeout.ms": 2000,
+		"metadata.request.timeout.ms": 2000,
 	})
-	assert.NoError(t, err)
+	if err != nil {
+		t.Fatalf("failed to create producer: %v", err)
+	}
 	defer p.Close()
 
-	// Test message delivery handler
+	deliveryResults := make(chan error, 1)
 	go func() {
+		defer close(deliveryResults)
 		for e := range p.Events() {
 			switch ev := e.(type) {
 			case *kafka.Message:
 				if ev.TopicPartition.Error != nil {
-					t.Errorf("Delivery failed: %v\n", ev.TopicPartition.Error)
+					deliveryResults <- ev.TopicPartition.Error
+					return
 				}
+				deliveryResults <- nil
+				return
 			}
 		}
 	}()
 
-	// Test order creation
 	testOrder := model.Order{
 		ID:        uuid.New().String(),
 		ProductId: uuid.New().String(),
@@ -56,21 +63,25 @@ func TestMainKafkaProducer(t *testing.T) {
 		Amount:    456000,
 	}
 
-	// Test order serialization
 	orderJSON, err := json.Marshal(testOrder)
 	assert.NoError(t, err)
 
-	// Get KAFKA_TOPIC from environment variable
-	topic := os.Getenv("KAFKA_TOPIC")
-	// Test message production
+	topic := kafkaTopic
 	err = p.Produce(&kafka.Message{
 		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
 		Value:          orderJSON,
 	}, nil)
 	assert.NoError(t, err)
 
-	// Wait for message delivery
-	p.Flush(1000)
+	flushed := p.Flush(5000)
+	assert.Equal(t, 0, flushed, "expected all messages to be flushed (0 remaining)")
+
+	select {
+	case err := <-deliveryResults:
+		assert.NoError(t, err, "Kafka message delivery should succeed")
+	case <-time.After(6 * time.Second):
+		t.Fatal("timed out waiting for Kafka delivery report")
+	}
 }
 
 func TestMainOrderSerialization(t *testing.T) {

@@ -64,3 +64,11 @@ go.work.sum
 
 deployments/docker-compose/digdag/.digdag/
 *.db
+
+# Local Go caches / build artifacts created during manual verification
+.gomodcache-local/
+.gocache-local/
+_build_verify/
+node_modules/
+package-lock.json
+package.json
