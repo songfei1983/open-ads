@@ -1,0 +1,227 @@
+name: Auto-Merge Dependabot PRs
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
+      - unlabeled
+  workflow_run:
+    workflows:
+      - "Go"
+      - "pre-commit"
+    types:
+      - completed
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: auto-merge-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  auto-merge:
+    name: Auto-Merge Dependabot Updates
+    runs-on: ubuntu-latest
+    if: |
+      (github.actor == 'dependabot[bot]' || github.actor == 'dependabot-preview[bot]') &&
+      (github.event_name == 'pull_request' || github.event_name == 'workflow_run')
+    steps:
+      - name: Fetch PR metadata
+        id: pr-meta
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request?.number
+              || context.payload.workflow_run?.pull_requests?.[0]?.number;
+
+            if (!prNumber) {
+              console.log("Could not determine PR number, skipping.");
+              core.setOutput("should_merge", "false");
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            const isDependabot = pr.user.login === 'dependabot[bot]' || pr.user.login === 'dependabot-preview[bot]';
+            const title = pr.title.toLowerCase();
+            const body = pr.body || '';
+            const labels = pr.labels.map(l => l.name);
+
+            if (!isDependabot) {
+              console.log("Not a Dependabot PR, skipping.");
+              core.setOutput("should_merge", "false");
+              return;
+            }
+
+            const isSecurity = title.includes('security') || body.includes('security update') || labels.includes('security');
+
+            let bumpLevel = null;
+            if (body) {
+              const bumpMatch = body.match(/Bumps\s+[\s\S]*?from\s+[\d.]+\s+to\s+([\d.]+)/i)
+                || body.match(/Updates?\s+.*(major|minor|patch)/i);
+              if (body.includes('semver-patch') || /patch/i.test(title)) bumpLevel = 'patch';
+              else if (body.includes('semver-minor') || /minor/i.test(title)) bumpLevel = 'minor';
+              else if (body.includes('semver-major') || /major/i.test(title)) bumpLevel = 'major';
+            }
+
+            if (!bumpLevel) {
+              if (/\b\d+\.\d+\.\d+(?:[-+][\w.]+)?\b/.test(title)) {
+                const versions = title.match(/\b\d+\.\d+\.\d+(?:[-+][\w.]+)?\b/g) || [];
+                if (versions.length >= 2) {
+                  const [from, to] = versions.map(v => v.split('.').map(n => parseInt(n, 10) || 0));
+                  if (from[0] !== to[0]) bumpLevel = 'major';
+                  else if (from[1] !== to[1]) bumpLevel = 'minor';
+                  else bumpLevel = 'patch';
+                }
+              }
+            }
+
+            const ciRequired = ['Go', 'pre-commit'];
+            const { data: checks } = await github.rest.checks.listForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: pr.head.sha,
+            });
+
+            const ciStatus = {};
+            for (const name of ciRequired) {
+              const check = checks.check_runs.find(c => c.name === name);
+              ciStatus[name] = check?.conclusion === 'success' ? 'success' : check?.status === 'completed' ? check.conclusion : 'pending';
+            }
+            const allCiPassed = Object.values(ciStatus).every(s => s === 'success');
+
+            core.setOutput("pr_number", prNumber);
+            core.setOutput("bump_level", bumpLevel || 'unknown');
+            core.setOutput("is_security", String(isSecurity));
+            core.setOutput("ci_passed", String(allCiPassed));
+            core.setOutput("mergeable_state", pr.mergeable_state);
+            core.setOutput("title", pr.title);
+
+            console.log(`PR #${prNumber}: ${pr.title}`);
+            console.log(`Bump level: ${bumpLevel}, Security: ${isSecurity}, CI passed: ${allCiPassed}, Mergeable: ${pr.mergeable_state}`);
+
+            const autoMergeLevels = ['patch', 'minor'];
+            const canAutoMerge = isSecurity || autoMergeLevels.includes(bumpLevel);
+
+            if (canAutoMerge && allCiPassed) {
+              core.setOutput("should_merge", "true");
+            } else if (bumpLevel === 'major') {
+              console.log("Major version update - requires manual review.");
+              core.setOutput("should_merge", "false");
+            } else {
+              console.log("Waiting for CI or conditions not met.");
+              core.setOutput("should_merge", "false");
+            }
+
+      - name: Enable Pull Request Auto-Merge
+        if: steps.pr-meta.outputs.should_merge == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ steps.pr-meta.outputs.pr_number }};
+            if (!prNumber) return;
+            try {
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+
+              if (pr.merged) {
+                console.log("PR already merged.");
+                return;
+              }
+
+              if (pr.mergeable_state === 'dirty') {
+                console.log("PR has merge conflicts, skipping.");
+                return;
+              }
+
+              let merged = false;
+              const methods = ['squash', 'rebase', 'merge'];
+              for (const method of methods) {
+                try {
+                  await github.rest.pulls.merge({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: prNumber,
+                    merge_method: method,
+                    commit_title: pr.title,
+                    commit_message: `Auto-merged by GitHub Actions (${{ steps.pr-meta.outputs.bump_level }} update)`,
+                  });
+                  console.log(`Successfully merged PR #${prNumber} with ${method}.`);
+                  merged = true;
+                  break;
+                } catch (e) {
+                  console.log(`Merge method ${method} failed: ${e.message}`);
+                }
+              }
+
+              if (!merged) {
+                console.log("Auto-merge enabled (will merge when all requirements satisfied).");
+                try {
+                  await github.graphql(`
+                    mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) {
+                      enablePullRequestAutoMerge(input: {
+                        pullRequestId: $pullRequestId,
+                        mergeMethod: $mergeMethod
+                      }) {
+                        pullRequest {
+                          id
+                          autoMergeRequest {
+                            enabledAt
+                          }
+                        }
+                      }
+                    }
+                  `, {
+                    pullRequestId: pr.node_id,
+                    mergeMethod: 'SQUASH',
+                  });
+                } catch (e) {
+                  console.log(`Auto-merge enable failed: ${e.message}`);
+                }
+              }
+            } catch (e) {
+              console.error(`Error: ${e.message}`);
+              throw e;
+            }
+
+      - name: Approve Dependabot PR
+        if: steps.pr-meta.outputs.should_merge == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ steps.pr-meta.outputs.pr_number }};
+            if (!prNumber) return;
+            try {
+              const { data: reviews } = await github.rest.pulls.listReviews({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+              const alreadyApproved = reviews.some(r =>
+                r.user?.login === 'github-actions[bot]' && r.state === 'APPROVED'
+              );
+              if (!alreadyApproved) {
+                await github.rest.pulls.createReview({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: prNumber,
+                  event: 'APPROVE',
+                  body: `Auto-approved: **${{ steps.pr-meta.outputs.bump_level }}** update${{ steps.pr-meta.outputs.is_security == 'true' ? ' (SECURITY) ' : '' }}. All required CI checks passed.`,
+                });
+                console.log(`Approved PR #${prNumber}.`);
+              }
+            } catch (e) {
+              console.error(`Approval error: ${e.message}`);
+            }

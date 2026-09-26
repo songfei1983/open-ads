@@ -1,0 +1,84 @@
+name: CodeQL Security Analysis
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: '37 3 * * 1'
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: go
+            build-mode: autobuild
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@v2
+        with:
+          disable-sudo: true
+          egress-policy: audit
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            proxy.golang.org:443
+            sum.golang.org:443
+            storage.googleapis.com:443
+            objects.githubusercontent.com:443
+            github-releases.githubusercontent.com:443
+            *.actions.githubusercontent.com:443
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-and-quality
+          packs: |
+            codeql/go-queries
+          config: |
+            paths-ignore:
+              - '**/testdata/**'
+              - '**/*_test.go'
+              - 'deployments/**'
+
+      - if: matrix.build-mode == 'manual'
+        shell: bash
+        run: |
+          echo 'Go analysis uses autobuild mode; manual build not required.'
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+          output: codeql-results
+          upload: true
+
+      - name: Upload SARIF results as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-sarif-${{ matrix.language }}
+          path: codeql-results
+          if-no-files-found: ignore
+          retention-days: 30
