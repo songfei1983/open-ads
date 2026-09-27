@@ -10,10 +10,10 @@ on:
   workflow_dispatch:
     inputs:
       format:
-        description: 'SBOM output format(s): cyclonedx-json,spdx-json,syft-json'
+        description: 'SBOM output format: cyclonedx-json or spdx-json'
         required: false
         type: string
-        default: 'cyclonedx-json,spdx-json'
+        default: 'cyclonedx-json'
       upload-snapshot:
         description: 'Upload SBOM snapshot to GitHub Dependency graph'
         required: false
@@ -75,7 +75,7 @@ jobs:
         id: syft
         uses: anchore/sbom-action@v0
         with:
-          format: ${{ github.event.inputs.format || 'cyclonedx-json,spdx-json' }}
+          format: ${{ github.event.inputs.format || 'cyclonedx-json' }}
           upload-artifact: true
           upload-release-assets: false
           artifact-name: sbom-${{ matrix.target }}
@@ -87,7 +87,7 @@ jobs:
         run: |
           set -e
           echo "### SBOM Summary (${{ matrix.target }})" >> $GITHUB_STEP_SUMMARY
-          echo "- Formats: ${{ github.event.inputs.format || 'cyclonedx-json,spdx-json' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Format: ${{ github.event.inputs.format || 'cyclonedx-json' }}" >> $GITHUB_STEP_SUMMARY
           echo "- Dependency snapshot uploaded: ${{ github.event_name != 'pull_request' && github.event.inputs.upload-snapshot != 'false' }}" >> $GITHUB_STEP_SUMMARY
           if [ -f sbom-${{ matrix.target }}.cyclonedx.json ]; then
             PKG_COUNT=$(python3 -c "import json;d=json.load(open('sbom-${{ matrix.target }}.cyclonedx.json'));print(len(d.get('components',[])))")
