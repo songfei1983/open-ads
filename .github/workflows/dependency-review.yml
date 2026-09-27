@@ -43,12 +43,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Resolve comparison refs for manual run
         id: refs
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const pullNumber = Number(context.payload.inputs['pull-request-number']);
@@ -79,7 +79,7 @@ jobs:
             api.osv.dev:443
 
       - name: Dependency Review (GitHub Advisory Database)
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
         with:
           comment-summary-in-pr: ${{ github.event_name == 'pull_request' && 'always' || false }}
           fail-on-severity: ${{ github.event.inputs.fail-on-severity || 'high' }}
@@ -92,7 +92,7 @@ jobs:
           retry-on-snapshot-warnings-timeout: 300
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: '1.26'
           cache: true
