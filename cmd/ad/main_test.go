@@ -28,12 +28,12 @@ func TestMainKafkaProducer(t *testing.T) {
 	t.Setenv("KAFKA_TOPIC", kafkaTopic)
 
 	p, err := kafka.NewProducer(&kafka.ConfigMap{
-		"bootstrap.servers":        kafkaServer,
-		"message.timeout.ms":       3000,
-		"socket.timeout.ms":        5000,
+		"bootstrap.servers":                  kafkaServer,
+		"message.timeout.ms":                 3000,
+		"socket.timeout.ms":                  5000,
 		"socket.connection.setup.timeout.ms": 2000,
-		"api.version.request.timeout.ms": 2000,
-		"metadata.request.timeout.ms": 2000,
+		"api.version.request.timeout.ms":     2000,
+		"metadata.request.timeout.ms":        2000,
 	})
 	if err != nil {
 		t.Fatalf("failed to create producer: %v", err)
