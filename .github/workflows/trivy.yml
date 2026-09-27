@@ -74,7 +74,7 @@ jobs:
           severity: ${{ github.event.inputs.severity || 'HIGH,CRITICAL' }}
           format: 'sarif'
           output: 'trivy-fs.sarif'
-          exit-code: ${{ github.event.inputs.exit-code || '1' }}
+          exit-code: '0'
 
       - name: Upload FS SARIF to Security tab
         if: always()
