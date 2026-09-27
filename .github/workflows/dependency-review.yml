@@ -104,7 +104,7 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Running govulncheck"
-          govulncheck -v ./... || (
+          govulncheck ./... || (
             echo "::warning::govulncheck reported issues. Review the output above."
             exit 1
           )
