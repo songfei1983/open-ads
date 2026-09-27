@@ -7,6 +7,27 @@ on:
       - opened
       - synchronize
       - reopened
+  workflow_dispatch:
+    inputs:
+      pull-request-number:
+        description: 'Pull request number to review'
+        required: true
+        type: number
+      fail-on-severity:
+        description: 'Fail PR when vulnerability severity >= (low/medium/high/critical)'
+        required: false
+        type: choice
+        options:
+          - low
+          - medium
+          - high
+          - critical
+        default: 'high'
+      enable-govulncheck:
+        description: 'Run Go govulncheck caller-level scan'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -23,6 +44,24 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Resolve comparison refs for manual run
+        id: refs
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pullNumber = Number(context.payload.inputs['pull-request-number']);
+            if (!Number.isInteger(pullNumber) || pullNumber < 1) {
+              throw new Error('A valid pull-request-number is required.');
+            }
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pullNumber,
+            });
+            core.setOutput('base', pr.base.sha);
+            core.setOutput('head', pr.head.sha);
 
       - name: Harden Runner
         uses: step-security/harden-runner@v2
@@ -42,13 +81,13 @@ jobs:
       - name: Dependency Review (GitHub Advisory Database)
         uses: actions/dependency-review-action@v4
         with:
-          comment-summary-in-pr: always
-          fail-on-severity: high
+          comment-summary-in-pr: ${{ github.event_name == 'pull_request' && 'always' || false }}
+          fail-on-severity: ${{ github.event.inputs.fail-on-severity || 'high' }}
           deny-licenses: AGPL-1.0-only, AGPL-1.0-or-later, AGPL-3.0-only, AGPL-3.0-or-later
           allow-licenses: Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, ISC, MPL-2.0, Unlicense, CC0-1.0
           warn-on-openssf-scorecard-level: 3
-          base-ref: ${{ github.event.pull_request.base.sha }}
-          head-ref: ${{ github.event.pull_request.head.sha }}
+          base-ref: ${{ github.event.pull_request.base.sha || steps.refs.outputs.base }}
+          head-ref: ${{ github.event.pull_request.head.sha || steps.refs.outputs.head }}
           retry-on-snapshot-warnings: true
           retry-on-snapshot-warnings-timeout: 300
 
@@ -59,6 +98,7 @@ jobs:
           cache: true
 
       - name: Go Vulnerability Check (govulncheck)
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.enable-govulncheck == 'true'
         run: |
           echo "::group::Installing govulncheck"
           go install golang.org/x/vuln/cmd/govulncheck@latest
