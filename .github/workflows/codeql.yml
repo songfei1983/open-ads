@@ -7,6 +7,13 @@ on:
     branches: ["main"]
   schedule:
     - cron: '37 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      languages:
+        description: 'Comma-separated languages to scan (go,javascript-typescript,python)'
+        required: false
+        type: string
+        default: 'go'
 
 permissions:
   contents: read
@@ -20,14 +27,13 @@ concurrency:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - language: go
-            build-mode: autobuild
+        language: ${{ fromJSON(needs.prepare.outputs.languages) }}
 
     steps:
       - name: Harden Runner
@@ -52,20 +58,13 @@ jobs:
         uses: github/codeql-action/init@v3
         with:
           languages: ${{ matrix.language }}
-          build-mode: ${{ matrix.build-mode }}
+          build-mode: ${{ matrix.language == 'go' && 'autobuild' || 'none' }}
           queries: security-and-quality
-          packs: |
-            codeql/go-queries
           config: |
             paths-ignore:
               - '**/testdata/**'
               - '**/*_test.go'
               - 'deployments/**'
-
-      - if: matrix.build-mode == 'manual'
-        shell: bash
-        run: |
-          echo 'Go analysis uses autobuild mode; manual build not required.'
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
@@ -82,3 +81,22 @@ jobs:
           path: codeql-results
           if-no-files-found: ignore
           retention-days: 30
+
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      languages: ${{ steps.languages.outputs.value }}
+    steps:
+      - name: Validate requested languages
+        id: languages
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const supported = new Set(['go', 'javascript-typescript', 'python']);
+            const requested = (context.payload.inputs?.languages || 'go')
+              .split(',').map(language => language.trim()).filter(Boolean);
+            const invalid = requested.filter(language => !supported.has(language));
+            if (requested.length === 0 || invalid.length > 0) {
+              throw new Error(`Unsupported CodeQL language(s): ${invalid.join(', ') || '(empty)'}`);
+            }
+            core.setOutput('value', JSON.stringify([...new Set(requested)]));

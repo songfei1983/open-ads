@@ -1,0 +1,132 @@
+name: Trivy CVE & Misconfiguration Scan
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      severity:
+        description: 'Minimum severity to fail (LOW,MEDIUM,HIGH,CRITICAL)'
+        required: false
+        type: string
+        default: 'HIGH,CRITICAL'
+      exit-code:
+        description: 'Exit non-zero when vulnerabilities of severity are found (blocks PR)'
+        required: false
+        type: string
+        default: '1'
+      scan-images:
+        description: 'Build & scan Docker images additionally (takes longer)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: trivy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fs:
+    name: Filesystem + Go Modules Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@v2
+        with:
+          disable-sudo: true
+          egress-policy: audit
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            *.actions.githubusercontent.com:443
+            ghcr.io:443
+            pkg-containers.githubusercontent.com:443
+            storage.googleapis.com:443
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Go mod download (improves Go binary / module scan)
+        run: go mod download
+
+      - name: Trivy Filesystem Scan (libraries)
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          ignore-unfixed: true
+          vuln-type: 'library,os'
+          severity: ${{ github.event.inputs.severity || 'HIGH,CRITICAL' }}
+          format: 'sarif'
+          output: 'trivy-fs.sarif'
+          exit-code: ${{ github.event.inputs.exit-code || '1' }}
+
+      - name: Upload FS SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-fs.sarif'
+          category: 'trivy-filesystem'
+
+  docker:
+    name: Dockerfile + Infrastructure as Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Trivy Misconfiguration (IaC/Dockerfile)
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          scan-type: 'config'
+          severity: 'MEDIUM,HIGH,CRITICAL'
+          ignore-unfixed: true
+          scanners: 'misconfig,secret,vuln'
+          scan-ref: '.'
+          format: 'table'
+          output: 'trivy-config.txt'
+          exit-code: '0'
+      - name: Upload config results as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-config
+          path: trivy-config.txt
+          retention-days: 14
+
+      - name: Build API image
+        if: github.event.inputs.scan-images == 'true'
+        run: docker build -t open-ads-api:ci -f cmd/api/Dockerfile .
+
+      - name: Scan API image
+        if: github.event.inputs.scan-images == 'true'
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          scan-type: 'image'
+          image-ref: 'open-ads-api:ci'
+          ignore-unfixed: true
+          severity: ${{ github.event.inputs.severity || 'HIGH,CRITICAL' }}
+          format: 'sarif'
+          output: 'trivy-image.sarif'
+          exit-code: ${{ github.event.inputs.exit-code || '1' }}
+
+      - name: Upload image SARIF to Security tab
+        if: always() && github.event.inputs.scan-images == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-image.sarif'
+          category: 'trivy-image'

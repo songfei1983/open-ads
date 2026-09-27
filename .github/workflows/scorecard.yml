@@ -1,0 +1,67 @@
+name: OpenSSF Scorecard Supply Chain Health
+
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: '53 2 * * 1'
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish results to OpenSSF REST API (requires repo public token)'
+        required: false
+        type: boolean
+        default: false
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@v2
+        with:
+          disable-sudo: true
+          egress-policy: audit
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            *.actions.githubusercontent.com:443
+            scorecard.dev:443
+            api.scorecard.dev:443
+            www.gstatic.com:443
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run Scorecard analysis
+        uses: ossf/scorecard-action@v2.4.1
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: ${{ github.event.inputs.publish == 'true' || false }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Scorecard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenSSF-Scorecard-results
+          path: results.sarif
+          retention-days: 90
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+          category: 'openssf-scorecard'
