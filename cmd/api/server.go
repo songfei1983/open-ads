@@ -11,7 +11,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/uptrace/opentelemetry-go-extra/otelzap"
-	"go.opentelemetry.io/contrib/instrumentation/github.com/labstack/echo/otelecho"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
@@ -35,14 +35,14 @@ func main() {
 	}()
 
 	e := echo.New()
-	e.Use(middleware.Logger())
+	e.Use(middleware.RequestLogger())
 	e.Use(middleware.Recover())
 	e.Use(middleware.RequestID())
-	e.Use(otelecho.Middleware("open-ads-api", otelecho.WithTracerProvider(tp)))
 	e.Use(echoprometheus.NewMiddleware("echo"))    // adds middleware to gather metrics
 	e.GET("/metrics", echoprometheus.NewHandler()) // adds route to serve gathered metrics
 	e.GET("/users", listUser)
 	e.GET("/users/:id", getUser)
+	e.Server.Handler = otelhttp.NewHandler(e, "open-ads-api")
 	e.Logger.Fatal(e.Start(":80"))
 }
 
