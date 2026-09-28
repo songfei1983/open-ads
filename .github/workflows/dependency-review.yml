@@ -43,12 +43,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Resolve comparison refs for manual run
         id: refs
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const pullNumber = Number(context.payload.inputs['pull-request-number']);
@@ -64,7 +64,7 @@ jobs:
             core.setOutput('head', pr.head.sha);
 
       - name: Harden Runner
-        uses: step-security/harden-runner@v2
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
         with:
           disable-sudo: true
           egress-policy: audit
@@ -79,7 +79,7 @@ jobs:
             api.osv.dev:443
 
       - name: Dependency Review (GitHub Advisory Database)
-        uses: actions/dependency-review-action@v5
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           comment-summary-in-pr: ${{ github.event_name == 'pull_request' && 'always' || false }}
           fail-on-severity: ${{ github.event.inputs.fail-on-severity || 'high' }}
@@ -91,7 +91,7 @@ jobs:
           retry-on-snapshot-warnings-timeout: 300
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26'
           cache: true
@@ -100,7 +100,7 @@ jobs:
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.enable-govulncheck == 'true'
         run: |
           echo "::group::Installing govulncheck"
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
           echo "::endgroup::"
 
           echo "::group::Running govulncheck"
