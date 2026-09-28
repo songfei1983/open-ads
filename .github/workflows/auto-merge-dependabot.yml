@@ -43,9 +43,14 @@ jobs:
       ((github.actor == 'dependabot[bot]' || github.actor == 'dependabot-preview[bot]') &&
       (github.event_name == 'pull_request' || github.event_name == 'workflow_run'))
     steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
       - name: Fetch PR metadata
         id: pr-meta
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const prNumber = context.payload.inputs?.['pr-number']
@@ -137,7 +142,7 @@ jobs:
 
       - name: Enable Pull Request Auto-Merge
         if: steps.pr-meta.outputs.should_merge == 'true' && github.event.inputs.dry-run != 'true'
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const prNumber = ${{ steps.pr-meta.outputs.pr_number }};
@@ -211,7 +216,7 @@ jobs:
 
       - name: Approve Dependabot PR
         if: steps.pr-meta.outputs.should_merge == 'true' && github.event.inputs.dry-run != 'true'
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const prNumber = ${{ steps.pr-meta.outputs.pr_number }};
