@@ -1,4 +1,4 @@
-FROM openjdk:11
+FROM eclipse-temurin:11-jre@sha256:717e7ce17d8a0eb3ddecef1195a778473972c016097356839114da01e6f145dd
 
 WORKDIR /digdag
 
