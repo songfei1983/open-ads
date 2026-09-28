@@ -57,3 +57,13 @@ updates:
     commit-message:
       prefix: "chore(deps)"
       include: "scope"
+
+  - package-ecosystem: docker
+    directory: /cmd/api
+    schedule:
+      interval: daily
+
+  - package-ecosystem: docker
+    directory: /deployments/docker-compose/digdag
+    schedule:
+      interval: daily
