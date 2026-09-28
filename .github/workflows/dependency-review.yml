@@ -100,7 +100,7 @@ jobs:
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.enable-govulncheck == 'true'
         run: |
           echo "::group::Installing govulncheck"
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
           echo "::endgroup::"
 
           echo "::group::Running govulncheck"
