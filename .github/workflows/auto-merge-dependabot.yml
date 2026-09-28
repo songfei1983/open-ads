@@ -103,7 +103,7 @@ jobs:
               }
             }
 
-            const ciRequired = ['Go', 'pre-commit'];
+            const ciRequired = ['build', 'pre-commit'];
             const { data: checks } = await github.rest.checks.listForRef({
               owner: context.repo.owner,
               repo: context.repo.repo,
