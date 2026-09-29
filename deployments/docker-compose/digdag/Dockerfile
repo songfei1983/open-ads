@@ -1,4 +1,4 @@
-FROM eclipse-temurin:11-jre@sha256:717e7ce17d8a0eb3ddecef1195a778473972c016097356839114da01e6f145dd
+FROM eclipse-temurin:24-jre@sha256:8cb2387a28af84cf0db0948d9c67d4480192f4e567027a3963f145d218e8b4f2
 
 WORKDIR /digdag
 
