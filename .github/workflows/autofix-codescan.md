@@ -12,6 +12,7 @@ permissions:
   security-events: read
 
 engine: copilot
+model: gpt-5.3-codex
 
 runtimes:
   go:
