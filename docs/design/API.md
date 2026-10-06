@@ -10,13 +10,13 @@
 | JSON API 版本 | 路径版本，例如 `/sdk/v1`、`/internal/v1`、`/admin/v1`；不兼容变更升主版本 |
 | 请求关联 | 接收/返回 `X-Request-ID`；没有时由服务生成；允许 `traceparent` 贯穿调用链 |
 | 时间 | RFC 3339 UTC；事件同时保留 `occurred_at` 和服务端 `received_at` |
-| 金额 | OpenRTB wire `price` 遵循协议数值字段；领域与数据库使用有符号整数最小单位及 ISO-4217 currency，不用浮点数累计 |
-| 幂等 | 账务/事件写入使用稳定 `source_event_key` 或 `Idempotency-Key`；重试复用同一 key |
+| 金额 | OpenRTB wire `price` 是十进制 CPM；领域/数据库 `*_micros` 使用整数主币微单位（1 主币 = 1,000,000 micros），并单独记录 ISO-4217 currency；不得用 binary float 累计 |
+| 幂等 | 账务/事件写入使用稳定 `source_event_key`、`reservation_id` 或 `Idempotency-Key`；重试复用同一 key |
 | 错误 | 自有 JSON API 使用 `{code, message, request_id}`；不回显堆栈、敏感标识或内部 SQL。OpenRTB 接口按 OpenRTB no-bid/HTTP 语义返回，不包通用错误信封 |
 | 分页 | 管理 API 使用 `limit` + opaque `cursor`；响应包含 `items`、`next_cursor` |
 | 并发更新 | 管理资源返回 `version`/ETag；更新使用 `If-Match`，版本冲突返回 `409` |
 
-常见状态：`400` 请求无效；`401/403` 未认证/无权限；`404` 管理资源不存在；`409` 版本冲突或非法状态迁移；`413` 超过请求体上限；`422` 业务规则不满足；`429` 限流；`503` 依赖不可用。实时 bidder 超时按 no-bid 处理，不等待管理面错误细节。
+常见状态：`202` 异步操作已接受但尚未完成；`400` 请求无效；`401/403` 未认证/无权限；`404` 管理资源不存在；`409` 版本冲突或非法状态迁移；`413` 超过请求体上限；`422` 业务规则不满足；`429` 限流；`503` 依赖不可用。实时 bidder 超时按 no-bid 处理，不等待管理面错误细节。
 
 ## 2. SSP API
 
@@ -26,7 +26,7 @@ SSP 对外提供 OpenRTB exchange endpoint、浏览器 Client API 和受保护�
 
 | Method / path | 调用方 | 认证 | 请求/响应 | 语义 |
 |---|---|---|---|---|
-| `POST /openrtb2/auction` | 已注册 Supply | supply credential、mTLS 或签名 | OpenRTB 2.6 `BidRequest` → `BidResponse`/no-bid | 校验版本、request/imp ID、媒体能力与截止时间；以 `tmax` 限定总延迟 |
+| `POST /openrtb2/auction` | 已注册 Supply | supply credential、mTLS 或签名；生产 supply 还需通过 ads.txt/app-ads.txt 授权校验 | OpenRTB 2.6 `BidRequest` → `BidResponse`/no-bid | 校验版本、request/imp ID、媒体能力与截止时间；验证/补齐 `source.schain`；以 `tmax` 限定总延迟 |
 
 响应中的竞价结果和通知 URL 遵循 OpenRTB 2.6。入口不把 Client SDK DTO 当作 OpenRTB 请求。
 
@@ -37,7 +37,8 @@ SSP 对外提供 OpenRTB exchange endpoint、浏览器 Client API 和受保护�
 | `POST /sdk/v1/ad-requests` | Portal/JS SDK | 短期 scoped test token；未来公开集成按 placement/origin allowlist | placement、slot、去敏 page context、consent fixture → SDK AdResponse/no-fill | SSP 内部创建 auction 并映射到 OpenRTB；`Cache-Control: no-store` |
 | `POST /sdk/v1/identity` | JS SDK/Publisher page | placement-scoped test/public token + consent state | 可选 publisher pseudonymous subject → SSP-scoped subject ID、expiry、status | 明确 opt-in；ID 按 publisher scope 隔离并存 first-party storage；无 consent 返回 `identity: null` |
 | `POST /sdk/v1/identity-sync` | JS SDK/Publisher page | 同上；已授权的 identity purpose | subject ID、partner ID → allowlisted one-time sync URL/state | 可选 legacy/browser match；只允许登记 partner 和固定 return URL |
-| `POST /sdk/v1/identity:revoke` | SDK/Publisher privacy flow | subject-scoped revoke token / publisher authorization | subject ID、reason、request ID → revocation status | SSP 先立即禁止该身份参与竞价/同步并失效缓存；随后可靠传播 DMP tombstone 和 partner unlink |
+| `POST /sdk/v1/identity:revoke` | SDK/Publisher privacy flow | subject-scoped revoke token / publisher authorization | subject ID、reason、request ID → `pending`/`completed` 与 revocation ID | SSP 先立即禁止该身份参与竞价/同步并失效缓存；仅在 DMP tombstone 持久化且所有可服务查询节点确认 deny gate 后报告 completed |
+| `GET /sdk/v1/identity-revocations/{revocation_id}` | SDK/Publisher privacy flow | 同一 subject-scoped revoke token / publisher authorization | revocation ID → 当前 `pending`/`completed` 状态 | 只允许原 subject/授权 publisher 查询，不返回 tombstone 或其他用户数据 |
 | `POST /sdk/v1/events` | JS SDK | 与广告 response 绑定的短时 opaque event token | client event ID、event type、token、发生时间 → 接收状态 | 仅作为客户端测量/调试信号；不得单独触发财务 ledger |
 
 `ad-requests` 示例：
@@ -94,7 +95,7 @@ no-fill 使用 `200` + `{"request_id":"...","status":"no_fill"}`。错误响应�
 | `GET /admin/v1/publishers` / `POST /admin/v1/publishers` | SSP 管理员 | 管理员身份、RBAC | Publisher 配置 DTO；响应包含 ID/version |
 | `GET /admin/v1/properties` / `POST /admin/v1/properties` | SSP 管理员 | 同上 | Property 配置与 Publisher 外部 ID |
 | `GET /admin/v1/placements` / `POST /admin/v1/placements` | SSP 管理员 | 同上 | 格式、floor、币种、隐私/计费策略版本 |
-| `GET /admin/v1/supply-endpoints` / `PUT /admin/v1/supply-endpoints/{id}` | SSP 管理员 | 同上 | Supply 协议 profile、凭据 secret reference、状态 |
+| `GET /admin/v1/supply-endpoints` / `PUT /admin/v1/supply-endpoints/{id}` | SSP 管理员 | 同上 | Supply 协议 profile、凭据 secret reference、ads.txt/app-ads.txt seller/account 映射、schain 策略和状态 |
 | `GET /admin/v1/dsp-endpoints` / `POST /admin/v1/dsp-endpoints` / `PUT /admin/v1/dsp-endpoints/{id}` | SSP 管理员 | 同上 | DSP bid URL、支持的 OpenRTB profile、credential secret reference、callback host allowlist、timeout/status |
 | `POST /internal/v1/identity-links:complete` | 已登记的 DSP identity-sync callback | DSP service identity + single-use sync token | sync token、DSP-specific user ID、consent receipt/version、expiry → link status/version | 将 DSP ID 映射为当前 SSP subject 的 pairwise `buyeruid`；不得接受任意 user ID upsert |
 | `POST /internal/v1/identity:revoke` | SSP | SSP service identity/mTLS | tenant、namespace、subject token、revocation ID、effective time → accepted/status | DMP 追加 revocation tombstone；解析排除该 token，物理清除历史快照按删除 SLA 异步完成 |
@@ -132,12 +133,12 @@ DSP 的 bidder endpoint 与 advertiser/campaign 管理 API 分开部署或分开
 | Method / path | 调用方 | 请求/响应 | 语义 |
 |---|---|---|---|
 | `POST /openrtb2/bid` | SSP/exchange | OpenRTB 2.6 BidRequest → BidResponse 或 no-bid | 按 request deadline 和已加载快照决策；不得在 cache miss 时回源 MariaDB |
-| `POST /openrtb2/notices/win` | SSP | OpenRTB win notice payload | `nurl` 目标；记录 win 状态，不直接扣 advertiser spend |
-| `POST /openrtb2/notices/loss` | SSP | OpenRTB loss notice payload | `lurl` 目标；记录 loss 状态 |
-| `POST /openrtb2/notices/billing` | SSP | OpenRTB billing notice payload | `burl` 目标；校验 source event、币种/金额、合同策略后在事务中写 spend ledger 与更新预算 |
+| 按 bidder 返回的 `nurl` 调用 | SSP/exchange | 方法、认证和宏替换按双方 OpenRTB 接入 profile；win notice 可使用 GET 或 POST | 记录 win 状态，不直接扣 advertiser spend |
+| 按 bidder 返回的 `lurl` 调用 | SSP/exchange | 方法、loss code/macro 和鉴权按双方 profile | 记录 loss 状态；仅在确认不再 billable 时释放预算风险 |
+| 按 bidder 返回的 `burl` 调用 | SSP/exchange | 方法、billing macro、金额单位、签名和幂等引用按双方 profile | 校验 source event、reservation、币种/金额与合同策略后，在事务中写 spend ledger 并更新所有适用预算范围 |
 | `GET /healthz` / `GET /readyz` | 运维探针 | 无业务 body | 报告服务存活、配置版本/预算租约可用状态 |
 
-通知 URL 由 DSP 在 BidResponse 对应 bid 的 `nurl`、`lurl`、`burl` 提供，SSP 按 OpenRTB 2.6 notice 语义调用；同一 notice 重放返回幂等成功。billing payload 的 `price` 宏替换和具体结算金额按 DSP/SSP 双边接入 profile 确定，不以 win price 自动替代 billable price。
+通知 URL 由 DSP 在 BidResponse 对应 bid 的 `nurl`、`lurl`、`burl` 提供。OpenRTB 不定义通用 JSON notice payload；双方 profile 必须定义方法、宏、签名/认证、重放保护、超时、重试、成功响应及 reservation/source event ID。billing price 宏的替换和结算金额按 profile 确定，不以 win price 自动替代 billable price。SSP 仅调用已登记 bidder 的合法 HTTPS host，并校验重定向/解析后的目标，避免 SSRF。
 
 ### 3.2 DSP 管理/控制 API
 
@@ -161,6 +162,8 @@ DSP 的 bidder endpoint 与 advertiser/campaign 管理 API 分开部署或分开
 | Method / path | 调用方 | 请求/响应 | 语义 |
 |---|---|---|---|
 | `POST /internal/v1/audience:resolve` | SSP | namespace、伪名 token、tenant、purpose/consent、max segments → snapshot/provider/segments | 只读已发布快照；无匹配返回空集合；拒绝授权不返回受众 |
+| `POST /internal/v1/identity:revoke` | SSP | namespace、subject token、revocation ID、effective time | 持久化 tombstone 并传播 deny gate；返回 `202 pending` 或 `completed`；completed 表示所有可服务查询节点均已确认 |
+| `GET /internal/v1/identity-revocations/{revocation_id}` | SSP | SSP service identity/mTLS | revocation ID → online suppression status、已确认水位、physical deletion status | 用于恢复异步撤回状态；`completed` 仅表示在线抑制生效，不代表历史快照物理删除完成 |
 | `POST /internal/v1/events:batch` | SSP/授权事件生产方 | `batch_id`、schema version、events[] → accepted/rejected counts | 有界批量写 ClickHouse；至少一次投递，不承诺写入时唯一去重；分析按 event ID 去重 |
 | `POST /internal/v1/snapshots` | 数据导入控制器 | provider、namespace、schema、source version、预期行数/checksum → snapshot/job ID | 创建不可变导入版本 |
 | `POST /internal/v1/snapshots/{id}/members:batch` | 数据导入控制器 | batch ID、membership rows[] → accepted count | 批量导入，幂等重放；不直接对在线读取可见 |
@@ -186,5 +189,6 @@ DMP 管理变更写入不可变版本；不把 ClickHouse 当作任意行级事�
 - SDK 的 test token 由已认证 Portal 会话换取，绑定 tenant、placement、origin、scope、过期时间和请求额度；不将 long-lived secret 发给浏览器。
 - CORS 精确列举 sandbox Portal origin，不使用 `*` 搭配 credentials；SDK API 做 payload 上限、placement allowlist、rate limit 和 abuse protection。
 - render URL 为短期签名地址，host allowlist；iframe sandbox/CSP 阻止跨域创意访问 SSP cookie/storage。诊断信息默认脱敏。
+- 生产 supply 的授权和透明度需同时维护 ads.txt/app-ads.txt 授权关系、sellers.json seller 映射与 OpenRTB `source.schain`；其校验来源、刷新周期、无效/缺失时策略和责任方由供给接入 profile 明确。仅 sandbox 可使用固定测试 fixture。
 - 浏览器 impression/click 上报仅作测量/调试输入，不直接产生财务分录。计费由 SSP/DSP 受信服务端策略和账本事务确认。
 - OpenRTB 2.6 API 契约由 SSP 与 DSP 双边 profile 确定支持字段和宏；自有 SDK/Admin API 变更通过路径主版本和契约测试管理。

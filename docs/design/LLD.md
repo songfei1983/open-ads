@@ -19,6 +19,8 @@ internal/<app>/observability/
 
 wire DTO 和 OpenRTB 类型留在对应服务 adapter 内。领域层不导入 `net/http`、Valkey 客户端、SQL 驱动或 ClickHouse 客户端。应用层依赖本应用定义的窄接口，依赖方向指向 domain/application。
 
+货币字段统一以整数微单位存储，`1 currency unit = 1,000,000 micros`；`*_micros` 表示主币单位的百万分之一，`*_cpm_micros` 表示每 1,000 次展示的 CPM 主币微单位。OpenRTB wire `price` 仍按协议以十进制 CPM 传输。对 CPM 计价的 billable event，单次金额按 `round_half_even(cpm_micros * quantity / 1000)` 计算为主币微单位；未提供 `qty.multiplier` 时 quantity 为 1。非 CPM 计价须在交易 profile 定义等价转换。计算使用十进制定点/有理数并检查溢出，不得使用 binary float 累计。对外付款/报表按 ISO-4217 币种最小单位和合同约定的舍入时点转换。
+
 建议端口形态（每个应用自行定义，不跨 module 共享）：
 
 ```go
@@ -27,6 +29,227 @@ type IDGenerator interface { NewID() string }
 ```
 
 每个服务的 repository/client 接口使用自己的 domain 类型；不创建通用 `Repository[T]` 或 `common.Entity`。
+
+### 1.1 数据库 ER 图
+
+以下图依据本节后续的表定义绘制。MariaDB 图中标为 `FK` 的关系对应 DDL 外键；标为 `logical, no FK` 的关系仅表示字段关联，数据库不强制完整性。`ssp_db`、`dsp_db` 与 ClickHouse 相互独立，不存在跨库关系。
+
+#### SSP (`ssp_db`)
+
+```mermaid
+erDiagram
+  PUBLISHER {
+    binary16 tenant_id PK
+    binary16 publisher_id PK
+  }
+  PROPERTY {
+    binary16 tenant_id PK
+    binary16 property_id PK
+    binary16 publisher_id FK
+    varchar property_type
+    varchar external_id
+  }
+  PLACEMENT {
+    binary16 tenant_id PK
+    binary16 placement_id PK
+    binary16 property_id FK
+    char currency
+  }
+  SUPPLY_ENDPOINT {
+    binary16 tenant_id PK
+    binary16 endpoint_id PK
+    binary16 property_id FK
+    varchar auth_secret_ref
+  }
+  SSP_CONFIG_OUTBOX {
+    binary16 event_id PK
+    binary16 tenant_id
+    varchar aggregate_type
+    binary16 aggregate_id
+    bigint aggregate_version
+  }
+  PUBLISHER_SUBJECT {
+    binary16 tenant_id PK
+    binary16 publisher_id PK
+    binary16 subject_id PK
+    binary source_subject_hmac
+  }
+  PARTNER_IDENTITY_LINK {
+    binary16 tenant_id PK
+    binary16 publisher_id PK
+    binary16 subject_id PK
+    varchar partner_id PK
+    binary partner_user_id_hmac
+  }
+  SSP_DELIVERY_EVENT {
+    binary16 tenant_id PK
+    binary16 event_id PK
+    binary source_event_key
+    binary16 publisher_id
+    binary16 property_id
+    binary16 placement_id
+  }
+  PUBLISHER_PAYABLE_LEDGER {
+    binary16 tenant_id PK
+    binary16 entry_id PK
+    binary32 idempotency_key
+    binary16 source_event_id FK
+    bigint amount_micros
+    char currency
+  }
+
+  PUBLISHER ||--o{ PROPERTY : "FK tenant_id,publisher_id"
+  PROPERTY ||--o{ PLACEMENT : "FK tenant_id,property_id"
+  PROPERTY ||--o{ SUPPLY_ENDPOINT : "FK tenant_id,property_id"
+  PUBLISHER ||--o{ PUBLISHER_SUBJECT : "FK tenant_id,publisher_id"
+  PUBLISHER_SUBJECT ||--o{ PARTNER_IDENTITY_LINK : "FK tenant_id,publisher_id,subject_id"
+  SSP_DELIVERY_EVENT ||--o{ PUBLISHER_PAYABLE_LEDGER : "FK tenant_id,event_id"
+  PUBLISHER ||--o{ SSP_DELIVERY_EVENT : "logical, no FK"
+  PROPERTY ||--o{ SSP_DELIVERY_EVENT : "logical, no FK"
+  PLACEMENT ||--o{ SSP_DELIVERY_EVENT : "logical, no FK"
+```
+
+`ssp_config_outbox.aggregate_type`/`aggregate_id` 是多态聚合引用，不是外键；delivery event 中的 publisher/property/placement ID 也未在 DDL 声明外键。DDL 的唯一约束均为复合键，例如 property 的 `(tenant_id, property_type, external_id)`、subject 的来源 HMAC、partner identity 和 event/ledger 幂等键；图中不把它们误表示为单列唯一。
+
+#### DSP (`dsp_db`)
+
+```mermaid
+erDiagram
+  ADVERTISER {
+    binary16 tenant_id PK
+    binary16 advertiser_id PK
+    char default_currency
+  }
+  CAMPAIGN {
+    binary16 tenant_id PK
+    binary16 campaign_id PK
+    binary16 advertiser_id FK
+  }
+  LINE_ITEM {
+    binary16 tenant_id PK
+    binary16 line_item_id PK
+    binary16 campaign_id FK
+    char currency
+  }
+  CREATIVE {
+    binary16 tenant_id PK
+    binary16 creative_id PK
+    varchar format
+  }
+  LINE_ITEM_CREATIVE {
+    binary16 tenant_id PK
+    binary16 line_item_id PK
+    binary16 creative_id PK
+  }
+  BUDGET_ACCOUNT {
+    binary16 tenant_id PK
+    binary16 line_item_id PK
+    varchar budget_scope PK
+    date period_start PK
+    bigint budget_limit_micros
+  }
+  BUDGET_LEASE {
+    binary16 tenant_id PK
+    binary16 lease_id PK
+    binary16 line_item_id
+    varchar budget_scope
+    date period_start
+    bigint held_micros
+  }
+  BUDGET_RESERVATION_SETTLEMENT {
+    binary16 tenant_id PK
+    binary16 reservation_id PK
+    varchar budget_scope PK
+    date period_start PK
+    binary16 lease_id FK
+    binary source_event_key
+    varchar outcome
+  }
+  DSP_DELIVERY_EVENT {
+    binary16 tenant_id PK
+    binary16 event_id PK
+    binary source_event_key
+    binary16 advertiser_id
+    binary16 campaign_id
+    binary16 line_item_id
+  }
+  ADVERTISER_SPEND_LEDGER {
+    binary16 tenant_id PK
+    binary16 entry_id PK
+    binary32 idempotency_key
+    binary16 source_event_id FK
+    binary16 line_item_id
+    bigint amount_micros
+  }
+
+  ADVERTISER ||--o{ CAMPAIGN : "FK tenant_id,advertiser_id"
+  CAMPAIGN ||--o{ LINE_ITEM : "FK tenant_id,campaign_id"
+  LINE_ITEM ||--o{ LINE_ITEM_CREATIVE : "FK tenant_id,line_item_id"
+  CREATIVE ||--o{ LINE_ITEM_CREATIVE : "FK tenant_id,creative_id"
+  LINE_ITEM ||--o{ BUDGET_ACCOUNT : "FK tenant_id,line_item_id"
+  BUDGET_LEASE ||--o{ BUDGET_RESERVATION_SETTLEMENT : "FK tenant_id,lease_id"
+  LINE_ITEM ||--o{ BUDGET_LEASE : "logical, no FK"
+  LINE_ITEM ||--o{ DSP_DELIVERY_EVENT : "logical, no FK"
+  DSP_DELIVERY_EVENT ||--o{ ADVERTISER_SPEND_LEDGER : "FK tenant_id,event_id"
+```
+
+`budget_lease` 的 line item/scope/period 和 `budget_reservation_settlement` 的预算范围、delivery event 的 advertiser/campaign/line item ID 是逻辑引用；表定义没有对应外键。settlement 的 source event key 也没有直接指向 delivery event 的外键。DDL 中 source event 和幂等唯一键均包含 tenant/scope 等列，图中只列键字段，不表示其为单列唯一。
+
+#### DMP (ClickHouse)
+
+```mermaid
+erDiagram
+  DMP_SNAPSHOT_PUBLICATION {
+    uuid tenant_id
+    string provider_id
+    string namespace
+    uuid snapshot_id
+    datetime published_at
+  }
+  DMP_MEMBERSHIP_SNAPSHOT {
+    uuid tenant_id
+    string provider_id
+    string namespace
+    uuid snapshot_id
+    string subject_token
+    string segment_id
+  }
+  DMP_SEGMENT_DEFINITION_VERSION {
+    uuid tenant_id
+    string provider_id
+    string segment_id
+    uint64 version
+  }
+  DMP_IDENTITY_REVOCATION {
+    uuid tenant_id
+    string namespace
+    string subject_token
+    uuid revocation_id
+  }
+  DMP_IDENTITY_REVOCATION_STATUS {
+    uuid tenant_id
+    uuid revocation_id
+    uint64 status_version
+    string online_status
+    string physical_delete_status
+  }
+  DMP_EVENT {
+    uuid tenant_id
+    uuid event_id
+    string provider_id
+    string namespace
+    string subject_token
+    string segment_id
+  }
+
+  DMP_SNAPSHOT_PUBLICATION ||--o{ DMP_MEMBERSHIP_SNAPSHOT : "logical tenant,provider,namespace,snapshot"
+  DMP_SEGMENT_DEFINITION_VERSION ||--o{ DMP_MEMBERSHIP_SNAPSHOT : "logical provider,segment"
+  DMP_IDENTITY_REVOCATION ||--o{ DMP_IDENTITY_REVOCATION_STATUS : "logical tenant,revocation_id history"
+  DMP_MEMBERSHIP_SNAPSHOT }o--o{ DMP_IDENTITY_REVOCATION : "logical token exclusion, no FK"
+  DMP_SEGMENT_DEFINITION_VERSION ||--o{ DMP_EVENT : "logical provider,segment"
+```
+
+ClickHouse 表不声明主键或外键；图中的 DMP 连线都是查询/版本关联，不提供数据库级 referential integrity。各表的 `ORDER BY` 是 MergeTree 排序键，不等同于唯一键。
 
 ## 2. SSP LLD
 
@@ -53,7 +276,7 @@ Auction 是短生命周期对象，默认只存在于请求上下文中；竞价
 - 验证 `BidRequest.id` 非空、`imp` 非空且各 `imp.id` 唯一；只处理已声明支持的 impression 格式。校验响应 `BidResponse.id` 与 request id 相等，`seatbid[].bid[].impid` 必须指向原始 imp，出价币种、floor、尺寸/格式及 deadline 必须满足约定。
 - 处理 no-bid 按 OpenRTB 2.x 语义实现，可包含 `seatbid: []`/`nbr` 等适用形式；DSP 错误、超时或无有效 bid 均不构成候选。
 - 拍卖的 `at`、币种、price macro 展开和 notice 规则按 OpenRTB 2.6 与供给方约定实现。`nurl` 表示 win，`lurl` 表示 loss，`burl` 表示符合 exchange 计费策略的 billable event；不得将 win 自动等同于展示或计费。
-- PublisherPayable 由 SSP 的 publisher 合同策略计算，可基于有效展示或合同定义的其他 billable event；金额和币种以整数微单位表达，记录策略版本和舍入结果。
+- PublisherPayable 由 SSP 的 publisher 合同策略计算，可基于有效展示或合同定义的其他 billable event；金额以主币微单位表达，币种独立记录，并记录策略版本和最终货币最小单位舍入结果。
 - 不支持的 `ext` 忽略或按 profile 拒绝；不把私有字段放入标准字段。
 
 ### 2.2.1 SSP Client API 与 JavaScript SDK
@@ -144,6 +367,12 @@ Portal 是独立静态页面/文件包，不增加 Go 业务服务、数据库�
 
 安全边界：SSP 对 Portal origin 做精确 CORS allowlist；不使用 `*` 搭配 credentials。短期 token 不含服务端密钥；接口校验 placement 与 token tenant 绑定，实施 payload 上限、QPS 配额、重放/滥用防护。Portal 和 renderer 使用 CSP；跨域 iframe sandbox 禁止访问 SSP origin/cookie。测试环境与生产环境 endpoint、数据库及 token issuer 分离。
 
+### 2.2.3 生产供给授权与透明度
+
+生产流量接入除 supply credential 外，还须验证 publisher 对对应 seller/account 的授权。SSP 维护 ads.txt/app-ads.txt 抓取、解析、缓存和过期策略，并将 seller account 与 sellers.json 中的 seller 身份关联；解析失败、未授权或 seller 信息冲突时，按供给 profile 隔离或拒绝库存，不能静默当作已授权。
+
+SSP 生成发往 DSP 的 OpenRTB `source.schain`，遵循 SupplyChain Object 的节点顺序和 `asi`/`sid`/`hp` 语义；保留可验证的上游节点与 complete 标志，不得伪造缺失链路为 complete。每个 supply profile 定义缺失/无效 schain 的处理策略、seller ID 映射及授权文件刷新 SLA。Sandbox 可以用固定 fixture，不能据此推断生产授权。
+
 ### 2.3 DMP 受众解析契约（内部 API，不是 OpenRTB）
 
 ```http
@@ -194,7 +423,7 @@ CREATE TABLE placement (
   placement_id BINARY(16) NOT NULL,
   property_id BINARY(16) NOT NULL,
   media_type VARCHAR(24) NOT NULL,
-  floor_micros BIGINT UNSIGNED NOT NULL,
+  floor_cpm_micros BIGINT UNSIGNED NOT NULL,
   currency CHAR(3) NOT NULL,
   privacy_policy VARCHAR(24) NOT NULL,
   status VARCHAR(16) NOT NULL,
@@ -366,15 +595,17 @@ delivery event 是高写入量数据，需批量落库、定义保留/归档周�
 | 聚合根 | 主要内容 | 关键不变量 |
 |---|---|---|
 | Advertiser | 广告主状态、允许币种 | 暂停广告主下 line item 不出价 |
-| Campaign | 活动状态、投放周期、投放目标 | 活动时间窗和总预算有效 |
+| Campaign | 活动状态、投放周期、投放目标 | 活动时间窗有效；第一期不支持独立 Campaign 总预算，预算限制在 LineItem 层 |
 | LineItem | 预算、bid strategy、targeting、频次/日限额 | 只有有效且预算租约充足时可候选 |
 | Creative | 素材格式、落地页、审核状态 | 素材须匹配 impression 格式和审核规则 |
-| BudgetAccount | 已花费、预留、可用金额及版本 | 可用金额不小于零；重复 billable event 不重复扣减 |
+| BudgetAccount | 按 line item、预算范围/周期和币种维护限额、已花费、已租出金额 | 每个适用预算范围都满足 `spent + leased <= limit`；重复 billable event 不重复扣减 |
 | DeliveryEvent | bid/win/loss/billable/impression 等 DSP 本地事件 | 每个 source event 唯一；win event 本身不扣预算 |
 | AdvertiserSpendLedger | advertiser/campaign/line item 的不可变 spend 分录 | 仅对有效 billable event 记账；source event 幂等 |
 
 Targeting DSL 属 DSP 私有领域语言；仅从 OpenRTB request 读取标准上下文，不将 DMP segment 解释为 DMP 实体，只按 `data.id`/`segment.id` 配置匹配。
 金额/预算模型属于 DSP bounded context；不读取 SSP 的 PublisherPayableLedger，也不将 publisher 应付金额当作 advertiser spend。
+
+频次上限和 pacing 是 LineItem 的投放策略，不是 budget lease 的同义词。进入实现前必须定义频控主体/维度、滚动或自然时间窗口、时区、跨节点计数一致性，以及 pacing 目标、反馈周期和无状态快照过期时的行为；这些规则未定前不得将 LineItem 标记为可发布。
 
 ### 3.2 MariaDB 表草案
 
@@ -412,7 +643,7 @@ CREATE TABLE line_item (
   campaign_id BINARY(16) NOT NULL,
   status VARCHAR(16) NOT NULL,
   currency CHAR(3) NOT NULL,
-  bid_micros BIGINT UNSIGNED NOT NULL,
+  bid_cpm_micros BIGINT UNSIGNED NOT NULL,
   daily_budget_micros BIGINT UNSIGNED NOT NULL,
   lifetime_budget_micros BIGINT UNSIGNED NOT NULL,
   targeting_version BIGINT UNSIGNED NOT NULL,
@@ -450,12 +681,15 @@ CREATE TABLE line_item_creative (
 CREATE TABLE budget_account (
   tenant_id BINARY(16) NOT NULL,
   line_item_id BINARY(16) NOT NULL,
+  budget_scope VARCHAR(16) NOT NULL,
+  period_start DATE NOT NULL,
   currency CHAR(3) NOT NULL,
+  budget_limit_micros BIGINT UNSIGNED NOT NULL,
   spent_micros BIGINT UNSIGNED NOT NULL,
   leased_micros BIGINT UNSIGNED NOT NULL,
   version BIGINT UNSIGNED NOT NULL,
   updated_at DATETIME(6) NOT NULL,
-  PRIMARY KEY (tenant_id, line_item_id),
+  PRIMARY KEY (tenant_id, line_item_id, budget_scope, period_start),
   CONSTRAINT fk_budget_line FOREIGN KEY (tenant_id, line_item_id)
     REFERENCES line_item (tenant_id, line_item_id)
 ) ENGINE=InnoDB;
@@ -464,13 +698,35 @@ CREATE TABLE budget_lease (
   tenant_id BINARY(16) NOT NULL,
   lease_id BINARY(16) NOT NULL,
   line_item_id BINARY(16) NOT NULL,
+  budget_scope VARCHAR(16) NOT NULL,
+  period_start DATE NOT NULL,
   owner_instance VARCHAR(128) NOT NULL,
   amount_micros BIGINT UNSIGNED NOT NULL,
-  remaining_micros BIGINT UNSIGNED NOT NULL,
+  held_micros BIGINT UNSIGNED NOT NULL,
+  settlement_grace_until DATETIME(6) NOT NULL,
+  status VARCHAR(16) NOT NULL,
   expires_at DATETIME(6) NOT NULL,
   PRIMARY KEY (tenant_id, lease_id),
-  KEY idx_lease_expiry (expires_at),
+  KEY idx_lease_expiry (status, expires_at, settlement_grace_until),
   KEY idx_lease_owner (tenant_id, owner_instance, line_item_id)
+) ENGINE=InnoDB;
+
+CREATE TABLE budget_reservation_settlement (
+  tenant_id BINARY(16) NOT NULL,
+  reservation_id BINARY(16) NOT NULL,
+  budget_scope VARCHAR(16) NOT NULL,
+  period_start DATE NOT NULL,
+  lease_id BINARY(16) NOT NULL,
+  source_event_key BINARY(32) NOT NULL,
+  outcome VARCHAR(16) NOT NULL,
+  reserved_max_micros BIGINT UNSIGNED NOT NULL,
+  actual_amount_micros BIGINT UNSIGNED NOT NULL,
+  currency CHAR(3) NOT NULL,
+  settled_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (tenant_id, reservation_id, budget_scope, period_start),
+  UNIQUE KEY uq_reservation_source_event (tenant_id, source_event_key, budget_scope, period_start),
+  CONSTRAINT fk_reservation_lease FOREIGN KEY (tenant_id, lease_id)
+    REFERENCES budget_lease (tenant_id, lease_id)
 ) ENGINE=InnoDB;
 
 CREATE TABLE dsp_delivery_event (
@@ -518,30 +774,37 @@ CREATE TABLE advertiser_spend_ledger (
 ) ENGINE=InnoDB;
 ```
 
-上面是概念 schema；字符集、外键级联策略、campaign/line item 的生命周期删除方式和价格单位需迁移设计评审，不直接视为可执行最终迁移。`dsp_delivery_event` 是投放/回调事件日志，`advertiser_spend_ledger` 是 DSP advertiser 的费用事实；两者不可互相替代。
+预算账户按 `budget_scope` 区分 lifetime/daily 等 LineItem 限制；daily 的 `period_start` 按已确定的账户时区计算，lifetime 使用 LineItem 生效周期起点。第一期 Campaign 只管理状态/时间窗/投放目标，不设独立总预算。`budget_account.leased_micros` 必须等于该账户下所有 `budget_lease.held_micros` 之和；每个预算账户维持 `spent_micros + leased_micros <= budget_limit_micros`。每次竞价须在所有适用 LineItem 预算范围持有足够租额，因此任一范围不足都必须 no-bid。
 
-DSP 的 spend 幂等键优先继承 SSP/exchange 提供的稳定 billable event ID；若协议接入没有该字段，DSP 与交易对手必须共同约定基于 auction ID、bid ID、imp ID 和 billable sequence 的确定性规则。不能直接以 `nurl` 调用次数或任意重试次数当收费次数。
+上面是概念 schema；字符集、外键级联策略、LineItem 生命周期删除方式和结算舍入时点需迁移设计评审，不直接视为可执行最终迁移。`dsp_delivery_event` 是投放/回调事件日志，`advertiser_spend_ledger` 是 DSP advertiser 的费用事实；两者不可互相替代。settlement 表按 reservation ID 与预算范围保存终态；同一 reservation 的所有范围必须在同一事务插入和更新。
+
+实例只可使用绑定自身唯一进程 incarnation 的租约。本地原子扣留每笔 bid 的最大 billable 风险后，生成包含 reservation ID 及所有适用 lease/scope 引用的签名 token，并放入双方 profile 约定的 notice URL；token 绑定 auction/bid/imp、最大金额、币种、expiry 和 key version，不含用户标识。此操作不访问 MariaDB。
+
+`budget_lease.held_micros` 是数据库尚未结算的总额度，包含节点本地未用额度和在途风险。合法 loss 或 billable notice 均在一个 MariaDB 事务内插入 `budget_reservation_settlement`，按 reservation ID 幂等校验结果，并对所有适用 scope 执行 `leased_micros -= reserved_max_micros`、`held_micros -= reserved_max_micros`；billable 另执行 `spent_micros += actual_amount_micros`，loss 的实际金额为零。实际账单不得超过 token 中的预留上限；所有 scope 更新必须整体成功。已释放金额只回到全局可租额度，不恢复旧实例本地额度。相同 reservation 的相同终态重放返回幂等成功；终态冲突、无效签名、超币种/上限或超出 grace 的 notice 隔离并对账。实例重启使用新的 `owner_instance` incarnation，不得重新消费旧租约。
+
+DSP 的 spend 幂等键优先继承双方 profile 约定的稳定 billable event ID；若协议接入没有该字段，DSP 与交易对手必须共同约定基于 auction ID、bid ID、imp ID 和 billable sequence 的确定性规则。不能直接以 `nurl` 调用次数或任意重试次数当收费次数。
 
 ### 3.3 预算并发与竞价
 
 1. 配置变更由 MariaDB 事务提交并增加版本；DSP 节点通过轮询变更版本/管理 API 获取完整一致快照，校验后原子替换本地只读快照。
 2. 节点出价只使用尚未过期的本地快照和预算 lease。lease 由 MariaDB 条件更新/事务分配，实例不得使用超过剩余额度的租约金额。
-3. 收到 `nurl` win notice 后记录非计费 `win` delivery event，不扣 advertiser 预算。收到 SSP 按约定触发的有效 `burl` billable notice 后，在一个 InnoDB 事务中插入 billable event 和 `advertiser_spend_ledger` 分录，并更新 `spent_micros`/lease 金额。唯一幂等键冲突表示重放，返回幂等成功；事务失败则重试。
-4. lease 到期回收需检查 owner 与剩余金额，使用锁/条件版本避免与结算竞争。实例失联会造成额度暂时不可用而非超支。
-5. 出价热路径不得等待慢 SQL。快照过旧、lease 不可用或预算状态不确定时，该 line item no-bid。
+3. 收到 `nurl` win notice 后记录非计费 `win` delivery event，不结算预算 reservation。`lurl` loss 和 `burl` billing 是同一 reservation 的互斥终态，均需带签名 reservation reference；只允许一个终态事务成功。
+4. loss 在一个 InnoDB 事务中插入 outcome=loss 的 settlement，并从所有适用预算账户/lease 释放 `reserved_max_micros`；不恢复旧实例的本地额度。billing 在同一事务边界插入 outcome=billable 的 settlement、billable event 和 `advertiser_spend_ledger`，扣除同一预留额并将 `actual_amount_micros` 计入 spend。按 reservation ID 去重；重复相同终态幂等成功，冲突终态隔离。
+5. 租约 `expires_at` 只停止实例继续使用租额；`settlement_grace_until` 至少覆盖租约到期后的最大 notice 延迟、重试窗口和时钟偏差余量，在此之前不能回收未结算 held 额度。窗口结束后以行锁/条件版本释放未结算余额；notice 事务与回收事务必须串行化。实例失联会造成额度暂时不可用而非超支；窗口结束后的迟到 notice 隔离并对账。
+6. 出价热路径不得等待慢 SQL。快照过旧、lease 不可用或预算状态不确定时，该 line item no-bid。
 
 ### 3.4 DSP HTTP 契约
 
 - `POST /openrtb2/bid`：OpenRTB 2.6 BidRequest，返回标准 BidResponse 或标准 no-bid。解析/评估受请求 deadline 限制。
 - `GET /healthz`、`GET /readyz`：仅报告进程健康和关键依赖/快照准备度，不暴露业务数据。
-- BidResponse 的 `nurl`、`lurl`、`burl` 分别指向 DSP 的 win、loss、billable notice endpoint；SSP 按 OpenRTB 2.6 notice 的 HTTP POST 语义和受支持宏发送。回调处理幂等。`nurl`/`lurl` 更新 delivery state，只有符合 DSP 计费策略的 `burl` 产生 spend。
+- BidResponse 的 `nurl`、`lurl`、`burl` 是 bidder 提供的 notice URL。OpenRTB 2.6 不定义通用 JSON notice body；exchange 与 bidder 必须在接入 profile 中约定每类 notice 的 HTTP 方法（win notice 可由 exchange 选择 GET 或 POST）、宏/价格单位、服务身份、签名 reservation reference、终态互斥、超时、重试和响应确认。`nurl` 只更新 win 状态；`lurl`/`burl` 对同一 reservation 只能有一个终态成功。
 - Campaign CRUD/审核管理 API 不属于 bidder endpoint，可作为后续独立控制面需求，不在第一期默认范围。
 
 ### 3.5 DSP 热缓存与零 DB 读取热路径
 
 - DSP 配置事务同时写入 `dsp_config_outbox`；后台刷新器读取新版本，编译 campaign/line item/targeting 快照，写入 `dsp:cache:*` 并原子替换各实例的进程内快照。
 - `POST /openrtb2/bid` 不查询 `dsp_db`。不得在 cache miss 时退回 SQL；缓存/本地快照缺失或超过最大陈旧时间时，该实例不就绪或对对应 line item no-bid。
-- 预算租约在后台批量申请，事务预留 MariaDB 中的可用预算；RTB 只消费已预留的本地额度。有效 Billing Notice 使用 MariaDB 事务幂等增加 advertiser spend 并扣预算；Win Notice 只记 win，不扣费。成功结算后异步补足租约。
+- 预算租约在后台批量申请，事务预留 MariaDB 中每个适用预算范围的可用金额；RTB 只消费已预留的本地额度。Notice profile 必须携带可验证的预留引用。有效 Billing Notice 使用 MariaDB 事务幂等地从租额转为实际 spend；Win Notice 只记 win，不扣费。租约退出后仍需保留到 billable 延迟窗口结束，之后再回收余额并异步补足租约。
 - 发布配置时监控实例已加载版本；过期实例从流量池摘除或只禁用相关 line item，不能继续使用无限期旧快照。
 - 缓存重建由 `dsp_db` 权威数据驱动。Valkey 故障时，已有有效进程内快照可按上限继续服务；节点重启后未完成预热前不 ready。
 
@@ -625,6 +888,21 @@ ENGINE = MergeTree
 PARTITION BY toYYYYMM(received_at)
 ORDER BY (tenant_id, namespace, subject_token, effective_at, revocation_id);
 
+CREATE TABLE dmp_identity_revocation_status
+(
+  tenant_id UUID,
+  revocation_id UUID,
+  status_version UInt64,
+  online_status LowCardinality(String),
+  physical_delete_status LowCardinality(String),
+  serving_epoch UInt64,
+  acknowledged_nodes UInt32,
+  serving_nodes UInt32,
+  updated_at DateTime64(3, 'UTC')
+)
+ENGINE = MergeTree
+ORDER BY (tenant_id, revocation_id, status_version);
+
 CREATE TABLE dmp_event
 (
   tenant_id UUID,
@@ -647,7 +925,9 @@ TTL event_date + INTERVAL 13 MONTH DELETE;
 
 `FixedString(64)` 假设 token 是 64 位十六进制 SHA-256；若使用二进制 digest 或 keyed HMAC，按真实编码调整。`namespace` 等低基数枚举可考虑 `LowCardinality`，高基数 subject ID 不应如此编码。事件 TTL `13 MONTH` 只是示例占位，必须由合规/报表需求批准。
 
-受众查询先解析当前已发布 snapshot，然后限定 `tenant_id + snapshot_id + namespace + subject_token + subject_token_key_version` 做精确匹配并限制 segment 数量；同查询/受控 deny set 必须排除有效 revocation tombstone。snapshot id 可在进程内短时间缓存；撤回标记不得依赖长 TTL 缓存，撤回会触发 deny set 失效/刷新。物理删除由重建 membership snapshot 和受控 TTL/分区清理完成。上线前必须用最大分区、撤回比例和生产级基数做 P95/P99/并发压测。
+受众查询先解析当前已发布 snapshot，然后限定 `tenant_id + snapshot_id + namespace + subject_token + subject_token_key_version` 做精确匹配并限制 segment 数量；同查询/受控 deny set 必须排除有效 revocation tombstone。snapshot id 可在进程内短时间缓存；撤回 gate 不得使用无法同步失效的长 TTL 缓存。
+
+撤回流程先将不可变 tombstone 持久化，再向所有可服务的 DMP 查询节点传播带单调递增版本的 deny entry。每个节点维护已应用的 revocation watermark；解析请求只能路由到水位不低于控制面要求的节点。仅当 tombstone 达到部署约定的持久化确认级别且所有可服务节点确认已加载该版本，DMP 才将 online status 设为 `completed`；该状态记录持久化确认后才向调用方返回 `completed`，否则返回 `pending`，SSP 保持本地 subject/link 禁用并阻止再次下发身份。节点重启/扩容时必须先从权威 tombstone 集合恢复并追平水位再进入 ready；水位落后的节点从受众查询流量摘除。无法确认 deny gate 新鲜度时，对身份解析 fail closed。在线状态和物理删除状态分别追加写入 `dmp_identity_revocation_status`，由单一协调器为每个 revocation 分配单调递增 `status_version`；状态查询用 `argMax` 读取最新值，不使用 `FINAL`。物理删除由重建 membership snapshot 和受控 TTL/分区清理完成。上线前必须压测撤回传播延迟、节点失联/重启、最大分区和生产级查询负载。
 
 事件至少一次：相同 `event_id` 可因重试重复写入；分析查询必须采用 `uniqExact(event_id)` 或明确的去重层。不得假设 MergeTree 会提供唯一约束或同步去重；物化视图不能被当作源表去重保障。
 
@@ -656,7 +936,8 @@ TTL event_date + INTERVAL 13 MONTH DELETE;
 | Endpoint | 用途 | 写入/响应规则 |
 |---|---|---|
 | `POST /internal/v1/audience:resolve` | 实时查询某 token 的 segment IDs | 限制结果数；无结果返回空集合；只查已发布快照 |
-| `POST /internal/v1/identity:revoke` | 登记某 namespace subject 的撤回 | 先持久化不可变 tombstone 并使在线解析拒绝该 token；历史快照中的物理删除异步完成并报告状态 |
+| `POST /internal/v1/identity:revoke` | 登记某 namespace subject 的撤回 | 持久化 tombstone 并传播 deny gate；所有可服务查询节点确认前返回 `202 pending`，确认后返回 `completed`；此状态仅表示在线抑制已生效，物理删除状态另行查询 |
+| `GET /internal/v1/identity-revocations/{revocation_id}` | 查询撤回处理状态 | SSP service identity/mTLS | 从状态追加表按 `status_version` 取最新记录，返回 `online_status`、已确认水位和 `physical_delete_status`；仅原请求租户可查询 |
 | `POST /internal/v1/events:batch` | 批量写入去敏事件 | 有界批量；成功仅在 ClickHouse insert 达到约定持久化确认后返回；允许重复投递 |
 | `POST /internal/v1/snapshots` | 创建/登记导入任务（仅在控制面开放时） | 版本化；不可直接发布未校验快照 |
 | `POST /internal/v1/snapshots/{id}:publish` | 校验完成后发布 | 校验租户/provider/namespace/行数/校验和后追加 publication marker |

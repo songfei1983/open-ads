@@ -10,12 +10,12 @@ Test Portal 是独立静态测试客户端，不增加第四个广告业务域�
 
 | 调用方 | 被调用方 | 契约 | 同步性 | 超时/失败行为 |
 |---|---|---|---|---|
-| Supply | SSP | OpenRTB 2.6 BidRequest/BidResponse | 同步 | 总预算受 `tmax` 和供给方约定约束 |
+| Supply | SSP | OpenRTB 2.6 BidRequest/BidResponse | 同步 | 总预算受 `tmax` 和供给方约定约束；生产供给另校验 ads.txt/app-ads.txt 授权并生成/透传 schain |
 | Test Portal / JS SDK | SSP | SSP Client API v1 (`/sdk/v1/ad-requests`) | 同步 | 短期测试 token、tenant/placement scope、精确 CORS allowlist 与 rate limit；返回安全渲染 DTO |
 | SSP | DSP | OpenRTB 2.6 BidRequest/BidResponse | 同步、并发 fan-out | 单 DSP 超时视为 no-bid；其余 DSP 继续 |
 | SSP | DMP | 内部 `Audience Resolve v1` | 同步，可短 TTL 缓存 | 超时不阻塞整个拍卖；按 Placement 策略无受众继续或 no-bid |
-| SSP | DMP | 内部 `Event Batch v1` | 异步重试，经 SSP outbox | DMP 暂不可用时保留并重试；设置最大积压和告警 |
-| SSP | DSP | OpenRTB `nurl`/`lurl`/`burl` 回调 URL | 异步回调 | win/loss 只记状态；仅 billable event 按合同触发 DSP spend，重复通知幂等 |
+| SSP | DMP | 内部 `Event Batch v1` | 异步重试，经有界 Valkey Stream | 分析事件按 at-least-once 投递；最大积压、保留期和允许丢失目标必须配置并告警；若某事件必须可靠传播，改用与源事务绑定的 MariaDB outbox |
+| SSP | DSP | OpenRTB `nurl`/`lurl`/`burl` notice URL | 异步回调，按双方 profile | win/loss 只记状态；仅 billable event 按合同触发 DSP spend；方法、宏、认证和重试策略由接入 profile 确定 |
 
 OpenRTB 的 no-bid 语义和 HTTP 表达按 2.6 契约实现；不得把内部 DMP API 包装成 OpenRTB endpoint。
 
@@ -45,9 +45,9 @@ sequenceDiagram
     B-->>P: OpenRTB BidResponse 或 no-bid
   end
   P->>P: 校验候选、按 auction policy 选胜者
-  P->>V: 追加 outcome 到 outbox
+  P->>V: 追加 best-effort telemetry 到有界 Stream
   P-->>S: OpenRTB BidResponse 或 no-bid
-  V-->>M: 批量 Event Batch v1（异步重试）
+  V-->>M: 批量 Event Batch v1（异步重试，按事件投递目标处理）
 ```
 
 实际实现可让 DMP 查询与 DSP fan-out 并行；只有需要受众数据的 DSP 请求必须等待解析，未配置受众依赖的 DSP 可以先并发发起。实现不得越过总 deadline。
@@ -118,9 +118,16 @@ sequenceDiagram
   DDB-->>B: 事务提交后响应
 ```
 
-竞价/投放 delivery event 通过各自有界 Valkey Stream 缓冲，以 at-least-once 消费者批量写入对应 MariaDB 的 `ssp_delivery_event`/`dsp_delivery_event`；仅在 DB 提交后 ack，使用稳定 source event key 去重。缓冲积压、重试、淘汰和丢弃必须告警；Valkey 不替代 MariaDB 日志事实。账务事件不得只存在缓存队列：publisher payable 触发事件在 `ssp_db` 原子落账，DSP 的 billable notice 在 `dsp_db` 原子落账。账务 endpoint 是独立回调，不阻塞原始 RTB BidRequest 的响应时限。
+竞价诊断和分析 delivery event 通过各自有界 Valkey Stream 缓冲，以 at-least-once 消费者批量写入对应 MariaDB 的 `ssp_delivery_event`/`dsp_delivery_event` 或 DMP；仅在下游确认后 ack，并以稳定 source event key 去重。该路径不是事务 outbox，必须公布允许丢失量/RPO、最大积压、保留期、trim 策略和故障恢复办法；达到丢弃阈值时告警。若某领域事件属于必须可靠传播的业务事实，应在产生该事实的 MariaDB 事务中写入 outbox，再异步投递。Valkey 不替代 MariaDB 账本。账务事件不得只存在缓存队列：publisher payable 触发事件在 `ssp_db` 原子落账，DSP 的 billable notice 在 `dsp_db` 原子落账。账务 endpoint 是独立回调，不阻塞原始 RTB BidRequest 的响应时限。
 
 OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` 是 exchange 按约定 billable policy 调用的账单通知。publisher 应付金额按 SSP 与 publisher 的合同策略计算，可能基于有效展示或其他约定事件，不直接等同 DSP 的 bid price 或 advertiser spend。SSP gross revenue、publisher payable 和 SSP margin 是不同指标；本设计的 PublisherPayableLedger 只记录应付负债。
+
+### DSP 预算风险生命周期
+
+预算总额按币种、LineItem 和预算周期维护 `spent + leased_total <= limit`。`leased_total` 包含实例本地可用额度及已扣留的在途风险，不重复相加。后台把额度租给唯一进程 incarnation；实例发 bid 前以稳定 reservation ID 在本地原子扣留该 bid 的最大 billable 金额，并在 DSP 返回的 notice URL 中放入签名 reservation reference。reference 至少绑定 tenant、line item、所有适用预算 lease/scope、auction/bid/imp、最大金额、币种、expiry 和 key version，不含用户标识。RTB 热路径不写 MariaDB。
+
+收到合法 `lurl` 或 `burl` 后，DSP 在 MariaDB 单事务内插入唯一 reservation settlement，并校验租约状态/宽限期、币种和上限；事务先查询 reservation 的既有终态，重复同结果即使迟到也返回幂等成功，reservation ID 对应不同结果则隔离冲突。只有未结算且超过 grace 的 reservation 才隔离。loss 从各适用账户和 lease 的 `leased/held` 中扣除最大预留额，将额度退回全局池；billable 扣除同一预留额并增加实际 spend，预留与实际金额的差额回到全局池。已释放金额不补回原实例租约，因此重复 loss 不能恢复本地出价额度。一个 reservation 覆盖的所有预算范围须在同一事务成功，否则整体回滚。租约到期停止新 bid，但未结算的 held 额度保留到宽限期；期满仍未收到终态 notice 的余额才回收。超出窗口的未结算 notice 隔离对账，不得使预算账户超限。
+收到合法 `lurl` 或 `burl` 后，DSP 在 MariaDB 单事务内插入唯一 reservation settlement，并校验租约状态/宽限期、币种和上限；事务先查询 reservation 的既有终态，重复同结果即使迟到也返回幂等成功，reservation ID 对应不同结果则隔离冲突。只有未结算且超过 grace 的 reservation 才隔离。loss 从各适用账户和 lease 的 `leased/held` 中扣除最大预留额，将额度退回全局池；billable 扣除同一预留额并增加实际 spend，预留与实际金额的差额回到全局池。已释放金额不补回原实例租约，因此重复 loss 不能恢复本地出价额度。一个 reservation 覆盖的所有预算范围须在同一事务成功，否则整体回滚。租约到期停止新 bid，但未结算的 held 额度保留到宽限期；`settlement_grace_until` 至少为 `expires_at + 接入 profile 最大通知延迟 + 最大重试窗口 + 时钟偏差余量`。期满仍未收到终态 notice 的余额才回收。超出窗口的未结算 notice 隔离对账，不得使预算账户超限。
 
 ## 4. 服务与领域边界
 
@@ -139,7 +146,8 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 - OpenRTB bidder adapter 校验版本、request ID、impression 和预算 deadline。
 - Bid application service 使用 DSP 自己的 campaign/line item/creative/targeting/budget 领域快照生成候选。
 - DSP 使用独立的 `dsp_db` 存配置、预算账本、预算租约和 win settlement；Valkey/进程内保存版本化候选与投放快照。
-- 热路径只读已预热的本地快照（可由 Valkey 分发/恢复），不在每个 bid request 上读取 MariaDB。后台刷新器消费配置版本变更；预算租约在后台预分配，热路径仅扣减本地租约额度。
+- 热路径只读已预热的本地快照（可由 Valkey 分发/恢复），不在每个 bid request 上读取 MariaDB。后台刷新器消费配置版本变更；预算租约在后台预分配，热路径仅在租约内原子地把可用额度转成在途风险额。
+- 频控与 pacing 是独立于 lease 的投放控制策略；上线前需确定 line item 维度、时间窗口/时区、重置和多实例计数一致性。没有相应策略定义与状态存储的版本不得声称支持该策略。
 - DSP 自己定义 `DeliveryLog` 与 `AdvertiserSpendLedger`；只对验证通过且符合计费策略的 billable event 入账。`nurl` win notice 只更新竞价状态，不自动扣 advertiser budget。
 - DSP 只接收其自己的 OpenRTB `buyeruid`/获准 `eids`，不读取 SSP identity link 或 DMP 身份映射；DSP 不因竞价要求反向索取全局 user ID。
 - 不调用 SSP/DMP 数据库。OpenRTB Win Notice 记为非计费赢标事件；DSP 只在 billable notice 到达后按内部唯一事件 ID 幂等扣减 advertiser spend。
@@ -156,7 +164,7 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 - **SSP / MariaDB + Valkey**：`ssp_db` 是 SSP 配置/供给数据事实源，InnoDB 事务提交后由后台刷新器更新版本化 Valkey 缓存和进程内快照。Valkey 丢失可重建；RTB 缓存 miss 不允许直接读 DB，实例需使用仍在有效期的本地快照，否则对受影响 placement no-bid/不就绪。
 - **DSP / MariaDB + Valkey**：`dsp_db` 是 DSP 配置、预算和 advertiser spend 结算事实源；独立事务保证预算账本和 billable settlement 一致性。Campaign 发布以版本号刷新 Valkey/内存快照；预算租约由后台预分配，实例报告已加载版本，发布控制面等待或告警未跟上的实例。
 - **SSP 财务事件**：同一 MariaDB 事务插入去重后的 billable delivery event、追加 PublisherPayableLedger 分录并更新可重建的余额/日报汇总。应付分录不可覆盖；冲正以带原分录引用的新负分录表达。
-- **DSP 财务事件**：同一 MariaDB 事务插入去重后的 billable delivery event、追加 AdvertiserSpendLedger 分录并扣减 BudgetAccount；重复 `burl` 按唯一 source event key 返回幂等成功，冲正使用新分录。
+- **DSP 财务事件**：同一 MariaDB 事务按 reservation ID 去重并核验终态，插入 delivery event、追加 AdvertiserSpendLedger 分录，并同步更新所有适用的 lease 与 BudgetAccount；重复 notice 幂等成功，冲正使用新分录。
 - **日志语义**：delivery event 是追加式事件，至少一次投递，以稳定 event ID 去重；财务账本是可审计权威记录。运营报表可由日志/账本生成，汇总表可重建，不得反向覆盖账本。
 - **跨系统对账**：SSP 与 DSP 通过 exchange/auction/bid/imp 标识和双方确认的计费事件做定期文件/API 对账；各服务只读写自己的库，不执行跨库 join。SSP publisher payable 与 DSP advertiser spend 金额允许按合同不同，差额应拆解为 fee/revenue share/tax/rounding 等显式项目。
 - **身份映射**：身份 link 只由 SSP 持有且按 publisher/partner 隔离；DMP 收到 HMAC namespace token，DSP 收到自己的 buyeruid。不是三边复制同一个 user ID，也不创建跨库 user table。
@@ -168,11 +176,12 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 
 - SSP 对 DSP 使用每目标独立连接池/并发限制；失败、熔断或超过 deadline 均视为 no-bid，不能拖住其他 DSP。
 - DMP 查询必须有 SSP 端 Valkey 短 TTL 缓存、最大结果数、独立 timeout 和熔断。对无同意/无合法标识的请求不进行解析，也不将可识别原值作为缓存 key。
-- SSP outbox 需有最大容量、老化策略、重试退避和积压告警；达到容量上限时记录明确丢弃计数，不影响响应 deadline。
+- Valkey telemetry Stream 需有最大容量、保留期、重试退避、允许丢失量和积压告警；只有已批准的非账务分析/诊断事件可按策略丢弃。MariaDB 事务 outbox 不得静默丢弃；容量不足时阻止/回滚对应的控制面变更并告警，RTB 热路径 telemetry 则按其独立 loss budget 处理，不延长响应 deadline。
 - DSP 预算租约有额度、实例 owner、过期时间和回收规则；租约暂不可用时停止对相关 line item 出价，不得绕过预算限制。
+- DSP 租约回收不得释放未结算的 bid 风险；loss/billing 必须按 reservation ID 在事务内结算。结算与宽限期回收必须锁定相同 lease/account 行；迟到或冲突 notice 隔离，不得重复增加全局可用额度。
 - 账务通知先验证服务身份、签名/来源、auction/bid/imp 关联和币种/金额范围，再执行幂等落账；无法验证的 notice 隔离并告警，不计入 publisher payable 或 advertiser spend。
 - 日志采集与财务入账使用不同队列/限流池，防止高流量诊断事件挤占账务写入容量；ledger 写失败必须重试/告警，不可静默丢弃。
-- identity sync 必须有可审计的 consent purpose/version、partner allowlist、link TTL 与撤回/删除流程；原始 ID 使用 envelope encryption，仅用 keyed hash 做匹配索引。撤回即停止下发并清理缓存，不记录原始 ID/完整 consent。
+- identity sync 必须有可审计的 consent purpose/version、partner allowlist、link TTL 与撤回/删除流程；原始 ID 使用 envelope encryption，仅用 keyed hash 做匹配索引。SSP 收到撤回先立即禁用本地 subject/link 并清缓存；DMP 只有在撤回 tombstone 已持久化且所有可服务查询节点的 deny gate 均确认后才返回完成。节点未追上撤回水位时不得处理带身份的受众查询；请求方在完成确认前不得重新发送该身份。
 - DMP 的快照/API 响应只返回最小 segment 标识；事件和身份 token 的保留期、删除流程以及 ClickHouse 分区 TTL 需按法规与合同确定。
 - 内部 API 使用 mTLS 或等效服务身份、请求签名/重放保护、每租户限流；错误响应不回显原始身份或完整请求体。
 
@@ -184,6 +193,6 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 
 ## 8. 尚未定案的容量参数
 
-目前没有足够业务输入设置数值型 SLA。进入实现前确定：峰值/突发 QPS、DSP 数量及并发、`tmax` 分布、目标 P95/P99、可用性、DMP membership 行数和更新频率、缓存命中目标、预算超支容忍度、delivery log 与财务账本保留期限/归档策略、日志缓冲可接受积压时间、恢复点/恢复时长、部署地域及法规范围。
+目前没有足够业务输入设置数值型 SLA。进入实现前确定：峰值/突发 QPS、DSP 数量及并发、`tmax` 分布、目标 P95/P99、可用性、DMP membership 行数和更新频率、缓存命中目标、预算超支容忍度及在途风险最长保留窗口、频控/pacing 首期范围、delivery log 与财务账本保留期限/归档策略、日志缓冲允许丢失量/最大积压/RPO、撤回生效 SLA、恢复点/恢复时长、部署地域及法规范围。生产流量还须确定 ads.txt/app-ads.txt、sellers.json 和 schain 的接入责任与校验策略。
 
 按服务划分的完整 API 路由、请求/响应和认证矩阵见 [API 设计](API.md)。
