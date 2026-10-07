@@ -4,7 +4,7 @@
 
 三个服务独立部署、独立故障域、独立数据所有权。服务发现、TLS、密钥分发和部署平台暂不绑定特定云或编排系统。内网 API 必须鉴权并加密；公网 SSP 入口另有流量清洗、限流和请求体上限。
 
-SSP 与 DSP 的业务事实分别存放在 MariaDB 的 `ssp_db`、`dsp_db`，使用独立数据库账号、授权、迁移和连接池；可先共用 MariaDB 集群，但应用没有跨库查询权限。Valkey 是两应用热缓存，不是事实源；缓存使用应用前缀和独立 ACL 身份。RTB 竞价路径不得因缓存 miss 同步回源 MariaDB。
+SSP 与 DSP 的业务事实分别存放在 MariaDB 的 `ssp_db`、`dsp_db`，使用独立数据库账号、授权、迁移和连接池；可先共用 MariaDB 集群，但应用没有跨库查询权限。Valkey 的 SSP/DSP keyspace 是热缓存，不是事实源；DMP 另有隔离 ACL/keyspace 的在线撤回 deny gate，其持久权威记录仍是 ClickHouse tombstone。RTB 竞价路径不得因缓存 miss 同步回源 MariaDB。
 
 Test Portal 是独立静态测试客户端，不增加第四个广告业务域或数据库。原生 JS SDK 调用 SSP Client API；SSP 将 client request 映射成 OpenRTB 2.6 BidRequest，DSP 仍只接收标准 OpenRTB。Portal 仅连接 sandbox/test 环境。
 
@@ -16,6 +16,8 @@ Test Portal 是独立静态测试客户端，不增加第四个广告业务域�
 | SSP | DMP | 内部 `Audience Resolve v1` | 同步，可短 TTL 缓存 | 超时不阻塞整个拍卖；按 Placement 策略无受众继续或 no-bid |
 | SSP | DMP | 内部 `Event Batch v1` | 异步重试，经有界 Valkey Stream | 分析事件按 at-least-once 投递；最大积压、保留期和允许丢失目标必须配置并告警；若某事件必须可靠传播，改用与源事务绑定的 MariaDB outbox |
 | SSP | DSP | OpenRTB `nurl`/`lurl`/`burl` notice URL | 异步回调，按双方 profile | win/loss 只记状态；仅 billable event 按合同触发 DSP spend；方法、宏、认证和重试策略由接入 profile 确定 |
+| Browser render iframe | SSP | `POST /sdk/v1/impressions`、`POST /sdk/v1/events` | 异步 | 校验签名 event token、期限、auction/bid/imp 绑定及唯一 event key；MVP impression 最多 billable 一次，click 永不触发财务 |
+| SSP tracker | DSP | bidder 返回的 `burl`（双方约定 JSON POST profile） | 持久 outbox 异步重试 | 仅在 impression/payable 事务提交后发送；DSP 按 reservation/event ID 幂等结算，重试不重复扣预算 |
 
 OpenRTB 的 no-bid 语义和 HTTP 表达按 2.6 契约实现；不得把内部 DMP API 包装成 OpenRTB endpoint。
 
@@ -122,6 +124,10 @@ sequenceDiagram
 
 OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` 是 exchange 按约定 billable policy 调用的账单通知。publisher 应付金额按 SSP 与 publisher 的合同策略计算，可能基于有效展示或其他约定事件，不直接等同 DSP 的 bid price 或 advertiser spend。SSP gross revenue、publisher payable 和 SSP margin 是不同指标；本设计的 PublisherPayableLedger 只记录应付负债。
 
+### Sandbox billable event 顺序
+
+首期 sandbox 的受控 render endpoint 返回 SSP 托管的静态图片 iframe 文档和短期 event token。图片加载后 iframe POST impression signal；SSP 校验 token 签名/期限、tenant/placement/auction/bid/imp 绑定和一次性 event key，在同一 MariaDB 事务中插入唯一 billable delivery event、PublisherPayableLedger 分录及 DSP billable outbox 记录。事务提交后异步向 DSP `burl` 发送稳定 `event_id`、reservation reference、金额和币种；DSP 验证后在原子结算事务中记 AdvertiserSpendLedger 和预算。点击通过 SSP redirect 记录非账务事件后跳转 allowlisted landing URL。过期、重放或绑定不匹配的事件不得记账。该规则只供 sandbox 账本验收，不代表生产 IVT/可见性保证；生产付款必须另行批准验证、争议和对账规则。
+
 ### DSP 预算风险生命周期
 
 预算总额按币种、LineItem 和预算周期维护 `spent + leased_total <= limit`。`leased_total` 包含实例本地可用额度及已扣留的在途风险，不重复相加。后台把额度租给唯一进程 incarnation；实例发 bid 前以稳定 reservation ID 在本地原子扣留该 bid 的最大 billable 金额，并在 DSP 返回的 notice URL 中放入签名 reservation reference。reference 至少绑定 tenant、line item、所有适用预算 lease/scope、auction/bid/imp、最大金额、币种、expiry 和 key version，不含用户标识。RTB 热路径不写 MariaDB。
@@ -157,12 +163,13 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 - DMP API adapter 实现受众解析、快照发布和批量事件接入；只暴露 provider/segment 公开标识，不暴露 ClickHouse 行结构。
 - Audience application service 负责授权检查、快照选择和结果限制。
 - ClickHouse 保存不可变的 segment definition、membership snapshot、snapshot publication 及分析事件。
+- SSP 与 DMP 都以共享 identity gate 管理 subject admission。SSP auction lease 覆盖 DMP 解析及所有 DSP fan-out 的完成/取消；撤回阻止新 lease 并等待旧 auction drain。DMP 另以 Valkey 原子 admission/in-flight lease 管理解析；撤回阻止新查询、持久化 tombstone 并等待旧查询 drain。SSP 持久禁用 subject/link，迟到结果不得进入 DSP bid request；双方 gate 状态不确定时 fail closed，撤回保持 `pending`。
 - DMP 不读取 SSP Valkey 或 DSP MariaDB；SSP/DSP 也不直接查 ClickHouse。
 
 ## 5. 数据与一致性
 
 - **SSP / MariaDB + Valkey**：`ssp_db` 是 SSP 配置/供给数据事实源，InnoDB 事务提交后由后台刷新器更新版本化 Valkey 缓存和进程内快照。Valkey 丢失可重建；RTB 缓存 miss 不允许直接读 DB，实例需使用仍在有效期的本地快照，否则对受影响 placement no-bid/不就绪。
-- **DSP / MariaDB + Valkey**：`dsp_db` 是 DSP 配置、预算和 advertiser spend 结算事实源；独立事务保证预算账本和 billable settlement 一致性。Campaign 发布以版本号刷新 Valkey/内存快照；预算租约由后台预分配，实例报告已加载版本，发布控制面等待或告警未跟上的实例。
+- **DSP / MariaDB + Valkey**：`dsp_db` 是 DSP 配置、预算和 advertiser spend 结算事实源；daily budget scope 按 UTC 自然日、`00:00 UTC` 切换。独立事务保证预算账本和 billable settlement 一致性。Campaign 发布以版本号刷新 Valkey/内存快照；预算租约由后台预分配，实例报告已加载版本，发布控制面等待或告警未跟上的实例。
 - **SSP 财务事件**：同一 MariaDB 事务插入去重后的 billable delivery event、追加 PublisherPayableLedger 分录并更新可重建的余额/日报汇总。应付分录不可覆盖；冲正以带原分录引用的新负分录表达。
 - **DSP 财务事件**：同一 MariaDB 事务按 reservation ID 去重并核验终态，插入 delivery event、追加 AdvertiserSpendLedger 分录，并同步更新所有适用的 lease 与 BudgetAccount；重复 notice 幂等成功，冲正使用新分录。
 - **日志语义**：delivery event 是追加式事件，至少一次投递，以稳定 event ID 去重；财务账本是可审计权威记录。运营报表可由日志/账本生成，汇总表可重建，不得反向覆盖账本。
@@ -181,7 +188,7 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 - DSP 租约回收不得释放未结算的 bid 风险；loss/billing 必须按 reservation ID 在事务内结算。结算与宽限期回收必须锁定相同 lease/account 行；迟到或冲突 notice 隔离，不得重复增加全局可用额度。
 - 账务通知先验证服务身份、签名/来源、auction/bid/imp 关联和币种/金额范围，再执行幂等落账；无法验证的 notice 隔离并告警，不计入 publisher payable 或 advertiser spend。
 - 日志采集与财务入账使用不同队列/限流池，防止高流量诊断事件挤占账务写入容量；ledger 写失败必须重试/告警，不可静默丢弃。
-- identity sync 必须有可审计的 consent purpose/version、partner allowlist、link TTL 与撤回/删除流程；原始 ID 使用 envelope encryption，仅用 keyed hash 做匹配索引。SSP 收到撤回先立即禁用本地 subject/link 并清缓存；DMP 只有在撤回 tombstone 已持久化且所有可服务查询节点的 deny gate 均确认后才返回完成。节点未追上撤回水位时不得处理带身份的受众查询；请求方在完成确认前不得重新发送该身份。
+- identity sync 必须有可审计的 consent purpose/version、partner allowlist、link TTL 与撤回/删除流程；原始 ID 使用 envelope encryption，仅用 keyed hash 做匹配索引。SSP 收到撤回先立即禁用本地 subject/link 并清缓存；DMP 先写共享 deny gate，再持久化撤回 tombstone，且两者确认后才返回完成。gate 不可用或状态不确定时，受众查询 fail closed；请求方在完成确认前不得重新发送该身份。
 - DMP 的快照/API 响应只返回最小 segment 标识；事件和身份 token 的保留期、删除流程以及 ClickHouse 分区 TTL 需按法规与合同确定。
 - 内部 API 使用 mTLS 或等效服务身份、请求签名/重放保护、每租户限流；错误响应不回显原始身份或完整请求体。
 
@@ -193,6 +200,6 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 
 ## 8. 尚未定案的容量参数
 
-目前没有足够业务输入设置数值型 SLA。进入实现前确定：峰值/突发 QPS、DSP 数量及并发、`tmax` 分布、目标 P95/P99、可用性、DMP membership 行数和更新频率、缓存命中目标、预算超支容忍度及在途风险最长保留窗口、频控/pacing 首期范围、delivery log 与财务账本保留期限/归档策略、日志缓冲允许丢失量/最大积压/RPO、撤回生效 SLA、恢复点/恢复时长、部署地域及法规范围。生产流量还须确定 ads.txt/app-ads.txt、sellers.json 和 schain 的接入责任与校验策略。
+目前没有足够业务输入设置数值型 SLA。进入实现前确定：峰值/突发 QPS、DSP 数量及并发、`tmax` 分布、目标 P95/P99、可用性、DMP membership 行数和更新频率、缓存命中目标、预算超支容忍度及在途风险最长保留窗口、delivery log 与财务账本保留期限/归档策略、日志缓冲允许丢失量/最大积压/RPO、撤回生效 SLA、恢复点/恢复时长、部署地域及法规范围。频控/pacing 不在首期；未来纳入时另行定义范围。生产流量还须确定 ads.txt/app-ads.txt、sellers.json 和 schain 的接入责任与校验策略。
 
 按服务划分的完整 API 路由、请求/响应和认证矩阵见 [API 设计](API.md)。

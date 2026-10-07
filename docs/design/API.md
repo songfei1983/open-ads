@@ -37,9 +37,12 @@ SSP 对外提供 OpenRTB exchange endpoint、浏览器 Client API 和受保护�
 | `POST /sdk/v1/ad-requests` | Portal/JS SDK | 短期 scoped test token；未来公开集成按 placement/origin allowlist | placement、slot、去敏 page context、consent fixture → SDK AdResponse/no-fill | SSP 内部创建 auction 并映射到 OpenRTB；`Cache-Control: no-store` |
 | `POST /sdk/v1/identity` | JS SDK/Publisher page | placement-scoped test/public token + consent state | 可选 publisher pseudonymous subject → SSP-scoped subject ID、expiry、status | 明确 opt-in；ID 按 publisher scope 隔离并存 first-party storage；无 consent 返回 `identity: null` |
 | `POST /sdk/v1/identity-sync` | JS SDK/Publisher page | 同上；已授权的 identity purpose | subject ID、partner ID → allowlisted one-time sync URL/state | 可选 legacy/browser match；只允许登记 partner 和固定 return URL |
-| `POST /sdk/v1/identity:revoke` | SDK/Publisher privacy flow | subject-scoped revoke token / publisher authorization | subject ID、reason、request ID → `pending`/`completed` 与 revocation ID | SSP 先立即禁止该身份参与竞价/同步并失效缓存；仅在 DMP tombstone 持久化且所有可服务查询节点确认 deny gate 后报告 completed |
+| `POST /sdk/v1/identity:revoke` | SDK/Publisher privacy flow | subject-scoped revoke token / publisher authorization | subject ID、reason、request ID → `pending`/`completed` 与 revocation ID | SSP 先阻止新 identity-bearing auction；仅在 SSP 活跃 auction 与 DMP in-flight lookup 均 drain、撤回状态持久化后报告 completed；pending 期间不发送身份/受众 |
 | `GET /sdk/v1/identity-revocations/{revocation_id}` | SDK/Publisher privacy flow | 同一 subject-scoped revoke token / publisher authorization | revocation ID → 当前 `pending`/`completed` 状态 | 只允许原 subject/授权 publisher 查询，不返回 tombstone 或其他用户数据 |
 | `POST /sdk/v1/events` | JS SDK | 与广告 response 绑定的短时 opaque event token | client event ID、event type、token、发生时间 → 接收状态 | 仅作为客户端测量/调试信号；不得单独触发财务 ledger |
+| `POST /sdk/v1/impressions` | SSP 托管的 sandbox render iframe | 广告响应绑定的短时签名 event token | event ID、token、发生时间 → accepted/duplicate/rejected | 校验 auction/bid/imp/placement 绑定、expiry 和一次性约束；仅 sandbox profile 可触发 payable ledger，不构成生产 IVT 证明 |
+| `GET /click/v1/{click_token}` | Browser | 短时签名 click token | opaque token → 记录 click 并 302 到竞价记录中的 allowlisted landing URL | 不接受客户端 redirect 参数；click 不计费；重复请求去重 |
+| `GET /render/v1/{render_token}` | Browser iframe | 短时签名 render token | opaque token → SSP 托管的 sandbox image document | 校验 token 与已胜出 creative 绑定；返回 CSP、`no-store` 和 `no-referrer` |
 
 `ad-requests` 示例：
 
@@ -62,8 +65,8 @@ filled response：
   "ad": {
     "creative_id": "creative-test-1",
     "format": "image",
-    "render_url": "https://render.test.example/signed/short-lived-token",
-    "click_url": "https://ssp.test.example/click/opaque-token",
+    "render_url": "https://render.test.example/render/v1/signed/short-lived-token",
+    "click_url": "https://ssp.test.example/click/v1/opaque-token",
     "event_token": "short-lived-opaque-token",
     "expires_at": "2026-10-01T12:00:30Z"
   }
@@ -86,6 +89,8 @@ filled response：
 响应只返回 SSP 生成的 opaque `subject_id`、`scope`、`expires_at`，不回显 publisher ID。`publisher_subject.value` 仅用于匹配，SSP 只保存带独立 HMAC key 的索引，不保留明文；没有 publisher subject 时，可由 SSP 生成随机 subject ID 并在 consent 允许时由 SDK 保存于 publisher first-party storage。
 
 no-fill 使用 `200` + `{"request_id":"...","status":"no_fill"}`。错误响应包含 `code`、`request_id` 和对客户端安全的简短 `message`。无广告不是 transport error。测试 diagnostics 需单独授权 scope，默认不返回 bidder、用户或完整 OpenRTB 详情。
+
+首期 renderer 只输出 SSP 托管的静态 PNG/JPEG/WebP image creative，不执行 DSP HTML/JavaScript。Impression 请求只携带 event token、稳定 `event_id` 和 `occurred_at`；SSP 从已保存的竞价记录恢复金额、currency、DSP 和 reservation。Sandbox profile 中第一个有效 impression 在同一 `ssp_db` 事务写入唯一 billable delivery event、publisher payable ledger 和 DSP billable outbox；之后由 outbox 按 DSP `burl` 的 sandbox JSON POST profile 重试。Publisher payable 暂为该有效 DSP billable amount 的 100%，不代表生产 payout。普通 `/sdk/v1/events` 与 click 永不触发财务分录。
 
 ### 2.3 Portal token 与 SSP 管理 API
 
@@ -135,10 +140,29 @@ DSP 的 bidder endpoint 与 advertiser/campaign 管理 API 分开部署或分开
 | `POST /openrtb2/bid` | SSP/exchange | OpenRTB 2.6 BidRequest → BidResponse 或 no-bid | 按 request deadline 和已加载快照决策；不得在 cache miss 时回源 MariaDB |
 | 按 bidder 返回的 `nurl` 调用 | SSP/exchange | 方法、认证和宏替换按双方 OpenRTB 接入 profile；win notice 可使用 GET 或 POST | 记录 win 状态，不直接扣 advertiser spend |
 | 按 bidder 返回的 `lurl` 调用 | SSP/exchange | 方法、loss code/macro 和鉴权按双方 profile | 记录 loss 状态；仅在确认不再 billable 时释放预算风险 |
-| 按 bidder 返回的 `burl` 调用 | SSP/exchange | 方法、billing macro、金额单位、签名和幂等引用按双方 profile | 校验 source event、reservation、币种/金额与合同策略后，在事务中写 spend ledger 并更新所有适用预算范围 |
+| 按 bidder 返回的 `burl` 调用 | SSP/exchange | MVP 双方 profile：HTTPS POST JSON、mTLS + 签名 reservation reference | 校验 event/auction/bid/imp、reservation、币种/金额上限后，在事务中写 spend ledger 并更新所有适用预算范围；重复 event 幂等成功 |
 | `GET /healthz` / `GET /readyz` | 运维探针 | 无业务 body | 报告服务存活、配置版本/预算租约可用状态 |
 
 通知 URL 由 DSP 在 BidResponse 对应 bid 的 `nurl`、`lurl`、`burl` 提供。OpenRTB 不定义通用 JSON notice payload；双方 profile 必须定义方法、宏、签名/认证、重放保护、超时、重试、成功响应及 reservation/source event ID。billing price 宏的替换和结算金额按 profile 确定，不以 win price 自动替代 billable price。SSP 仅调用已登记 bidder 的合法 HTTPS host，并校验重定向/解析后的目标，避免 SSRF。
+
+MVP `burl` JSON body：
+
+```json
+{
+  "event_id": "stable-billable-event-id",
+  "auction_id": "auction-id",
+  "bid_id": "bid-id",
+  "imp_id": "imp-id",
+  "reservation_ref": "signed-reservation-reference",
+  "amount_micros": 2500,
+  "currency": "USD",
+  "occurred_at": "2026-10-07T12:00:00Z"
+}
+```
+
+SSP 只在 payable transaction/outbox commit 后投递；重试复用 `event_id` 和相同 body。DSP 校验金额不超过 reservation 上限且 currency 一致。首期金额按 first-price CPM 单次展示金额计算，并按已定义的 half-even 规则舍入。
+
+回执约定：DSP 仅在账务事务提交后返回 `204`；相同 `event_id` 且内容一致的重复 notice 也返回 `204`，同 ID 不同内容返回 `409` 并隔离。无效签名/身份、schema 或 reservation 返回 `4xx` 并隔离，不自动重试；网络错误、`429`、`5xx` 按 `Retry-After` 或带抖动的指数退避重试，直到 reservation grace 截止。截止仍未确认的 outbox 项保留并告警/对账，不静默丢弃。MVP 的 placement、DSP bid、creative 及 notice currency 必须完全一致，不做汇率换算。
 
 ### 3.2 DSP 管理/控制 API
 
@@ -149,21 +173,47 @@ DSP 的 bidder endpoint 与 advertiser/campaign 管理 API 分开部署或分开
 | `GET/POST /admin/v1/advertisers`、`PUT /admin/v1/advertisers/{id}` | 广告主管理 | 状态、允许币种 |
 | `GET/POST /admin/v1/campaigns`、`PUT /admin/v1/campaigns/{id}` | Campaign 管理 | 状态、时间窗、目标 |
 | `GET/POST /admin/v1/line-items`、`PUT /admin/v1/line-items/{id}` | 投放与预算配置 | targeting、bid、daily/lifetime budget、币种 |
-| `GET/POST /admin/v1/creatives`、`PUT /admin/v1/creatives/{id}` | 素材与审核 | format、asset reference、review state |
+| `GET/POST /admin/v1/creatives`、`PUT /admin/v1/creatives/{id}` | 素材与审核 | format、asset reference/hash、server-derived width/height、review state |
+| `POST /admin/v1/creative-assets` | DSP 管理员 | 管理员 RBAC；multipart PNG/JPEG/WebP upload | 校验 MIME、文件签名、尺寸与大小后写入不可变 asset store；返回 `asset_ref`、SHA-256、解码所得宽高，不返回可公开长期访问的 bucket URL |
 | `POST /admin/v1/campaigns/{id}:publish` | 发布配置版本 | 校验配置并返回 `config_version`、发布状态 |
 | `GET /admin/v1/budgets/{line_item_id}` | 查看预算账本汇总 | spent/reserved/available、currency、ledger version |
 
 管理 API 不允许客户端直接调整 `spent` 汇总字段。财务调整必须生成带原因和审计身份的新 ledger entry。
 
+首期 `line-items` 写入 DTO 至少包含 `campaign_id`、状态、`bid_cpm_micros`、currency、daily/lifetime budget、`targeting` 和关联 creative IDs。daily budget 按 UTC 自然日聚合，`period_start` 为 UTC 日期，`00:00 UTC` 开始新 scope；不接受租户本地时区配置。Targeting 仅支持 `site_domains`、`page_path_prefixes`、`banner_sizes`；同数组内 OR，指定维度间 AND。domain 为规范化 host 精确匹配，path prefix 按路径段边界匹配，size 精确匹配；省略维度表示不限。未知字段或不支持条件在 publish 时返回 `422`，成功发布生成不可变 targeting version。首期 creative 只接受受控 asset store 的静态 PNG/JPEG/WebP 与 HTTPS landing URL，不接受任意 HTML/JS。
+
+Asset store 是无领域模型的共享对象存储基础设施：DSP 控制面只写、SSP renderer 只读。对象不可覆盖，`asset_ref` 是不透明 key；上传时校验实际文件签名与解码尺寸。创建 creative 时服务端从 asset metadata 复制宽高与 hash 到 creative 记录，不接受调用者自报尺寸；publish 时复核 asset hash、MIME 和尺寸。OpenRTB sandbox profile 在 `seatbid[].bid[].ext.openads` 中携带 `asset_ref`、`asset_sha256`、`asset_width_px`、`asset_height_px` 和 `landing_url`；SSP 校验其与注册 creative 的 metadata 一致后绑定到短时 render token，不执行 `adm` 中的任意 HTML/JavaScript。Renderer 通过服务端只读凭据取图，不将对象存储凭据暴露给浏览器。
+
+```json
+{
+  "campaign_id": "campaign-test-1",
+  "status": "active",
+  "bid_cpm_micros": 2500000,
+  "currency": "USD",
+  "daily_budget_micros": 1000000000,
+  "lifetime_budget_micros": 10000000000,
+  "targeting": {
+    "site_domains": ["publisher.test"],
+    "page_path_prefixes": ["/sports"],
+    "banner_sizes": [{"w": 300, "h": 250}]
+  },
+  "creative_ids": ["creative-test-1"]
+}
+```
+
+DSP bidder 热路径只使用成功发布的配置快照。MVP 采用 `at=1` first-price CPM；频控、pacing、Deal、video/native 和 user-level targeting 不在首期支持范围。
+
 ## 4. DMP API
+
+DMP 在线撤回使用独立 Valkey ACL/keyspace 的共享 deny gate，ClickHouse 保存权威 tombstone。受众解析通过原子 admission 登记 in-flight lease，返回前复核 deny 并释放 lease；gate 不可用或 epoch 未恢复时返回 `503 policy_state_unavailable`，不得返回受众。SSP 也使用跨实例 subject admission lease，覆盖受众解析和 DSP fan-out。撤回原子阻止两侧新 admission，持久化撤回状态并等待 SSP auction 与 DMP lookup 全部 drain 后才返回 `completed`；迟到结果必须丢弃，pending 期间不得发送该身份或使用其受众结果。
 
 ### 4.1 内部实时/批量接口
 
 | Method / path | 调用方 | 请求/响应 | 语义 |
 |---|---|---|---|
-| `POST /internal/v1/audience:resolve` | SSP | namespace、伪名 token、tenant、purpose/consent、max segments → snapshot/provider/segments | 只读已发布快照；无匹配返回空集合；拒绝授权不返回受众 |
-| `POST /internal/v1/identity:revoke` | SSP | namespace、subject token、revocation ID、effective time | 持久化 tombstone 并传播 deny gate；返回 `202 pending` 或 `completed`；completed 表示所有可服务查询节点均已确认 |
-| `GET /internal/v1/identity-revocations/{revocation_id}` | SSP | SSP service identity/mTLS | revocation ID → online suppression status、已确认水位、physical deletion status | 用于恢复异步撤回状态；`completed` 仅表示在线抑制生效，不代表历史快照物理删除完成 |
+| `POST /internal/v1/audience:resolve` | SSP | namespace、伪名 token、tenant、purpose/consent、max segments → snapshot/provider/segments | 只读已发布快照；无匹配返回空集合；拒绝授权不返回受众；deny gate 不可用返回 `503 policy_state_unavailable` |
+| `POST /internal/v1/identity:revoke` | SSP | namespace、subject token、revocation ID、effective time | 原子拒绝新 admission，持久化 tombstone 并 drain 旧 in-flight lease；返回 `202 pending` 或 `completed`；completed 表示 gate、tombstone、状态和 drain 均已确认 |
+| `GET /internal/v1/identity-revocations/{revocation_id}` | SSP | SSP service identity/mTLS | revocation ID → online status、gate epoch、drained lookup count、physical deletion status | 用于恢复异步撤回状态；`completed` 表示 admission 已关闭且旧 lookup 已 drain，不代表历史快照物理删除完成 |
 | `POST /internal/v1/events:batch` | SSP/授权事件生产方 | `batch_id`、schema version、events[] → accepted/rejected counts | 有界批量写 ClickHouse；至少一次投递，不承诺写入时唯一去重；分析按 event ID 去重 |
 | `POST /internal/v1/snapshots` | 数据导入控制器 | provider、namespace、schema、source version、预期行数/checksum → snapshot/job ID | 创建不可变导入版本 |
 | `POST /internal/v1/snapshots/{id}/members:batch` | 数据导入控制器 | batch ID、membership rows[] → accepted count | 批量导入，幂等重放；不直接对在线读取可见 |

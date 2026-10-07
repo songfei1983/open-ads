@@ -10,7 +10,7 @@
 - **DSP**：接收 OpenRTB BidRequest、做广告候选筛选和出价。业务事实存储在 MariaDB 独立数据库 `dsp_db`，Valkey 仅缓存热数据。
 - **DMP**：管理受众数据和快照，提供受众解析及事件写入 API。业务数据存储使用 ClickHouse。
 
-三个应用各自拥有领域模型、数据库所有权、迁移/发布流程和运行时配置。SSP 与 DSP 可部署在同一 MariaDB 集群，但必须使用不同数据库、账号、迁移流程和最小权限授权；不能跨库查询或共享表。DMP 独立使用 ClickHouse。Valkey keyspace 按应用隔离，只存可重建的缓存/短期缓冲数据。禁止共享领域实体、存储模型、Go `common` 业务包或跨库查询。服务间只通过有版本的 HTTP 契约交互。
+三个应用各自拥有领域模型、数据库所有权、迁移/发布流程和运行时配置。SSP 与 DSP 可部署在同一 MariaDB 集群，但必须使用不同数据库、账号、迁移流程和最小权限授权；不能跨库查询或共享表。DMP 独立使用 ClickHouse。Valkey keyspace 按应用和 ACL 隔离：SSP/DSP 用于可重建缓存/短期缓冲；SSP/DMP identity deny gate 与短期 admission lease 是有界安全协调状态，必须可从各自持久撤回记录恢复，不能承载财务或广告投放事实。禁止共享领域实体、存储模型、Go `common` 业务包或跨库查询。服务间只通过有版本的 HTTP 契约交互。
 
 开发语言为 Go；HTTP 使用标准库 `net/http`，业务层不依赖 Web 框架。数据库驱动和 OpenRTB wire DTO 属于基础设施依赖，不构成领域共享。
 
@@ -21,7 +21,12 @@
 - SSP 与 DSP 的竞价请求/响应遵守 **OpenRTB 2.6**。SSP 是 exchange，DSP 是 bidder；在每个应用内独立实现 wire DTO 到本地领域对象的映射。
 - SSP 到 DMP 的受众解析是内部 REST API，不属于 OpenRTB。DMP 返回 provider/segment 标识后，SSP 将其映射到 OpenRTB 2.6 的 `user.data[].segment[]`，再发送给 DSP。
 - 私有字段只放在明确约定的 `ext` 中；不得修改标准字段含义，也不得要求 DSP 理解 DMP 的内部模型。
-- 每个应用维护自己的 OpenRTB 2.6 契约测试和支持能力清单。具体媒体格式及扩展范围在需求评审后确定。
+- 每个应用维护自己的 OpenRTB 2.6 契约测试和支持能力清单。首期仅支持 image banner；其他媒体格式及扩展范围在后续需求评审后确定。
+- 首期 sandbox MVP 固定为单一 image banner、单币种 placement、OpenRTB `at=1` first-price CPM；不支持 video/native、Deal、频控、pacing 或生产结算。DSP 的 daily/lifetime LineItem 预算仍生效；daily budget 使用 UTC 自然日，按 `00:00 UTC` 切换，不使用租户本地时区或夏令时。
+- 首期 targeting 只支持 `site.domain` 精确匹配、`site.page` 路径前缀匹配和 banner 宽高精确匹配；指定维度间 AND，同维度列表内 OR。没有规则的维度不限制投放。
+- Sandbox 的有效、签名 impression tracker event 是演示账本的 billable trigger；同一 bid 最多计一次，click 只记录测量事件。此规则不构成生产反作弊或付款依据；启用生产结算前必须批准 IVT/可见性规则、publisher 合同和账务对账策略。
+- MVP publisher payable 暂按有效 DSP billable 金额的 100% 记账，不计税费或 SSP fee；收入分成、付款/打款和多币种换汇不在首期范围。SDK/管理控制面只用于 sandbox。
+- DMP audience 可选，MVP 默认不传用户身份；只有有授权且 deny gate 可用时才解析受众。DMP 撤回完成语义由 ClickHouse 持久 tombstone 与 DMP 专用 Valkey deny gate 共同保证。
 - 生产供给接入还须定义 `ads.txt`/`app-ads.txt` 授权校验、`sellers.json` seller 映射和 OpenRTB `source.schain` 的生成/透传策略；它们与 Supply credential 认证互补，不能互相替代。仅 sandbox 流量可暂缓。
 - Test Portal/JavaScript SDK 到 SSP 使用 `/sdk/v1` client API；该 API 只返回浏览器渲染所需的安全字段，禁止让浏览器直接访问 DSP、DMP 或 MariaDB。
 - OpenRTB `user.id`、`buyeruid`、`eids` 按各自标准语义使用；不创建在三个应用间共享的全局 user ID。
@@ -49,7 +54,13 @@
 9. **投放审计**：实时接口只保留必要的去敏事件字段。敏感标识使用受控的伪名化 token；原始 IP、完整 user ID、consent string 和完整 BidRequest 不写普通日志。
 10. **测试入口**：门户使用测试租户/fixture 和短期、受限的 SDK token；线上长期密钥、数据库凭证和 DSP endpoint secret 不进入 HTML、JavaScript bundle 或浏览器存储。
 11. **身份隔离**：SSP 是 exchange identity mapping 的拥有者；为每个 publisher/partner 建 pairwise alias。DMP 只用 tenant/namespace-scoped HMAC token 查受众，DSP 只接收自身 `buyeruid` 和明确授权的 `eids`；无同意/无映射时不传身份，不做 fingerprinting。
-12. **投放控制范围**：频次上限、日预算重置和 pacing 属于 DSP 投放策略，不等同于竞价预算租约。第一期必须明确支持的维度/窗口/时区/策略；未完成配置模型、状态存储和跨实例一致性设计的能力不得宣传为已支持。
+12. **投放控制范围**：频次上限和 pacing 属于 DSP 投放策略，不等同于竞价预算租约，且明确不在首期 MVP 支持范围。首期 daily budget 按 UTC 自然日重置；后续若增加频控/pacing，必须先定义维度、窗口/时区、状态存储和跨实例一致性。
+
+## 4.1 首期 MVP 范围
+
+首期以可完整演示的 sandbox 闭环为验收目标：管理员配置 Supply/Placement 和 DSP advertiser/campaign/line item/creative；Supply 或 SDK 发起请求；SSP 并发调用 DSP；DSP 按已发布 targeting 与预算快照出价；SSP 返回受控图片 render URL；有效 impression 经 SSP tracker 去重后写 SSP payable ledger，并通过持久 outbox 通知 DSP 写 spend ledger。Click 只产生非账务测量事件。Test Portal 能查看 no-fill、request ID、阶段耗时和脱敏诊断。
+
+首期不接受真实 publisher payout 或 advertiser invoice；投放到生产流量前，必须完成本文件验收门槛中的业务、容量、隐私和供给授权确认，并补齐生产反作弊/结算策略。DMP 可单独验证快照解析与撤回屏障，不是无身份 contextual auction 的前置依赖。
 
 ## 5. 组件视图
 
