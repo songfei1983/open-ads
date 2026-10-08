@@ -23,7 +23,7 @@
 - 私有字段只放在明确约定的 `ext` 中；不得修改标准字段含义，也不得要求 DSP 理解 DMP 的内部模型。
 - 每个应用维护自己的 OpenRTB 2.6 契约测试和支持能力清单。首期仅支持 image banner；其他媒体格式及扩展范围在后续需求评审后确定。
 - 首期 sandbox MVP 固定为单一 image banner、单币种 placement、OpenRTB `at=1` first-price CPM；不支持 video/native、Deal、频控、pacing 或生产结算。DSP 的 daily/lifetime LineItem 预算仍生效；daily budget 使用 UTC 自然日，按 `00:00 UTC` 切换，不使用租户本地时区或夏令时。
-- 首期 targeting 只支持 `site.domain` 精确匹配、`site.page` 路径前缀匹配和 banner 宽高精确匹配；指定维度间 AND，同维度列表内 OR。没有规则的维度不限制投放。
+- 首期 targeting 只支持 `site.domain` 精确匹配、`site.page` 路径前缀匹配和 banner 宽高精确匹配；指定维度间 AND，同维度列表内 OR。没有规则的维度不限制投放。**DMP audience segment（OpenRTB `user.data[].segment[]`）在首期 MVP 仅作为 SSP→DSP 的透明透传字段，DSP 出价与 Targeting 不读取、不匹配、不依赖 segments；DMP 子系统完整可独立验收（快照发布、受众解析、撤回屏障），但该能力对竞价候选结果不产生差异化影响。生产启用 segment-level targeting 前需评审新的 Targeting 维度、编译快照字段与压测。**
 - Sandbox 的有效、签名 impression tracker event 是演示账本的 billable trigger；同一 bid 最多计一次，click 只记录测量事件。此规则不构成生产反作弊或付款依据；启用生产结算前必须批准 IVT/可见性规则、publisher 合同和账务对账策略。
 - MVP publisher payable 暂按有效 DSP billable 金额的 100% 记账，不计税费或 SSP fee；收入分成、付款/打款和多币种换汇不在首期范围。SDK/管理控制面只用于 sandbox。
 - DMP audience 可选，MVP 默认不传用户身份；只有有授权且 deny gate 可用时才解析受众。DMP 撤回完成语义由 ClickHouse 持久 tombstone 与 DMP 专用 Valkey deny gate 共同保证。

@@ -132,7 +132,6 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 
 预算总额按币种、LineItem 和预算周期维护 `spent + leased_total <= limit`。`leased_total` 包含实例本地可用额度及已扣留的在途风险，不重复相加。后台把额度租给唯一进程 incarnation；实例发 bid 前以稳定 reservation ID 在本地原子扣留该 bid 的最大 billable 金额，并在 DSP 返回的 notice URL 中放入签名 reservation reference。reference 至少绑定 tenant、line item、所有适用预算 lease/scope、auction/bid/imp、最大金额、币种、expiry 和 key version，不含用户标识。RTB 热路径不写 MariaDB。
 
-收到合法 `lurl` 或 `burl` 后，DSP 在 MariaDB 单事务内插入唯一 reservation settlement，并校验租约状态/宽限期、币种和上限；事务先查询 reservation 的既有终态，重复同结果即使迟到也返回幂等成功，reservation ID 对应不同结果则隔离冲突。只有未结算且超过 grace 的 reservation 才隔离。loss 从各适用账户和 lease 的 `leased/held` 中扣除最大预留额，将额度退回全局池；billable 扣除同一预留额并增加实际 spend，预留与实际金额的差额回到全局池。已释放金额不补回原实例租约，因此重复 loss 不能恢复本地出价额度。一个 reservation 覆盖的所有预算范围须在同一事务成功，否则整体回滚。租约到期停止新 bid，但未结算的 held 额度保留到宽限期；期满仍未收到终态 notice 的余额才回收。超出窗口的未结算 notice 隔离对账，不得使预算账户超限。
 收到合法 `lurl` 或 `burl` 后，DSP 在 MariaDB 单事务内插入唯一 reservation settlement，并校验租约状态/宽限期、币种和上限；事务先查询 reservation 的既有终态，重复同结果即使迟到也返回幂等成功，reservation ID 对应不同结果则隔离冲突。只有未结算且超过 grace 的 reservation 才隔离。loss 从各适用账户和 lease 的 `leased/held` 中扣除最大预留额，将额度退回全局池；billable 扣除同一预留额并增加实际 spend，预留与实际金额的差额回到全局池。已释放金额不补回原实例租约，因此重复 loss 不能恢复本地出价额度。一个 reservation 覆盖的所有预算范围须在同一事务成功，否则整体回滚。租约到期停止新 bid，但未结算的 held 额度保留到宽限期；`settlement_grace_until` 至少为 `expires_at + 接入 profile 最大通知延迟 + 最大重试窗口 + 时钟偏差余量`。期满仍未收到终态 notice 的余额才回收。超出窗口的未结算 notice 隔离对账，不得使预算账户超限。
 
 ## 4. 服务与领域边界
@@ -150,7 +149,7 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 ### DSP
 
 - OpenRTB bidder adapter 校验版本、request ID、impression 和预算 deadline。
-- Bid application service 使用 DSP 自己的 campaign/line item/creative/targeting/budget 领域快照生成候选。
+- Bid application service 使用 DSP 自己的 campaign/line item/creative/targeting/budget 领域快照生成候选。**首期 MVP Targeting 只消费 `site.domain` / `site.page` / banner size，不读取 OpenRTB `user.data[].segment[]`（DMP segment）；SSP 把 DMP 结果原样透传，但 DSP Bid Selection 对 segments 透明、不对其做过滤或加权。这一限制必须在 DSP publish 校验阶段明确拒绝 `targeting.segments` 字段，防止管理员误认为 segment targeting 已生效。**
 - DSP 使用独立的 `dsp_db` 存配置、预算账本、预算租约和 win settlement；Valkey/进程内保存版本化候选与投放快照。
 - 热路径只读已预热的本地快照（可由 Valkey 分发/恢复），不在每个 bid request 上读取 MariaDB。后台刷新器消费配置版本变更；预算租约在后台预分配，热路径仅在租约内原子地把可用额度转成在途风险额。
 - 频控与 pacing 是独立于 lease 的投放控制策略；上线前需确定 line item 维度、时间窗口/时区、重置和多实例计数一致性。没有相应策略定义与状态存储的版本不得声称支持该策略。
@@ -198,8 +197,8 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 
 最低指标：入口 QPS/错误率/延迟分位数；SSP 各 DSP 响应时延、no-bid、超时和清算差异；SSP/DSP delivery event 接收/积压/去重数；publisher payable 与 DSP spend 入账金额、冲正金额、ledger 写入失败/延迟、DSP budget ledger reconciliation 差异；SSP/DSP Valkey 命中率、缓存版本与陈旧度；DMP cache hit、ClickHouse lookup 延迟、快照版本/新鲜度；DSP 预算租约余量和 settlement 重复率；Valkey 内存/淘汰率；分别按 `ssp_db`、`dsp_db` 观测 MariaDB 连接池、事务冲突和慢查询；ClickHouse insert/query 延迟及 parts/磁盘水位。
 
-## 8. 尚未定案的容量参数
+## 8. 容量参数与 SLA 输入项
 
-目前没有足够业务输入设置数值型 SLA。进入实现前确定：峰值/突发 QPS、DSP 数量及并发、`tmax` 分布、目标 P95/P99、可用性、DMP membership 行数和更新频率、缓存命中目标、预算超支容忍度及在途风险最长保留窗口、delivery log 与财务账本保留期限/归档策略、日志缓冲允许丢失量/最大积压/RPO、撤回生效 SLA、恢复点/恢复时长、部署地域及法规范围。频控/pacing 不在首期；未来纳入时另行定义范围。生产流量还须确定 ads.txt/app-ads.txt、sellers.json 和 schain 的接入责任与校验策略。
+数值型 SLA、合规与保留策略需要业务输入后才能量化。设计验收门槛（SLA 输入项检查清单、是否允许进入实现的判定）统一见 [设计 README §6 设计验收门槛](README.md#L85-L95)，本节不重复列出。生产流量还须额外确定 ads.txt/app-ads.txt、sellers.json 和 schain 的接入责任与校验策略。
 
 按服务划分的完整 API 路由、请求/响应和认证矩阵见 [API 设计](API.md)。

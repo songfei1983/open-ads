@@ -21,12 +21,47 @@ wire DTO 和 OpenRTB 类型留在对应服务 adapter 内。领域层不导入 `
 
 货币字段统一以整数微单位存储，`1 currency unit = 1,000,000 micros`；`*_micros` 表示主币单位的百万分之一，`*_cpm_micros` 表示每 1,000 次展示的 CPM 主币微单位。OpenRTB wire `price` 仍按协议以十进制 CPM 传输。对 CPM 计价的 billable event，单次金额按 `round_half_even(cpm_micros * quantity / 1000)` 计算为主币微单位；未提供 `qty.multiplier` 时 quantity 为 1。非 CPM 计价须在交易 profile 定义等价转换。计算使用十进制定点/有理数并检查溢出，不得使用 binary float 累计。对外付款/报表按 ISO-4217 币种最小单位和合同约定的舍入时点转换。
 
+**`*_micros` 数据库类型统一约定（覆盖本节后续所有 CREATE TABLE 的 `_micros` 列）：**
+
+所有金额/报价/预算微单位列在 MariaDB 中统一声明为 `BIGINT SIGNED`（有符号 64 位整数），禁止使用 `BIGINT UNSIGNED`。原因：
+1. `ledger.amount_micros`（账单分录）必须允许负数（冲正/退款/对账差异），如果同一 `_micros` 语义的字段在不同表混用 UNSIGNED/SIGNED，会导致比较运算、SUM 聚合、外键类型不一致等隐式 bug。
+2. UNSIGNED BIGINT 在 Go/SQL driver 层映射到 `uint64`，但财务计算（保留中间结果、临时负数）几乎全部走 `int64` 定点，混用两种类型会造成大量的显式类型转换和溢出风险。
+3. 理论上限：`2^63 - 1 ≈ 9.22 × 10^18 micros = 9.22 × 10^12` 主币单位（如 USD 9.22 万亿），远超任何单笔 campaign、任何账本分录的可想象上限，Signed 范围完全足够。
+
+**非负约束（CHECK）按字段语义分层：**
+
+| 语义（列名示例） | 取值约束（CHECK，所有 DDL 的对应列必须带，除非下方另有说明） |
+|---|---|
+| 上限/报价类：`budget_limit_micros`、`floor_cpm_micros`、`bid_cpm_micros` | `CHECK (col >= 0)`；预算 0 合法（代表暂停投放），floor 0 合法（代表不设 floor） |
+| 累计类：`spent_micros`、`leased_micros`、`held_micros` | `CHECK (col >= 0)`；永远非负 |
+| 预留/实际类：`reserved_max_micros`、`actual_amount_micros`、`available_micros` | `CHECK (col >= 0)`；永远非负 |
+| 事件分录类：`delivery_event.amount_micros` | 允许 `NULL`（未结算 / 非 billable event）；非 NULL 时 `CHECK (amount_micros IS NULL OR amount_micros >= 0)`。首期 Sandbox 印象/点击/渲染事件中非 billable 的 click/render_error 一律存 `NULL`，禁止存 0（0 会在统计中被误当 0 元 billable 事件） |
+| 账本分录类：`publisher_payable_ledger.amount_micros`、`advertiser_spend_ledger.amount_micros` | 允许负数（冲正）；`CHECK (amount_micros != 0)`（零值分录无意义，禁止入库）。冲正必须写一条与原分录金额绝对值相等、符号相反的新分录（附带关联原分录 ID），绝不 UPDATE 历史分录的 `amount_micros`。 |
+
+后续所有 `CREATE TABLE` 中的 `_micros BIGINT UNSIGNED NOT NULL` 应视为 `_micros BIGINT SIGNED NOT NULL CHECK (_micros >= 0)` 的简写。`_micros BIGINT NULL` 与 `_micros BIGINT NOT NULL` 的语义差异必须与上表匹配，不能照搬草稿中的 SIGNED/UNSIGNED 差异。实现时由数据库迁移脚本强制执行上面表中的类型和 CHECK 约束，迁移 review 时的 checklist 条目见本节末尾「DDL review checklist」。
+
 建议端口形态（每个应用自行定义，不跨 module 共享）：
 
 ```go
 type Clock interface { Now() time.Time }
-type IDGenerator interface { NewID() string }
+type IDGenerator interface { NewID() ID }
+// ID 是 128-bit 抽象 ID；内部以 [16]byte 存储，对外提供 hex/UUID 文本的 parse/format。
+// 禁止把 ID 当作"字符串主键"，禁止在代码里手动拼接 hex。
+type ID interface {
+    Bytes() [16]byte
+    String() string // 32 hex chars（无连字符）；wire DTO、HTTP JSON、URL path 均使用此格式
+    IsZero() bool
+}
 ```
+
+**ID 生成统一方案：RFC 9562 UUID v7（时间有序）+ big-endian 字节序。** 禁止使用 UUID v1（MAC 泄漏）、v4（无序导致 B 树索引写放大）或自增 INT（枚举风险 & 跨库合并困难）。
+
+- UUID v7 结构：前 48 bits 为毫秒级 Unix 时间戳（UTC，单调时钟防回拨），中间 12 bits 随机（版本 0x7），后 62 bits 随机（variant RFC 4122 Leach-Salz = `10`）。
+- **MariaDB 存储**：始终使用 `BINARY(16)` + 大端字节序（把 UUID v7 原始 128 bits 按网络字节序写入；不使用 MySQL `UUID_TO_BIN(,1)` 的"时间高位翻转"格式，避免迁移到其他 DB/programming language 时产生 byte order bug）。
+- **ClickHouse 存储**：使用原生 `UUID` 列类型（ClickHouse UUID 是 RFC 4122 大端 16-byte，与 MariaDB BINARY(16) big-endian 逐字节等价；`toString(uuid_col)` 输出的是带 `-` 的 UUID 文本，跨系统传输时统一用 `replaceRegexpAll(toString(uuid), '-', '')` 产出 32-hex 无连字符版本，保证所有服务 wire 格式一致）。
+- **字符串化约定**：所有对外 JSON DTO、HTTP path/query 参数、日志关联 ID、测试输出一律输出 **32 hex 字符、无连字符、全小写**（例如 `018f7a3b2c9d7e1fa3b4c5d6e7f89012`）。解析时同时兼容带连字符（8-4-4-4-12）的 UUID 文本与 32-hex 无连字符两种，但输出永远是无连字符 32-hex。
+- **零值**：全零 16 字节 = `00000000000000000000000000000000`，语义等同于 `NULL`；业务表主键不允许零值，外键允许零值表示"无关联"。
+- **单调性保证**：同一实例、同一毫秒内若产生多 ID，使用每 ID 递增的 counter 填充后 62 bits 的最低若干位，保证同一毫秒生成的 ID 在实例内严格单调；跨实例不要求全局有序。
 
 每个服务的 repository/client 接口使用自己的 domain 类型；不创建通用 `Repository[T]` 或 `common.Entity`。
 
@@ -254,6 +289,152 @@ erDiagram
 
 ClickHouse 表不声明主键或外键；图中的 DMP 连线都是查询/版本关联，不提供数据库级 referential integrity。各表的 `ORDER BY` 是 MergeTree 排序键，不等同于唯一键。
 
+## 1.2 控制面认证与租户模型
+
+管理面（`/admin/v1/*`、`/portal/v1/*`）跨越 SSP 与 DSP 两个 bounded context；两个服务的管理员实体与会话相互独立，不共享用户表、不共享会话存储。Test Portal（静态页面）作为 SSP `/portal/v1/*` 的前端消费者，不拥有任何数据库或业务状态。DMP 管理 API 复用同样的角色与 token 语义，但在 DMP 自己的服务内做独立鉴权。
+
+### 1.2.1 租户（Tenant）概念与 fixture
+
+`tenant_id` 是所有业务表的主键前缀，代表一个数据隔离域。首期 MVP 中：
+- SSP 的 `ssp_db` 中存在一个 `tenant` 表，描述 SSP 侧的租户元数据；SSP 管理 API 的所有资源（Publisher、Property、Placement、DSP Endpoint）均以调用方 `tenant_id` 做行级过滤。
+- DSP 的 `dsp_db` 中同样存在一个独立的 `tenant` 表；DSP 管理 API 的 Advertiser、Campaign、LineItem、Creative 同样以调用方 `tenant_id` 做行级过滤。
+- DMP 使用 ClickHouse 的 `tenant_id` 列做逻辑分区过滤，不单独建租户表。
+- 跨服务调用时，SSP 将自身解析出的 `tenant_id` 放入内部服务请求 DTO（如 `audience:resolve` 的 `tenant_id` 字段）。SSP 发往 DSP 的 OpenRTB BidRequest 不携带 SSP `tenant_id`；DSP 的 `tenant_id` 来自其自身 bidder 接入 profile 中预先配置的 SSP partner→DSP tenant 映射。首期 MVP 两个 DB 中的 sandbox tenant 使用相同的 fixture UUID，便于本地联调。
+
+两个 `tenant` 表结构相同但互相独立（不同数据库、不同迁移周期、不同连接池、最小权限授权）：
+
+```sql
+-- ssp_db 与 dsp_db 分别独立建表，不共享数据、不做跨库同步
+CREATE TABLE tenant (
+  tenant_id BINARY(16) NOT NULL,
+  display_name VARCHAR(128) NOT NULL,
+  status VARCHAR(16) NOT NULL,
+  default_currency CHAR(3) NULL,
+  created_at DATETIME(6) NOT NULL,
+  updated_at DATETIME(6) NOT NULL,
+  version BIGINT UNSIGNED NOT NULL,
+  PRIMARY KEY (tenant_id)
+) ENGINE=InnoDB;
+```
+
+首期 sandbox 预置一条 fixture 租户，由数据库迁移脚本插入：
+- `tenant_id = 0x00000000000000000000000000000001`（UUID v4 全零的占位值，真实生产必须换成随机 UUID）
+- `display_name = 'Sandbox Demo Tenant'`
+- `default_currency = 'USD'`
+- `status = 'active'`
+
+### 1.2.2 管理员用户与 RBAC 角色
+
+SSP 与 DSP 各自在自己的数据库中维护 `admin_user` 表；DMP 首期没有自有的管理登录，管理员通过 SSP 的 super_admin 凭证、借 SSP 管理台的"Data 管理"tab 透传到 DMP 的 `/admin/v1/*`（SSP 管理面内部再调用 DMP），因此 DMP 不建立独立的 `admin_user` 表。
+
+首期 MVP 的角色集：
+
+| 角色 | 适用服务 | 能力边界 |
+|---|---|---|
+| `super_admin` | SSP、DSP | 可操作本服务内所有 tenant；创建/禁用其他管理员；新增/停用 tenant；财务对账/账本冲正 |
+| `ssp_admin` | SSP | 仅在自己所属 tenant 内对 Publisher、Property、Placement、Supply/DSP Endpoint、Identity 全部管理资源有写权限 |
+| `dsp_admin` | DSP | 仅在自己所属 tenant 内对 Advertiser、Campaign、LineItem、Creative、Budget、Targeting 全部管理资源有写权限 |
+| `ssp_viewer` | SSP | 仅在自己所属 tenant 内可读管理资源与运营报表，无写权限 |
+| `dsp_viewer` | DSP | 仅在自己所属 tenant 内可读管理资源与运营报表，无写权限 |
+
+首期 MVP 数据库迁移脚本在 **两个** DB 中各预置 1 条 super_admin fixture 记录，用于本地联调：
+- `username = 'admin@openads.local'`
+- password：由部署环境变量 `OPENADS_MVP_ADMIN_PASSWORD` 指定；**不得写死在代码、迁移脚本常量或 HTML 中**
+- password 存储：使用 Argon2id（推荐参数 `t=3, m=64MB, p=2, salt_len=16, key_len=32`）或等价强度的 password-hash 库；DB 只存 salted hash + 参数元组版本，不存明文
+
+```sql
+-- ssp_db 与 dsp_db 分别独立建表
+CREATE TABLE admin_user (
+  tenant_id BINARY(16) NOT NULL,
+  admin_user_id BINARY(16) NOT NULL,
+  username VARCHAR(255) NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  password_hash_version SMALLINT UNSIGNED NOT NULL,
+  role_set JSON NOT NULL,
+  status VARCHAR(16) NOT NULL,
+  last_login_at DATETIME(6) NULL,
+  created_at DATETIME(6) NOT NULL,
+  updated_at DATETIME(6) NOT NULL,
+  version BIGINT UNSIGNED NOT NULL,
+  PRIMARY KEY (tenant_id, admin_user_id),
+  UNIQUE KEY uq_admin_username (username)
+) ENGINE=InnoDB;
+```
+
+角色行级过滤规则：每个 `/admin/v1/*` handler 在进入业务逻辑前，先从鉴权中间件取出会话中的 `tenant_id`、`subject_admin_user_id`、`role_set`：
+- 含 `super_admin` 时，允许通过 `X-Tenant-Override` header 操作其他 tenant；无 override 时默认使用会话中该管理员的归属 tenant。
+- 不含 `super_admin` 时，会话 tenant 强制等于 SQL 查询条件中的 `tenant_id`，任何 `X-Tenant-Override` 都被忽略并记一次告警。
+- `version` 乐观锁：写操作必须通过 `If-Match` 传入 ETag（即资源 `version` 字段），版本冲突返回 `409`。
+
+### 1.2.3 Portal 登录与会话机制
+
+Test Portal 是 SSP 托管的静态资源包（或独立静态站点），其登录/会话全部依赖 SSP 的 `/portal/v1/*` 接口（**不在 DSP 或 DMP 开放登录**）。首期 MVP 不引入 JWT；统一使用 opaque session_id + HttpOnly Secure cookie，避免把 signing key 管理引入首版。后续生产如需服务间调用或非浏览器 client（如 CI/CD 发布 campaign），可再引入 service account + signed JWT 或 mTLS client cert。
+
+**登录接口（SSP 新增，需同步更新 API.md SSP §2.3）：**
+
+| Method / path | 调用方 | 认证 | 请求/响应 |
+|---|---|---|---|
+| `POST /portal/v1/auth/login` | Portal 登录页 | allowlisted Origin + CSRF double-submit；首次登录无 session | `{username, password}` → `{tenant_id, roles, expires_at}`；同时 Set-Cookie 两个 HttpOnly Secure SameSite=Lax cookie |
+| `POST /portal/v1/auth/logout` | 已登录 Portal | 同 session + CSRF | 空 body → `204`；删除服务端 session，浏览器清除 cookie |
+| `GET /portal/v1/auth/session` | 已登录 Portal | 同 session | 返回当前 `{tenant_id, admin_user_id, roles, expires_at}`；用于 Portal 首屏鉴权 |
+
+登录成功的会话建立步骤（SSP login handler）：
+1. 校验 `Origin` 精确命中 Portal allowlist（配置项，首期可 `https://portal.test.example` 或本地 `http://localhost:5173`）。
+2. 读取 double-submit CSRF：请求 header `CSRF-Token` 必须等于 cookie `openads_portal_csrf`（登录请求允许带 0 值占位 token，因为首次请求还没 session；登录接口 handler 内部对登录请求放宽到"无 cookie 时不校验 CSRF，仅校验 Origin"，避免鸡生蛋）。
+3. Argon2id 校验 username/password，成功则创建新 session 记录。
+4. 生成三条安全 cookie（`Secure` + `HttpOnly` + `SameSite=Lax` + `Path=/` + `Max-Age=3600`；HTTPS 环境必须追加 `Secure`，本地 `http://localhost` 开发可临时取消 `Secure`，但必须有显式配置开关而非默认关闭）：
+   - `openads_portal_sid`：128-bit 随机 hex（opaque session_id）
+   - `openads_portal_csrf`：32-byte 随机 CSRF token 的 double-submit 副本
+   - `openads_portal_tenant`：明文 `tenant_id` hex，供 Portal UI 做只读展示；**不作为鉴权依据**，服务端只信 session store
+5. Session 存储：首期 MVP 优先写 Valkey（SSP 侧专用 ACL/keyspace，key 为 `ssp:portal:session:v1:<sid>`，TTL 1h；value 包含 `tenant_id, admin_user_id, roles, csrf_token, issued_at, expires_at, rotated_sid_of_prev`），保证多实例部署可用；Valkey 不可用时降级到 `ssp_db.portal_session`（下面 DDL），但必须告警。
+
+```sql
+-- ssp_db 仅作 session fallback 存储；正常走 Valkey
+CREATE TABLE portal_session (
+  session_id BINARY(16) NOT NULL,
+  tenant_id BINARY(16) NOT NULL,
+  admin_user_id BINARY(16) NOT NULL,
+  role_set JSON NOT NULL,
+  csrf_token BINARY(32) NOT NULL,
+  issued_at DATETIME(6) NOT NULL,
+  expires_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (session_id),
+  KEY idx_portal_session_expiry (expires_at)
+) ENGINE=InnoDB;
+```
+
+**会话鉴权中间件**（应用到所有 `/portal/v1/*` 与 `/admin/v1/*`）：
+1. 读取 `openads_portal_sid` cookie → 查 session store（先 Valkey，未命中则 fallback ssp_db）→ 确认未过期、关联 `admin_user.status='active'`。
+2. 取会话中的 `tenant_id`、`role_set`、`csrf_token`、`admin_user_id` 注入请求 context。
+3. 对非 GET/HEAD/OPTIONS 的写操作，额外校验 `CSRF-Token` header 值与会话中的 `csrf_token` 完全一致（constant-time 比较）。
+4. **会话续期与轮转**：剩余 TTL < 10min 时，服务端原子生成新 session_id + 新 csrf_token，把旧 session 的 `rotated_sid_of_prev` 指向前一个，写入 1 分钟 TTL 的"旧 sid → 新 sid"重定向映射，再下发新 cookie。单个 session 的**最长总登录时长上限为 12h**，到期强制重新登录，防止无限续期。
+
+失败响应：统一返回 `401 { "code":"AUTH_FAILED", "message":"invalid credentials or session expired", "request_id":"..." }`，不区分用户不存在 vs 密码错误，避免账号枚举。
+
+### 1.2.4 管理面审计日志
+
+所有 `/admin/v1/*` 写操作在 handler 层统一追加 `admin_audit_log` 记录（仅追加，无 UPDATE，无 DELETE），写入各自 DB。
+
+```sql
+-- ssp_db 与 dsp_db 独立建表
+CREATE TABLE admin_audit_log (
+  tenant_id BINARY(16) NOT NULL,
+  audit_id BINARY(16) NOT NULL,
+  admin_user_id BINARY(16) NOT NULL,
+  action VARCHAR(64) NOT NULL,
+  resource_type VARCHAR(64) NOT NULL,
+  resource_id BINARY(16) NULL,
+  before_snapshot JSON NULL,
+  after_snapshot JSON NULL,
+  request_id VARCHAR(128) NOT NULL,
+  occurred_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (tenant_id, audit_id),
+  KEY idx_audit_admin_time (tenant_id, admin_user_id, occurred_at)
+) ENGINE=InnoDB;
+```
+
+敏感字段（`password_hash`、`auth_secret_ref` 的明文、identity 的密文 buyeruid、creative 的 `asset_sha256` 外的任意 secret）在写入审计快照前必须置空或替换为引用键 ID；绝不把完整请求体、完整 DB 行或原始 SQL 写入审计日志。
+
 ## 2. SSP LLD
 
 ### 2.1 聚合与不变量
@@ -282,6 +463,109 @@ Auction 是短生命周期对象，默认只存在于请求上下文中；竞价
 - 拍卖的 `at`、币种、price macro 展开和 notice 规则按 OpenRTB 2.6 与供给方约定实现。`nurl` 表示 win，`lurl` 表示 loss，`burl` 表示符合 exchange 计费策略的 billable event；不得将 win 自动等同于展示或计费。
 - PublisherPayable 由 SSP 的 publisher 合同策略计算，可基于有效展示或合同定义的其他 billable event；金额以主币微单位表达，币种独立记录，并记录策略版本和最终货币最小单位舍入结果。
 - 不支持的 `ext` 忽略或按 profile 拒绝；不把私有字段放入标准字段。
+
+#### SSP 拍卖编排：Bid 候选校验 + 胜者选择（AuctionPolicy）+ Loss Notice 触发时序
+
+本节补充：从并发的 N 个 DSP 返回的 M 个 Bid 中，如何**先做合法性/一致性校验**，再**按 AuctionPolicy 规则选出唯一胜者**，以及**对落选者与胜者的 loss/win notice 何时、以什么失败语义触发**。热路径不读 MariaDB，只读写预热到进程/Valkey 的 Placement、AuctionPolicy、DSP Endpoint 快照。
+
+##### 2.2.0.1 Bid 合法性校验（每个 Bid 独立执行；校验失败的 Bid 被静默丢弃，不进入候选，不触发 loss）
+
+对每个 DSP endpoint 返回的 OpenRTB BidResponse（不区分成功/超时）做以下 9 步：
+
+| # | 校验项 | 失败语义 |
+|---|---|---|
+| 1 | `BidResponse.id == BidRequest.id`（精确 byte-wise 匹配） | 整个 BidResponse 丢弃 |
+| 2 | `seatbid[].bid[].impid` 存在且精确等于请求中某个 imp.id（首期 MVP 只 1 imp，因此必须 == 该 imp.id） | 该 bid 丢弃 |
+| 3 | **币种**：`BidResponse.cur == placement.currency`（首期 MVP 不做汇率换算；请求时 SSP 已把 `BidRequest.cur[] = [placement.currency]` 发给 DSP；仍需防御性校验） | 该 bid 丢弃；若该 DSP 所有 bid 币种不符，记一次 `dsp_currency_mismatch` 指标 |
+| 4 | **Floor**：把 wire `bid.price`（十进制 float CPM）转换为整数微单位 `bid_cpm_micros = round_half_even_to_uint64(bid.price * 1_000_000)`；校验 `bid_cpm_micros >= placement.floor_cpm_micros`（floor 为 placement 域的权威值）；低于 floor → 该 bid 丢弃 | 记 `below_floor_discarded` 指标，不触发 loss |
+| 5 | **尺寸/格式**：bid.w/h == placement 的实际 imp 尺寸（请求里的 banner 宽高）；若 bid 未带 w/h 则从 DSP 的 `ext.openads.asset_width_px/asset_height_px` 读取，仍缺失则丢弃 | 该 bid 丢弃 |
+| 6 | **Creative 元数据一致性**：bid.ext.openads 中必须有 `asset_ref`、`asset_sha256`、`asset_width_px`、`asset_height_px`、`landing_url`；其中 `asset_sha256`、`asset_width_px`、`asset_height_px` 必须与 DSP Endpoint profile 中该 `dsp_id` → 已发布 creative_id（由 DSP 管理员注册的 creative 元数据白名单）**完全一致**。首期 MVP 采用「DSP 管理员先通过 `/dsp/admin/v1/creatives` 注册 creative → SSP 管理台通过 `/ssp/admin/v1/dsp-endpoints/{id}/creatives` 把允许的 creative hash/size 同步到 SSP」的最小白名单模型（避免恶意 DSP 自报任意尺寸/hash 导致渲染不一致）；如果 SSP 侧没有该 creative 的白名单记录则 bid 丢弃。 | 该 bid 丢弃，记 `creative_not_whitelisted`，不触发 loss |
+| 7 | **Landing URL allowlist**：`ext.openads.landing_url` 的 host 必须命中 DSP endpoint profile 中配置的 `allowlisted_landing_hosts[]`；首期 MVP 不允许任意 landing URL，防止 SSRF/绕过域名安全。 | 该 bid 丢弃 |
+| 8 | **Win/Loss/Bill notice URL host**：bid 返回的 `nurl` / `lurl` / `burl` 的 host 必须精确命中 DSP endpoint profile 中配置的 `allowlisted_callback_hosts[]`，未命中则用该 DSP 默认回调模板覆盖或（默认策略）**丢弃该 bid**，防止 SSP 被利用为 SSRF 代理。 | 该 bid 丢弃 |
+| 9 | **Deadline 剩余时间**：距 `tmax` 剩余 < `config.min_render_token_sanity_ms`（默认 1ms）时，该 bid 不进入候选；winner 选择必须有足够时间构造 render token、写 Valkey auction 结果缓冲、序列化响应。 | 该 bid 丢弃 |
+
+校验阶段丢弃的 bid **不触发 loss notice**（因为从未真正进入候选池，等价于该 DSP 该次 bid 在 SSP 侧被视为未提交）。
+
+##### 2.2.0.2 胜者选择算法（AuctionPolicy，first-price CPM + tie-break + AuctionPolicy 全局规则）
+
+对所有通过上节校验的 bids，按 **AuctionPolicy** 选出 1 个胜者（首期 MVP 每个 imp 只选出 1 个胜者；Deal/多 winner 后续再扩展）。AuctionPolicy 在 Placement 上关联，publish 时编译进 SSP 配置快照。
+
+输入：通过校验的 valid_bids[]、placement_snap、auction_policy_snap、placement.floor_cpm_micros。
+
+Go 风格伪代码（简化核心逻辑）：
+
+```go
+// AuctionPolicy.at = 1 首期 MVP，first-price；字段存在 ext 中但不支持 at=2，直接拒绝 publish。
+if auction_policy.at != 1 { panic("auction policy misconfigured, MVP only supports first-price at=1") }
+
+if len(valid_bids) == 0 {
+    // —— 全落选：触发所有「实际提交了 BidResponse 且 seatbid 非空」 DSP 的 loss notice（见下节）——
+    return NO_FILL
+}
+
+// 排序：先按 bid_cpm_micros DESC（first-price，谁出价高谁赢）；同分进入 tie-break 链：
+//   tie-break ①：DSP endpoint priority INT ASC（小值优先；管理员在 SSP `/admin/v1/dsp-endpoints` 里配置，默认 0；用于 Deal 或信任度分层。首期 MVP 全 0，本条不会触发分歧）
+//   tie-break ②：placement.floor_cpm_micros 与 bid_cpm_micros 的差值 ASC（越接近 floor 的优先？NO：first-price 下应越贵越好，本条只用来防御 bid 完全相等时的稳定排序；因此等价于 bid_cpm_micros 后比较以下可重复确定值）
+//   tie-break ③：auction_policy.tie_breaker == "bid_id_asc" → bid.ID 字节序 ASC；管理员可配置，默认 "bid_id_asc"。
+//
+// 排序的核心不变量：bid_cpm_micros DESC 优先，其余一切 tie-break 只是保证完全相同价格时的稳定可重复。
+sort.SliceStable(valid_bids, func(i, j int) bool {
+    a, b := valid_bids[i], valid_bids[j]
+    if a.BidCpmMicros != b.BidCpmMicros { return a.BidCpmMicros > b.BidCpmMicros }
+    if a.DSPPriority != b.DSPPriority { return a.DSPPriority < b.DSPPriority }
+    switch auctionPolicy.TieBreaker {
+    case "bid_id_asc":
+        return a.BidID < b.BidID
+    default: // 非法 tie-breaker 在 publish 编译时就拒绝；运行时 fallback 到 bid_id_asc + 告警
+        return a.BidID < b.BidID
+    }
+})
+winner := valid_bids[0]
+losers := valid_bids[1:]
+
+// 注：first-price 的成交价 = 胜者自报 bid price，不做「二价 + 0.01$」之类的让步。
+// 这是 README §2 中明确的 MVP at=1 first-price CPM。
+settle_price_cpm_micros := winner.BidCpmMicros
+
+// 后续：
+//  - 对 winner 调用 bid.nurl（Win Notice）
+//  - 对所有 losers（含「提交了 BidResponse 且 seatbid 非空但最终没赢的 DSP 全部 bids 集合」中的每个 Bid）调用其 bid.lurl（Loss Notice）
+//  - 构造 OpenRTB BidResponse 给 Supply / SDK，并绑定 render_token / click_token / event_token
+```
+
+AuctionPolicy 快照字段（首期 MVP 只暴露少量可配置字段；其余按默认）：
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `at` | INT | `1` | 仅允许 `1`（first-price）；publish 时拒绝 `2`（second-price）及其他 |
+| `tie_breaker` | STRING | `"bid_id_asc"` | `"bid_id_asc"` / `"dsp_priority_then_bid_id_asc"`；非法 → publish 返回 `422` |
+| `floor_enforcement` | STRING | `"strict"` | 仅 `"strict"`（低于 floor 的 Bid 丢弃，不进入候选）；后续可加 `"soft"` 但 MVP 不支持 |
+| `currency_policy` | STRING | `"exact_match"` | 仅 `"exact_match"`；不支持汇率换算 |
+
+##### 2.2.0.3 Loss Notice 触发时序、并发与失败语义
+
+**触发范围：** 每个合法提交的 Bid（即该 DSP endpoint 成功返回了 HTTP 200 且 seatbid 数组非空）都分配一个最终状态：
+- 被 §2.2.0.1 校验阶段丢弃的 Bid → **不触发 loss**（等价于「该 bid 没被 SSP 当作有效出价接收」）
+- 通过校验进入了 valid_bids[] 但不是 winner 的 Bid → **触发 loss**（`lurl`），`loss_code = 2`（LOST_TO_HIGHER_BIDDER，OpenRTB 标准值）
+- valid_bids[] 为空但某 DSP 实际提交了非空 seatbid（且其内部 bid 全在 §2.2.0.1 被丢弃 → 这些 bid 本身不触发 loss，但 DSP 端如果提供了「整次请求没赢」的 fallback `lurl` 在 BidResponse 根而非 bid 级，SSP 应按接入 profile 约定是否调用；**首期 MVP 所有 loss 都在 Bid 级（seatbid[].bid[].lurl），不处理 BidResponse 根 lurl**）
+- Winner → **触发 win**（`nurl`）；不触发 loss。
+
+**触发时机：** 不阻塞 OpenRTB 响应的 HTTP 返回。**先把 Supply/SDK 的 BidResponse 发出去**，再在独立的 goroutine 池里异步触发 win/loss notice（以及后续 billable outbox 流程）。原因：调用 DSP notice 的网络延迟会拖慢 Supply 的 tmax deadline，违反 HLD §2 中 SSP 总 tmax 截止的不变量。
+
+```
+时序摘要：
+  并发 fan-out DSP bid → 收集响应 → valid_bids 校验/排序 → 选中 winner
+    → （立即）构造 SSP → Supply BidResponse（包含 winner 的 adm / nurl / price）并发送 HTTP 响应
+    → （异步、独立 worker pool）对 winner 调 nurl；对每个 loser bid 调对应 lurl；
+    → （异步、Valkey auction 缓冲 + 幂等）将 winner 的 bid/reservation 写入短时 auction 结果缓冲（后续 impression tracker 需要用它恢复金额/reservation）
+```
+
+**Win/Loss Notice 的失败语义：**
+- 方法、宏展开（如 `${AUCTION_PRICE}` 精确替换为 `settle_price_cpm_micros / 1_000_000.0` 的十进制字符串，half-even 舍入到 micro 精度）、认证（DSP endpoint profile 中配置的 mTLS / HMAC-SHA256 请求签名）按双方接入 profile 执行。
+- 超时、5xx、429（含 Retry-After）：**最多重试 `max_notice_retries`（默认 3）次，带抖动指数退避，最长重试窗口不超过该 DSP notice grace window；超过仍失败的条目写入 `ssp_delivery_event` 中一条 `notice_delivery_failed` 审计事件，不无限阻塞也不重复到账务层**——因为 win notice 本身不记账、不扣预算（记账只走 `burl` billable notice，见 LLD §3.3），win/loss 的最终状态以 DSP 侧 billable 事件的成功为准，win notice 失败不影响账务正确性。
+- `lurl` 失败：该 bid 对应 reservation 在 DSP 侧将按 `settlement_grace_until` 到期由 lease 回收逻辑自动释放（见 LLD §3.3），因此 SSP 侧 `lurl` 失败不做告警级 P0，只做指标 `lost_loss_notice_delivery_failed`；连续失败率超阈值时升级告警。
+
+**去重保证：** 每个 `nurl`/`lurl` 调用带全局唯一 `notice_id = sha256("notice" + auction_id + ":" + bid_id + ":" + outcome)`，由 SSP 侧 `ssp_notice_outbox`（如果后续引入；首期 MVP 直接把 notice_id 放入 HTTP 请求的 `X-Notice-ID` header 供 DSP 幂等）用于 DSP 去重日志，不做账务幂等；账务幂等由后续 `burl` 的 `reservation_ref` + `source_event_key` 负责，二者解耦。
 
 ### 2.2.1 SSP Client API 与 JavaScript SDK
 
@@ -525,7 +809,46 @@ CREATE TABLE partner_identity_link (
 ) ENGINE=InnoDB;
 ```
 
-控制面在一个 MariaDB 事务内提交聚合变更和 `ssp_config_outbox` 记录。后台刷新器消费未发布变更、装载对应聚合及必要引用、生成不可变快照，再发布到 Valkey/本地内存；重复消费按 aggregate version 幂等处理。publisher subject 的外部 pseudonym 仅存 HMAC 索引，不存明文。identity link 中 partner ID 只以应用层 envelope encryption 密文保存，并带 encryption key version；HMAC 索引使用独立密钥，不能从 HMAC 反推出原值。只允许 SSP identity service 解密，不写日志。表结构是概念草案，软删除、Deal/AuctionPolicy 表和索引需按管理查询模型细化。
+控制面在一个 MariaDB 事务内提交聚合变更和 `ssp_config_outbox` 记录。publisher subject 的外部 pseudonym 仅存 HMAC 索引，不存明文。identity link 中 partner ID 只以应用层 envelope encryption 密文保存，并带 encryption key version；HMAC 索引使用独立密钥，不能从 HMAC 反推出原值。只允许 SSP identity service 解密，不写日志。表结构是概念草案，软删除、Deal/AuctionPolicy 表和索引需按管理查询模型细化。
+
+#### 2.4.1 SSP 配置刷新器（Config Refresher）默认策略
+
+`*_config_outbox` 的消费不做 CDC/binlog；首期 MVP 采用 **带 SKIP LOCKED 的轮询 + 批量发布**，每台 SSP/DSP 实例独立运行各自的 refresher goroutine（不做 leader 选举；同一 tenant/聚合的 version 更新由 DB 乐观锁 + outbox 幂等保证）。流程：
+
+1. **轮询间隔**：`config_refresh_poll_interval = 1s`（±10% 抖动，避免所有实例同一毫秒打 DB）；间隔可按环境配置，最低不得 < 200ms（防 DB 打满）。
+2. **候选选取（避免多实例重复消费）**：每轮以 `READ COMMITTED` 隔离级别、短事务（< 500ms）执行：
+   ```sql
+   SELECT event_id, aggregate_type, aggregate_id, aggregate_version, created_at
+   FROM ssp_config_outbox
+   WHERE published_at IS NULL
+   ORDER BY created_at ASC
+   LIMIT 64
+   FOR UPDATE SKIP LOCKED;
+   ```
+   `SKIP LOCKED` 保证被其他实例锁住的 pending event 直接跳过，不互相等待；`LIMIT 64` 限制单轮批量，避免大事务。
+3. **按聚合去重**：对同一 `(aggregate_type, aggregate_id)` 的多个 outbox 行（管理员快速连续点了 5 次保存），仅保留最高 `aggregate_version`，其余直接标记 `published_at = NOW(6)` 并跳过快照构建（旧版本对当前状态无意义，不得在旧版本上构建快照）。
+4. **快照构建与版本比较**：加载聚合（及关联引用，如 Placement → Property → Publisher → DSP endpoint），序列化不可变快照 struct → 计算 `payload_hash = sha256(snapshot_bytes)` → 与 Valkey 中该 key 的已发布快照 `payload_hash` 比较；**完全相同则直接跳过写入**，只更新 outbox 的 `published_at`，避免 Valkey cache invalidation 风暴。
+5. **Valkey + 进程快照原子发布**：
+   - Valkey：以 pipeline + EVAL（Lua）写 `ssp:cache:v1:{tenant}:<type>:<id>`，保证 `schema_version`、`snapshot_version`、`payload`、`published_at` 字段同时落地；TTL 不依赖过期（配置永不过期，TTL 仅设为 7 天「无人访问则清理」的兜底被动清理，**不负责删除**）。写入成功后做一次 `ssp:cache:v1:{tenant}:manifest:v1`（本 tenant 下所有聚合的 `(type, id, version)` 列表）的增量更新，用于实例启动时全量拉取。
+   - 进程内：以 `atomic.Value` / copy-on-write 方式原子替换本实例的进程只读 map；所有 bid handler **只读该快照 map**，不做 Valkey 回源（Valkey 是实例新启动时的 snapshot 源，正常稳态下热路径不走 Valkey）。
+6. **outbox 最终态写入**：成功（或 payload_hash 未变的跳过）后在同事务内 `UPDATE ssp_config_outbox SET published_at = NOW(6) WHERE event_id IN (...)`。若本轮有任一 outbox 的构建失败（例如聚合 ID 在 DB 中找不到——通常是 race 被其他操作先删了），该条 outbox 单独：
+   - 写入 `failed_attempts = failed_attempts + 1`，`last_failed_at = NOW(6)`，`last_error_msg = <sanitized, no SQL>`（需在 outbox 表中加 3 列，见下补充 DDL）。
+   - `failed_attempts >= 5` 后停止自动重试，管理员需通过 `/admin/v1/config-outbox/{event_id}:retry` 或全量重放按钮手动重放，并触发告警（P1，指标 `config_outbox_failed_total{reason="exhausted_retries"}`）。
+   - 任何单条失败不阻塞本轮其他 outbox 成功推进。
+7. **冷启动/新实例启动全量初始化**：实例启动时不等待 outbox 逐步推进，直接读取 Valkey manifest → 批量 `MGET` 所有快照到进程 map；manifest 缺失或陈旧时才 fallback 从 DB 聚合全量重建一次并回填 Valkey（启动链路 ≤ 5s 允许，超过则 readiness 失败，防止带空快照入流量）。
+8. **最大陈旧容忍度**：进程快照相对 outbox 版本落后 > `snapshot_max_staleness = 10s`（可配置）时，readiness probe 的 `readyz` 返回失败，负载均衡摘除该实例的 bid 流量，但该实例仍持续跑 refresher 追赶。
+
+补充 outbox DDL 列（SSP、DSP 两个 outbox 表一致）：
+```sql
+ALTER TABLE ssp_config_outbox
+  ADD COLUMN failed_attempts SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+  ADD COLUMN last_failed_at DATETIME(6) NULL,
+  ADD COLUMN last_error_sanitized VARCHAR(512) NULL;
+ALTER TABLE dsp_config_outbox -- DSP 侧同样的 3 列
+  ADD COLUMN failed_attempts SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+  ADD COLUMN last_failed_at DATETIME(6) NULL,
+  ADD COLUMN last_error_sanitized VARCHAR(512) NULL;
+```
 
 `publisher_subject.source_subject_hmac` 用于将重复 publisher-scoped pseudonym 稳定映射到 SSP subject；无外部 ID 时由 SSP 生成随机 `subject_id`，consent 允许后由 SDK 保存在 publisher origin 的 first-party storage。optional redirect sync 的 single-use state 只存在有 TTL 的 Valkey entry，与 subject、partner、consent version 绑定，DSP callback 成功后立即删除。
 
@@ -655,6 +978,183 @@ delivery event 是高写入量数据，需批量落库、定义保留/归档周�
 
 频次上限和 pacing 是 LineItem 的投放策略，不是 budget lease 的同义词。进入实现前必须定义频控主体/维度、滚动或自然时间窗口、时区、跨节点计数一致性，以及 pacing 目标、反馈周期和无状态快照过期时的行为；这些规则未定前不得将 LineItem 标记为可发布。
 
+### 3.1.1 Targeting 精确匹配规则（规范化 + 匹配算法）
+
+Targeting 的 JSON DTO 见 [API.md §3.2 line-items DTO 示例](file:///Users/songfei/Develop/github.com/songfei1983/open-ads/docs/design/API.md#L187-L202)。所有字符串在进入只读编译快照前**先规范化**，再以规范化形式做匹配；匹配失败的 line item 不进入候选集。
+
+#### 3.1.1.1 规范化步骤（publish 编译时执行一次，不是每个 bid request 都做）
+
+| 维度 | 规范化规则 | 匹配语义（bid request 字段 vs 规范化后的 targeting 列表） |
+|---|---|---|
+| `site_domains` | 1) 取 host（去掉 scheme、port、userinfo、path、query、fragment）<br>2) 转为 US-ASCII 小写（非 ASCII 域名执行 Punycode/IDNA ToASCII）<br>3) 去掉末尾 `.`（FQDN 尾点）<br>4) publish 时校验 host 非空且不含 `/`、`?`、`#`、空白字符；非法 → publish 返回 `422` | **精确匹配（集合 OR）**：从 OpenRTB `BidRequest.site.domain` 取字段后执行同一份规范化 → 在 `site_domains[]` 中查找；有**任何一个命中**即该维度通过。targeting 省略该字段（或为 `null`/`[]`）→ 该维度不限。 |
+| `page_path_prefixes` | 1) 若 OpenRTB `site.page` 是完整 URL，先 RFC 3986 解析取 `path` 再处理；若已是 path 则直接用<br>2) 执行 `%XX` 解码为 UTF-8 字节，再对 path 段做 percent-encode（unreserved 字符保留，其余按字节编码大写 `%HH`），连续 `/` 折叠为 `/`，空 path 归一化为 `/`，`.`/`..` 段按 RFC 3986 §5.2.4 Remove Dot Segments 处理<br>3) publish 时校验每条 path 以 `/` 开头、非空、无 `?`/`#`/控制字符；非法 → `422` | **路径段边界前缀匹配（列表 OR）**：规范化后的 request `path` 与 targeting 中 `p` 任一前缀满足以下条件即通过：`path == p` **或** `strings.HasPrefix(path, p + "/")`。即 `/sports` 匹配 `/sports`、`/sports/football`，**不匹配** `/sports2`、`/foo/sports`。大小写：默认**区分大小写**；若后续要改，必须在 `placement`/`line_item` 里加显式布尔开关，**不得默认 case-insensitive 否则与 URL RFC 不一致**。 |
+| `banner_sizes` | publish 时校验 `w`/`h` 均为 ≥ 1 的正整数、对 ≤ `10000`（防止异常大位图）；非法 → `422` | **精确宽高匹配（列表 OR）**：OpenRTB `imp[i].banner.w` 和 `imp[i].banner.h`（取 `banner.format[].w/h` 或 `banner.w/h`，请求里若两者冲突以 `banner.w/h` 优先，都没有则跳过该 imp 的 banner 候选），任一 size 命中该列表则维度通过。同一 line item targeting 列表内重复 size 在 publish 编译阶段去重。 |
+
+**请求侧字段提取规则（SSP 先规范化，DSP 只信任 OpenRTB wire）：**
+- SSP 在把 SDK Client Request 映射到 OpenRTB `site.domain` 时，从 `page.origin`（例：`https://publisher.test`）里取出 host 并按上面规范化后写入 `site.domain`；从 `page.path`（例：`/demo`）按上面规范化后写入 `site.page`。SSP 对 Supply 直连的 OpenRTB 请求也要执行同样的规范化流程后再发 DSP，确保 DSP 侧接收的 `site.domain`/`site.page` 已规范化 → DSP 热路径只需直接 compare，不再重复规范化。
+- **Supply 直连 OpenRTB 请求中 `site.domain` 缺失但提供了完整 `site.page` URL 的情况**（许多 exchange 会只传 page URL 不传 domain）：SSP 必须先对 `site.page` 执行 RFC 3986 解析，取 URL 的 host（若 page 是 `https://example.com:8443/foo?a=1`，则 host 为 `example.com`，丢弃 port 8443；因为 CPM targeting 的 domain 维度不含 port），按上面的 `site_domains` 规范化流程（Punycode + lowercase + 去尾点）处理后**回填进 `BidRequest.site.domain`**，再发往所有 DSP。若 `site.page` 既不是完整 URL（无 scheme）且 `site.domain` 为空，则视为 domain 缺失，后续行为和下面「均缺失」一致。
+- 若 Supply 请求里 `site.domain` 和 `site.page` 均缺失、或规范化后结果为空（非法 URL）→ SSP 按 Placement 策略：默认继续走「无 site 上下文的 contextual auction」（DSP targeting 里带 `site_domains`/`page_path_prefixes` 的 line item 全部不匹配），不直接拒绝整次请求。
+
+**维度组合：**
+- 不同维度之间是 **AND**：`site_domains 命中 AND page_path_prefixes 命中 AND banner_sizes 命中`
+- 同一维度列表内是 **OR**（上面表格已说明）
+- 三个维度中任何一个维度列表非空且无任何命中 → 该 line item 不候选
+
+### 3.1.2 Bid Selection 算法（候选生成 + 胜者选择伪代码）
+
+输入：一个 OpenRTB 2.6 BidRequest（1 个 imp，首期 MVP 不支持多 imp）、DSP 进程内版本化快照（所有 active line item + creative + targeting 编译结果 + 可用预算租约）。
+
+输出：0 或 1 个 OpenRTB 2.6 Bid（首期 MVP 对 1 imp 最多返回 1 bid；返回多个不违法但无额外收益，后续 Deal/多 creative rotation 再扩展）。
+
+Go 风格伪代码：
+
+```go
+// —— 步骤 0：基础校验（LLD §3.4 校验之后进入本流程）——
+// 已有前置保证：request.id 非空、imp 非空、imp.id 唯一、bidder 支持的 media type==image banner、
+// 请求 deadline 剩余 > config.min_bid_deadline（否则立即 no-bid）。
+
+imp := request.Imp[0]
+tenant := dsp_bidder_profile.ResolveTenant(ssp_partner_id) // 见 LLD §1.2.1 跨服务 tenant 映射
+
+// —— 步骤 1：从 OpenRTB 取请求上下文（SSP 已规范化，不再重复规范化）——
+normSiteDomain := ""
+if request.Site != nil { normSiteDomain = request.Site.Domain } // SSP 已 Punycode+lowercase+strip tail dot
+normPagePath   := "/"
+if request.Site != nil && request.Site.Page != "" { normPagePath = request.Site.Page } // SSP 已 % 规范化
+bannerW := uint16(0)
+bannerH := uint16(0)
+if imp.Banner != nil {
+    if imp.Banner.W != 0 && imp.Banner.H != 0 { bannerW, bannerH = uint16(imp.Banner.W), uint16(imp.Banner.H) }
+    else if len(imp.Banner.Format) > 0 { bannerW, bannerH = uint16(imp.Banner.Format[0].W), uint16(imp.Banner.Format[0].H) }
+}
+currency := "USD" // 首期 MVP 固定 USD；实际实现按 bidder profile 校验 request.cur 允许列表
+now := clock.Now().UTC()
+if bannerW == 0 || bannerH == 0 { return NoBid("banner_size_missing") }
+
+// —— 步骤 2：编译后的 active line item 过滤 ——
+// candidateIndex 是 publish 时编译好的只读有序数组；lineItemSnap 含 targeting、creative IDs、
+// bid_cpm_micros、关联 campaign 时间窗、归属 advertiser.status、已加载的 lease 状态。
+var candidates []*CompiledLineItem
+for _, li := range candidateIndex[tenant] {
+    // 2a. 基础状态
+    if li.Status != "active" { continue }
+    if li.AdvertiserStatus != "active" { continue }
+    camp := li.CampaignSnap
+    if camp.Status != "active" { continue }
+    if now.Before(camp.StartsAt) { continue }
+    if camp.EndsAt != nil && now.After(*camp.EndsAt) { continue }
+    if li.Currency != currency { continue } // 首期不做汇率换算，币种不一致直接 no-bid 该 li
+
+    // 2b. Targeting（按 §3.1.1.1 语义，AND 语义，缺省维度不限）
+    ok_domain := true
+    if len(li.Targeting.NormSiteDomains) > 0 {
+        _, ok_domain = li.Targeting.NormSiteDomainsSet[normSiteDomain]
+    }
+    if !ok_domain { continue }
+    ok_path := true
+    if len(li.Targeting.NormPagePathPrefixes) > 0 {
+        ok_path = false
+        for _, p := range li.Targeting.NormPagePathPrefixes {
+            if normPagePath == p || strings.HasPrefix(normPagePath, p+"/") { ok_path = true; break }
+        }
+    }
+    if !ok_path { continue }
+    ok_size := false
+    for _, sz := range li.Targeting.BannerSizes {
+        if sz.W == bannerW && sz.H == bannerH { ok_size = true; break }
+    }
+    if !ok_size { continue }
+
+    // 2c. 预算租约可用性（每个 budget scope 同时满足「本地 lease 可用额 ≥ 本次最大计费风险」）
+    //    最大计费风险 = round_half_even(li.BidCpmMicros * 1 / 1000) 即单次展示金额 micros
+    oneImpMicros := RoundedMicrosFromCpm(li.BidCpmMicros, 1)
+    leaseOK := true
+    for _, scope := range li.BudgetScopes { // daily + lifetime，首期两者都必填
+        localLease := li.LoadedLeaseByScope[scope]
+        if localLease == nil || localLease.Status != "active" ||
+            localLease.ExpiresAt.Before(now.Add(config.ReservationMinValidity)) ||
+            localLease.AvailableMicros.Load() < oneImpMicros {
+            leaseOK = false
+            break
+        }
+    }
+    if !leaseOK { continue }
+
+    candidates = append(candidates, li)
+}
+
+// —— 步骤 3：从 candidates 中选中 1 个 line item + 1 个 creative ——
+// 排序规则：按 bid_cpm_micros DESC（first-price，出价高者胜）；
+// tie-break（bid_cpm_micros 完全相同时）按以下比较链直到分出胜负：
+//   ① lifetime_budget_remaining_micros DESC（大预算优先，避免小预算先耗尽造成大盘后续缺货）
+//   ② line_item_id BYTEWISE ASC（确定、可重复）
+// 选中 creative：从 li.CreativeSnapIDs[] 取 publish 时编译好的 round-robin cursor % len(creatives)；
+//   cursor 按进程内原子 counter 每成功选中 1 次 +1（无跨实例一致性需求，MVP 只求近似轮转）。
+if len(candidates) == 0 { return NoBid("no_matching_line_item") }
+
+sort.SliceStable(candidates, func(i, j int) bool {
+    a, b := candidates[i], candidates[j]
+    if a.BidCpmMicros != b.BidCpmMicros { return a.BidCpmMicros > b.BidCpmMicros }
+    if a.RemainingLifetimeBudgetMicros() != b.RemainingLifetimeBudgetMicros() {
+        return a.RemainingLifetimeBudgetMicros() > b.RemainingLifetimeBudgetMicros()
+    }
+    return bytes.Compare(a.LineItemID[:], b.LineItemID[:]) < 0
+})
+winner := candidates[0]
+creative := winner.PickNextCreativeRR(now) // round-robin；creative.status 已在 publish 时保证 active
+
+// —— 步骤 4：本地租约扣留 + 生成 reservation_ref + notice URL ——
+//    *热路径不写 MariaDB*，只在内存原子扣 localLease.AvailableMicros → localLease.HeldMicros。
+reservation := BuildSignedReservationRef(
+    tenant, winner, creative, request, imp, bannerW, bannerH, currency,
+    oneImpMicros, clock.Now().UTC().Add(config.ReservationTtl),
+) // 输出 opaque binary token：绑定 tenant/li/budget_scope/period_start/auction/bid/imp/
+  // max_micros/currency/expires_at/key_version，不含用户标识，HMAC-SHA256 key 只在 DSP 进程。
+
+for _, scope := range winner.BudgetScopes {
+    lease := winner.LoadedLeaseByScope[scope]
+    if !lease.AtomicTryHold(oneImpMicros) {
+        // 竞争失败（刚好被另一个 goroutine 抢光）→ 放弃本条 li，不降级到候选#2；
+        // 视为 no-bid，下一个 request 重新评估。避免穿透候选导致预算状态前后不一致。
+        return NoBid("lease_race_lost")
+    }
+}
+
+// —— 步骤 5：构造 OpenRTB 2.6 BidResponse ——
+// price 按 OpenRTB wire 格式：十进制 float CPM = float64(winner.BidCpmMicros) / 1_000_000.0
+// nurl / lurl / burl 由 bidder profile 展开宏；reservation_ref 放在双方约定的 ext 字段里（burl POST body 的 reservation_ref）。
+bid := &Bid{
+    ID:    request.ID + ":" + NewShortRandID(), // bid ID 可溯源
+    ImpID: imp.ID,
+    Price: float64(winner.BidCpmMicros) / 1_000_000.0,
+    CID:   EncodeHex(campaign.CampaignID),
+    Crid:  EncodeHex(creative.CreativeID),
+    W:     bannerW,
+    H:     bannerH,
+    NURL:  ExpandMacro(bidderProfile.WinTpl, reservation, bid),
+    LURL:  ExpandMacro(bidderProfile.LossTpl, reservation, bid),
+    BURL:  ExpandMacro(bidderProfile.BillableTpl, reservation, bid),
+    Ext: json.RawMessage(fmt.Sprintf(`{"openads":%s}`, json(map[string]any{ // SSP 校验并绑定 render token
+        "asset_ref":       creative.AssetRef,
+        "asset_sha256":    fmt.Sprintf("%x", creative.AssetSHA256),
+        "asset_width_px":  creative.AssetWidthPx,
+        "asset_height_px": creative.AssetHeightPx,
+        "landing_url":     creative.LandingURL,
+    }))),
+}
+return BidResponse{ID: request.ID, Cur: currency, SeatBid: []SeatBid{{Seat: bidderProfile.DSPSeat, Bid: []Bid{*bid}}}}
+```
+
+#### Bid Selection 不变量与失败语义（保证实现者行为一致）
+
+1. **`nurl` win notice 绝不直接扣预算**；只有 `burl` billable notice 进入 `budget_reservation_settlement` 的 billable 分支。见 HLD §3 预算风险生命周期。
+2. **floor 校验在哪侧执行：** DSP 不知道 Placement floor（placement 属于 SSP），因此 floor 检查放在 **SSP 收到 BidResponse 后执行**（见下一节 SSP Winner Selection）。DSP 自己只保证 `bid_cpm_micros` ≥ 管理员在 line_item 上配置的 `min_bid_cpm_micros`（如后续添加；首期 MVP 不设 line_item min bid，等效 min=0 micros，floor 全由 SSP placement 负责）。
+3. **候选集到 #1 的穿透不回退到 #2**：一旦 sort 选中 #1 但在 lease 扣留发生竞争失败，直接返回 NoBid，不降级用 #2。降级会让排序靠前的 line item 的「高 bid 优先」契约失效；下一次 bid request 会重新评估，行为稳定。
+4. **币种强制统一**：首期 MVP 不做汇率换算。SSP Placement、DSP LineItem、Creative 关联、OpenRTB BidRequest.cur 与 BidResponse.cur 必须完全一致；否则：
+   - DSP BidRequest.cur 与 line_item currency 不匹配 → 该 li 不候选。
+   - SSP 收到 DSP BidResponse.cur 与 placement.currency 不匹配 → 该 bid 视为非法丢弃（不进入拍卖）。
+5. **请求的 site/page 缺失**：不导致整个 auction 失败，只让带 site_domains / page_path_prefixes 的 li 不命中；完全 contextual 无 targeting 的 li（比如「全站通投」）仍可候选，保证 no-fill 率可接受。
+
 ### 3.2 MariaDB 表草案
 
 DSP 使用独立 MariaDB 数据库 `dsp_db`，与 SSP 的 `ssp_db` 分开授权、连接池、迁移和备份。全部业务表使用 InnoDB、明确主键、UTC 时间和外键/唯一约束；tenant 条件需进入唯一键与查询索引。
@@ -739,6 +1239,129 @@ CREATE TABLE line_item_creative (
   CONSTRAINT fk_lic_creative FOREIGN KEY (tenant_id, creative_id)
     REFERENCES creative (tenant_id, creative_id)
 ) ENGINE=InnoDB;
+
+### 3.2.1 Creative Asset Store（MVP 实现方案 + asset_ref 生成规则 + SSP renderer 读路径）
+
+`creative.asset_ref` 是 DSP→SSP 跨域共享的**不可变对象引用键**；双方不直接共享对象存储 bucket 或数据库连接，而是通过严格的上传注册流程 + renderer 内部读路径把 asset bytes 安全地送到浏览器。Asset Store 本身**无领域模型**、无 business state，只负责 bytes 的不可变持久化、完整性校验和受控读取。
+
+#### 3.2.1.1 MVP 存储后端：本地文件系统（单节点部署）
+
+首期 MVP 不引入 MinIO/S3 等对象存储集群，使用**本地文件系统 + 显式配置根目录**。部署脚本在 SSP 和 DSP 间建立共享挂载目录（或首次部署时由 DSP 写入，SSP 通过只读 NFS/本地复制机制读取，**两者必须读写同一份底层 bytes**，禁止双写/同步延迟造成 SSP 看不到 DSP 上传的文件）；生产再替换为对象存储实现，只需修改 `AssetStore` 接口实现不改上层逻辑。
+
+配置：
+- DSP 侧：`OPENADS_ASSET_STORE_ROOT=/var/openads/assets/dsp-write`（DSP 进程 `rwx`，其他用户不可读）
+- SSP 侧：`OPENADS_ASSET_STORE_ROOT=/var/openads/assets/ssp-read`（SSP 进程 `r-x`，不可写）
+- 两个路径必须指向同一个底层共享目录（例如同一 NFS mount、同一 bind mount），由运维配置保证。若 SSP 读侧配置路径与 DSP 写侧不一致 → renderer 返回 `503 asset_unavailable` + 告警，不返回占位图（占位图会掩盖配置错误）。
+
+路径布局（所有路径都在 `<ASSET_STORE_ROOT>` 下；不使用符号链接、不使用相对路径穿越）：
+```
+<ASSET_STORE_ROOT>/
+    <tenant_hex>/
+        assets/
+            <sha256_hex[0:2]>/
+                <sha256_hex[2:4]>/
+                    <sha256_hex>  # 以文件内容的 SHA-256 (hex, 64 chars) 作为文件名；无扩展名、无额外元数据文件
+```
+- 目录前缀分两级，每级 2 hex chars（共 256×256=65536 个目录桶），防止单目录文件数过多导致 FS 慢。
+- **文件不可变、永不覆盖、永不就地改名**：如果同一 bytes 再次上传，命中已存在文件即返回成功（幂等）；绝不允许「先删旧再写新」破坏引用完整性。
+- 文件权限：创建后 chmod `0440`，owner DSP-write-only uid，group SSP-read-only gid，其他用户无权限。
+
+#### 3.2.1.2 `asset_ref` 生成规则与约束（DSP 控制面生成，SSP 只信任白名单中已注册的 ref）
+
+`asset_ref` = `"as:" + <tenant_id_hex> + ":" + <sha256_hex>`。例如 tenant=0x0001 的 32 字节 hex，文件 SHA-256 = `deadbeef...` → `as:00000000000000000000000000000001:deadbeefcafebabe...(64 chars 总长度)`。
+
+不变量：
+1. **纯 ASCII、无 `/`、无 `..`、无 URL escape、无换行/控制字符**。SSP renderer 在把 `asset_ref` 映射回文件系统路径时，必须用正则 `^as:[0-9a-f]{32}:[0-9a-f]{64}$` 强校验；不符合该正则的 asset_ref 一律返回 `400 invalid_asset_ref`，防止任意路径穿越。
+2. **`asset_ref` 能唯一定位 bytes（不依赖 creative_id 或 DB 查询）**：renderer 即使暂时拿不到 creative 表快照，也能独立按 ref 读取；DB 中 creative.asset_ref 只是一份权威索引。
+3. **上传后立即计算 SHA-256（服务端重算，不接受客户端自报）**：`POST /admin/v1/creative-assets`（DSP 管理 API，见 API.md §3.2）的 multipart 文件字节到达后，DSP 控制面在写入文件系统的同时流式重新计算 `actual_sha256`，然后：
+   - 若调用方 multipart 中额外传了 `expected_sha256`（可选），与 `actual_sha256` 不一致 → `422 asset_hash_mismatch`，写入的临时文件立即删除（不进入最终路径）。
+   - 把 bytes 写入临时路径 `<ASSET_STORE_ROOT>/.tmp/<pid>.<nanotimestamp>.<rand>` → fsync 后再 `rename(2)`（原子 move）到最终路径（两级前缀 + actual_sha256），确保「不存在半文件可读」的窗口。
+   - 成功后在响应里返回 `{asset_ref, actual_sha256, actual_size_bytes, actual_width_px, actual_height_px, mime_type}`。
+4. **文件大小与 MIME 白名单（upload 时服务端校验，不接受客户端声明的 Content-Type）**：
+   - MIME 判定：读文件开头的 magic bytes，不在白名单的直接 `422 unsupported_mime_type`。白名单 = `{PNG:89504E47, JPEG:FFD8FF, WebP:RIFF....WEBP}`。首期不支持 GIF、SVG、动画 WebP 或 HTML/JS。
+   - 大小上限：10MB；width/height 上限 4096×4096（服务端用纯 Go image decoder 解码后重算）。超限则 `422 asset_too_large` / `422 asset_dimensions_exceeded`。
+   - `creative.asset_sha256`（BINARY(32)）、`asset_width_px`、`asset_height_px` 在创建 creative 时全部来源于 `creative-assets` 上传响应的服务端重算值，**不接受管理员自行填写**；publish 时再与 asset_ref 对应的文件 bytes SHA-256 二次校验一致（防止「上传后 admin 在 DB 里改 creative 记录但文件内容被恶意替换」的 race）。
+
+#### 3.2.1.3 从 Upload → Creative Publish → DSP Bid → SSP 白名单 → Renderer 读的完整链路
+
+1. **上传（DSP 控制面）**：`POST /dsp/admin/v1/creative-assets` multipart → DSP 按上面规则落盘 → 返回 asset_ref 与服务端重算元组。同时 DSP 内部写入 `dsp_db.creative_asset_registry(tenant_id, asset_ref, sha256, size, width, height, mime, uploaded_by_admin_id, uploaded_at)` 作为审计；asset_bytes 只在 FS。
+2. **创建 Creative（DSP 控制面）**：`POST /dsp/admin/v1/creatives` DTO 中 asset_ref 必须已存在 registry（否则 `404 asset_not_found`），asset_ref/sha256/size/w/h/mime 必须与 registry 完全一致（管理员不能在 DB 里改）。
+3. **Creative 注册到 SSP 白名单（DSP↔SSP 最小同步流程，首期 MVP 走管理员显式同步 UI 按钮 + 内部 API）**：
+   - 背景：LLD §2.2.0.1 Bid 校验第 6 条要求 SSP 在接 Bid 时有「该 DSP dsp_id → 允许的 creative hash/size 白名单」。首期 MVP 不引入消息总线，用显式同步 API 加管理员操作（按钮 "发布到 SSP"）：
+   - DSP 管理员点击"同步到 SSP"时，DSP 控制面以服务身份调用 `POST /ssp/internal/v1/dsp-endpoints/{dsp_endpoint_id}/creative-registry:upsert`（SSP 新增的 internal API，仅允许 DSP 服务身份、dsp_endpoint_id 必须是该 SSP partner 的绑定 endpoint），body 为 `[{creative_id, asset_sha256_bin, asset_width_px, asset_height_px, mime, landing_url_host, status, version}]`。
+   - SSP 收到后写入 `ssp_db.dsp_endpoint_creative_whitelist(tenant_id, dsp_endpoint_id, asset_sha256 PK, width PK, height PK, mime, landing_url_host, status, synced_at, version)`；后续 SSP Bid 校验第 6 条直接从 Valkey 缓存的白名单编译快照查。
+   - 管理员也可通过 SSP `/ssp/admin/v1/dsp-endpoints/{id}/creatives` UI 手填单行白名单（用于联调阶段没有自动化同步的情况）。
+   - 失败语义：SSP 不持有 asset bytes，白名单只记录 hash/size/mime，**不做任何 hash 与文件一致性的二次校验**（由 DSP 上传端保证 hash 与 bytes 一致，SSP renderer 读文件后会再重算一次 hash 用于反篡改，见下）。
+4. **DSP Bid → SSP Receive**：DSP 在 `seatbid[].bid[].ext.openads.asset_ref / asset_sha256 / width / height / landing_url` 中自报。SSP Bid 校验第 6 条查白名单 → 不一致则 bid 丢弃。
+5. **SSP Renderer 最终 Render（浏览器请求 `GET /render/v1/{render_token}` → 出图）**：
+   - renderer 是 SSP 内部的 HTTP handler（**不需要独立服务进程**，作为 SSP 一个子路由挂载；但它有独立的只读 credential 访问 Asset Store root，与 SSP 管理控制面的写权限隔离）。
+   - `render_token` 短时有效（TTL 与 SDK response 中的 `expires_at` 一致，默认 ≤5 分钟）、opaque、HMAC-SHA256 签名；token 内绑定 `tenant_id + placement_id + auction_id + bid_id + imp_id + creative_id + asset_sha256_bin + asset_width_px + asset_height_px + landing_url_allowlist_host + expires_at + key_version`。renderer 校验签名、expiry、绑定关系后才允许读文件。
+   - 读文件：从 token 解出的 asset_ref（**不从 query/form 读 asset_ref 防止 URL 注入**；asset_ref 只作为 render_token 内已签名字段）→ 严格按正则 `^as:[0-9a-f]{32}:[0-9a-f]{64}$` 取 tenant_hex 和 sha256_hex → 拼接 `<ASSET_STORE_ROOT>/<tenant_hex>/assets/<sha[0:2]>/<sha[2:4]>/<sha256_hex>` → open 文件，流式读取。
+   - **读时二次 hash 校验（防篡改）**：读 bytes 过程中流式重算 SHA-256，读完后与 render_token 内绑定的 `asset_sha256_bin` 精确比较；不一致 → `503 asset_tampered_detected` + 立即告警（P0），不返回 bytes，不落 audit log 之外的普通日志。
+   - HTTP 响应 headers（安全）：
+     - `Content-Type: <registered mime at upload time>`（image/png / image/jpeg / image/webp；从不读取文件系统扩展名，从不接受 wildcard `application/octet-stream` 或 HTML）
+     - `Content-Length: <actual_size_bytes>`（不启用 chunked，减少浏览器兼容性风险）
+     - `Cache-Control: private, max-age=300, no-transform`（短时缓存可减轻回源；因为 asset 不可变，缓存不会脏）
+     - `X-Content-Type-Options: nosniff`（禁止浏览器 MIME sniff，防止把图片当成脚本/HTML 执行）
+     - `Content-Disposition: inline`（不触发下载对话框）
+     - `Referrer-Policy: no-referrer`
+     - `Content-Security-Policy: default-src 'none'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`（最强 CSP，iframe 只能显示图片本身，不能执行任何脚本、不能加载任何外部资源）
+   - **不允许 render 直接返回 302 到对象存储 URL**（因为会把对象存储 URL 暴露给浏览器，造成凭据泄漏与越权）；renderer 必须以「服务端代理读 + 服务端受控响应」方式出图。
+6. **对象存储不可用/文件缺失/Hash 不匹配**：renderer 一律返回 `503 asset_unavailable`（空 body 或最小占位 SVG；占位 SVG 不含任何可识别的 creative 信息，只显示 "asset unavailable" 文本）+ 指标/告警，绝不返回 200 + 错误图片 + 错误 impression（否则会造成计费错配）。Impression tracker 只在浏览器成功加载了 render 的 iframe 里的图片后才会发；render 503 不会触发 billable impression。
+
+#### 3.2.1.4 上传与同步的 DDL 补充（两 DB 分别）
+
+```sql
+-- dsp_db：asset 审计注册表（用于 creative 创建时的存在性与 hash 绑定校验）
+CREATE TABLE dsp_creative_asset_registry (
+  tenant_id BINARY(16) NOT NULL,
+  asset_ref VARCHAR(128) NOT NULL,
+  content_sha256 BINARY(32) NOT NULL,
+  content_size_bytes BIGINT UNSIGNED NOT NULL,
+  width_px SMALLINT UNSIGNED NOT NULL,
+  height_px SMALLINT UNSIGNED NOT NULL,
+  mime_type VARCHAR(32) NOT NULL,
+  uploaded_by_admin_id BINARY(16) NOT NULL,
+  uploaded_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (tenant_id, asset_ref),
+  UNIQUE KEY uq_dsp_asset_sha256 (tenant_id, content_sha256)
+) ENGINE=InnoDB;
+
+-- ssp_db：DSP creative 白名单编译快照源表；publish/同步 API 写入后由配置刷新器编译进 Valkey + 进程快照
+CREATE TABLE dsp_endpoint_creative_whitelist (
+  tenant_id BINARY(16) NOT NULL,
+  dsp_endpoint_id BINARY(16) NOT NULL,
+  content_sha256 BINARY(32) NOT NULL,
+  width_px SMALLINT UNSIGNED NOT NULL,
+  height_px SMALLINT UNSIGNED NOT NULL,
+  mime_type VARCHAR(32) NOT NULL,
+  landing_url_host VARCHAR(255) NOT NULL,
+  entry_status VARCHAR(16) NOT NULL,
+  synced_version BIGINT UNSIGNED NOT NULL,
+  synced_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (tenant_id, dsp_endpoint_id, content_sha256, width_px, height_px),
+  KEY idx_dsp_whitelist_endpoint (tenant_id, dsp_endpoint_id, entry_status)
+) ENGINE=InnoDB;
+```
+
+#### 3.2.1.5 从 MVP 本地 FS 迁移到对象存储（S3/MinIO/GCS）的路径（不阻塞首期，但给出替换点避免未来重构）
+
+MVP 的 `AssetStore` adapter 在 SSP 和 DSP 都定义为窄接口：
+```go
+type AssetStore interface {
+    // DSP only（控制面写）：bytes 写入不可变位置，返回 (asset_ref, sha256_bin, size, w, h, mime, error)
+    PutImmutable(ctx context.Context, tenantID uuid.UUID, r io.Reader) (*AssetMeta, error)
+    // SSP only（renderer 读）：返回可关闭的字节流；调用方读完后校验流式 hash
+    OpenForRead(ctx context.Context, assetRef string) (io.ReadCloser, ContentMeta, error)
+    // 两者共用：给定 asset_ref 判断字节是否存在（用于 sync/白名单校验）
+    Exists(ctx context.Context, assetRef string) (bool, error)
+}
+```
+MVP 实现为 `LocalFSLayer`（遵守 3.2.1.1 根目录与两级前缀、正则、权限、原子 rename）。未来替换为 S3 adapter 时：
+- PutImmutable 上传到 `s3://<bucket>/<tenant_hex>/assets/<sha256[0:2]>/<sha256[2:4]>/<sha256>`，server-side encryption 开启，ACL 为 private；
+- OpenForRead 用 SSP renderer 专用的只读服务端 IAM role 做 `GetObject`，不给浏览器签发 presigned URL（保持 renderer 代理读，不暴露对象存储）；
+- Exists 做 `HeadObject`。
+上层调用者（upload handler、creative publish validator、renderer token 校验与读）完全不需要改。
 
 CREATE TABLE budget_account (
   tenant_id BINARY(16) NOT NULL,
