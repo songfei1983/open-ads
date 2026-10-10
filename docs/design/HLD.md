@@ -2,7 +2,7 @@
 
 ## 1. 系统上下文
 
-三个服务独立部署、独立故障域、独立数据所有权。服务发现、TLS、密钥分发和部署平台暂不绑定特定云或编排系统。内网 API 必须鉴权并加密；公网 SSP 入口另有流量清洗、限流和请求体上限。
+三个服务独立部署、独立故障域、独立数据所有权。服务发现、TLS、密钥分发和部署平台暂不绑定特定云或编排系统。内网 API 使用加密传输；公网 SSP 入口另有流量清洗、限流和请求体上限。
 
 SSP 与 DSP 的业务事实分别存放在 MariaDB 的 `ssp_db`、`dsp_db`，使用独立数据库账号、授权、迁移和连接池；可先共用 MariaDB 集群，但应用没有跨库查询权限。Valkey 的 SSP/DSP keyspace 是热缓存，不是事实源；DMP 另有隔离 ACL/keyspace 的在线撤回 deny gate，其持久权威记录仍是 ClickHouse tombstone。RTB 竞价路径不得因缓存 miss 同步回源 MariaDB。
 
@@ -11,11 +11,11 @@ Test Portal 是独立静态测试客户端，不增加第四个广告业务域�
 | 调用方 | 被调用方 | 契约 | 同步性 | 超时/失败行为 |
 |---|---|---|---|---|
 | Supply | SSP | OpenRTB 2.6 BidRequest/BidResponse | 同步 | 总预算受 `tmax` 和供给方约定约束；生产供给另校验 ads.txt/app-ads.txt 授权并生成/透传 schain |
-| Test Portal / JS SDK | SSP | SSP Client API v1 (`/sdk/v1/ad-requests`) | 同步 | 短期测试 token、tenant/placement scope、精确 CORS allowlist 与 rate limit；返回安全渲染 DTO |
+| Test Portal / JS SDK | SSP | SSP Client API v1 (`/sdk/v1/ad-requests`) | 同步 | 精确 CORS allowlist 与 rate limit；返回安全渲染 DTO |
 | SSP | DSP | OpenRTB 2.6 BidRequest/BidResponse | 同步、并发 fan-out | 单 DSP 超时视为 no-bid；其余 DSP 继续 |
 | SSP | DMP | 内部 `Audience Resolve v1` | 同步，可短 TTL 缓存 | 超时不阻塞整个拍卖；按 Placement 策略无受众继续或 no-bid |
 | SSP | DMP | 内部 `Event Batch v1` | 异步重试，经有界 Valkey Stream | 分析事件按 at-least-once 投递；最大积压、保留期和允许丢失目标必须配置并告警；若某事件必须可靠传播，改用与源事务绑定的 MariaDB outbox |
-| SSP | DSP | OpenRTB `nurl`/`lurl`/`burl` notice URL | 异步回调，按双方 profile | win/loss 只记状态；仅 billable event 按合同触发 DSP spend；方法、宏、认证和重试策略由接入 profile 确定 |
+| SSP | DSP | OpenRTB `nurl`/`lurl`/`burl` notice URL | 异步回调，按双方 profile | win/loss 只记状态；仅 billable event 按合同触发 DSP spend；方法、宏和重试策略由接入 profile 确定 |
 | Browser render iframe | SSP | `POST /sdk/v1/impressions`、`POST /sdk/v1/events` | 异步 | 校验签名 event token、期限、auction/bid/imp 绑定及唯一 event key；MVP impression 最多 billable 一次，click 永不触发财务 |
 | SSP tracker | DSP | bidder 返回的 `burl`（双方约定 JSON POST profile） | 持久 outbox 异步重试 | 仅在 impression/payable 事务提交后发送；DSP 按 reservation/event ID 幂等结算，重试不重复扣预算 |
 
@@ -62,18 +62,17 @@ sequenceDiagram
   participant Portal as Static Test Portal
   participant SSP as SSP
   participant DSP as DSP
-  U->>Portal: 选择 test tenant/placement/slot
-  Portal->>SSP: 认证会话换取短期 scoped test token
+  U->>Portal: 选择 placement/slot
   Portal->>Portal: 加载原生 JS SDK
   Portal->>SSP: POST /sdk/v1/ad-requests
-  SSP->>SSP: 校验 origin/token/placement，映射 OpenRTB 2.6
+  SSP->>SSP: 校验 origin/placement，映射 OpenRTB 2.6
   SSP->>DSP: OpenRTB BidRequest
   DSP-->>SSP: OpenRTB BidResponse / no-bid
   SSP-->>Portal: 安全 SDK AdResponse / no-fill
   Portal->>Portal: SDK 在 sandbox iframe 预览并展示诊断信息
 ```
 
-测试 token 只授权指定 test tenant、placement、origin 和短时间窗；不包含 MariaDB/Valkey/DSP 凭证。Portal 的诊断视图默认去敏，不显示完整 OpenRTB 用户对象、身份 token 或 bidder secrets。通过权限控制可显示 request/response 的结构化脱敏摘要及各阶段 latency。
+Portal 的诊断视图默认去敏，不显示完整 OpenRTB 用户对象或身份 token；提供 request/response 的结构化脱敏摘要及各阶段 latency。
 
 ### User ID sync 时序
 
@@ -185,11 +184,11 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 - Valkey telemetry Stream 需有最大容量、保留期、重试退避、允许丢失量和积压告警；只有已批准的非账务分析/诊断事件可按策略丢弃。MariaDB 事务 outbox 不得静默丢弃；容量不足时阻止/回滚对应的控制面变更并告警，RTB 热路径 telemetry 则按其独立 loss budget 处理，不延长响应 deadline。
 - DSP 预算租约有额度、实例 owner、过期时间和回收规则；租约暂不可用时停止对相关 line item 出价，不得绕过预算限制。
 - DSP 租约回收不得释放未结算的 bid 风险；loss/billing 必须按 reservation ID 在事务内结算。结算与宽限期回收必须锁定相同 lease/account 行；迟到或冲突 notice 隔离，不得重复增加全局可用额度。
-- 账务通知先验证服务身份、签名/来源、auction/bid/imp 关联和币种/金额范围，再执行幂等落账；无法验证的 notice 隔离并告警，不计入 publisher payable 或 advertiser spend。
+- 账务通知先校验 auction/bid/imp 关联和币种/金额范围，再执行幂等落账；数据不匹配的 notice 隔离并告警，不计入 publisher payable 或 advertiser spend。
 - 日志采集与财务入账使用不同队列/限流池，防止高流量诊断事件挤占账务写入容量；ledger 写失败必须重试/告警，不可静默丢弃。
 - identity sync 必须有可审计的 consent purpose/version、partner allowlist、link TTL 与撤回/删除流程；原始 ID 使用 envelope encryption，仅用 keyed hash 做匹配索引。SSP 收到撤回先立即禁用本地 subject/link 并清缓存；DMP 先写共享 deny gate，再持久化撤回 tombstone，且两者确认后才返回完成。gate 不可用或状态不确定时，受众查询 fail closed；请求方在完成确认前不得重新发送该身份。
 - DMP 的快照/API 响应只返回最小 segment 标识；事件和身份 token 的保留期、删除流程以及 ClickHouse 分区 TTL 需按法规与合同确定。
-- 内部 API 使用 mTLS 或等效服务身份、请求签名/重放保护、每租户限流；错误响应不回显原始身份或完整请求体。
+- 内部 API 实施每租户限流；错误响应不回显原始身份或完整请求体。
 
 ## 7. 可观测性和部署
 
@@ -199,6 +198,6 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 
 ## 8. 容量参数与 SLA 输入项
 
-数值型 SLA、合规与保留策略需要业务输入后才能量化。设计验收门槛（SLA 输入项检查清单、是否允许进入实现的判定）统一见 [设计 README §6 设计验收门槛](README.md#L85-L95)，本节不重复列出。生产流量还须额外确定 ads.txt/app-ads.txt、sellers.json 和 schain 的接入责任与校验策略。
+数值型 SLA、合规与保留策略需要业务输入后才能量化。设计验收门槛（SLA 输入项检查清单、是否允许进入实现的判定）统一见 [设计 README](README.md) §6，本节不重复列出。生产流量还须额外确定 ads.txt/app-ads.txt、sellers.json 和 schain 的接入责任与校验策略。
 
-按服务划分的完整 API 路由、请求/响应和认证矩阵见 [API 设计](API.md)。
+按服务划分的完整 API 路由、请求/响应见 [API 设计](API.md)。

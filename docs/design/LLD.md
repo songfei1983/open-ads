@@ -1,6 +1,6 @@
 # Open Ads 低层设计（LLD）
 
-本文定义建议的聚合、端口、领域内 REST 契约、存储布局和失败语义。按服务整理的 API 路由与认证矩阵见 [API 设计](API.md)。数据库版本、驱动、部署拓扑和规模指标待评审后锁定。
+本文定义建议的聚合、端口、领域内 REST 契约、存储布局和失败语义。按服务整理的 API 路由、请求/响应与失败语义见 [API 设计](API.md)。数据库版本、驱动、部署拓扑和规模指标待评审后锁定。
 
 ## 1. Go 应用结构
 
@@ -94,7 +94,6 @@ erDiagram
     binary16 tenant_id PK
     binary16 endpoint_id PK
     binary16 property_id FK
-    varchar auth_secret_ref
   }
   SSP_CONFIG_OUTBOX {
     binary16 event_id PK
@@ -289,15 +288,11 @@ erDiagram
 
 ClickHouse 表不声明主键或外键；图中的 DMP 连线都是查询/版本关联，不提供数据库级 referential integrity。各表的 `ORDER BY` 是 MergeTree 排序键，不等同于唯一键。
 
-## 1.2 控制面认证与租户模型
-
-管理面（`/admin/v1/*`、`/portal/v1/*`）跨越 SSP 与 DSP 两个 bounded context；两个服务的管理员实体与会话相互独立，不共享用户表、不共享会话存储。Test Portal（静态页面）作为 SSP `/portal/v1/*` 的前端消费者，不拥有任何数据库或业务状态。DMP 管理 API 复用同样的角色与 token 语义，但在 DMP 自己的服务内做独立鉴权。
-
-### 1.2.1 租户（Tenant）概念与 fixture
+## 1.2 租户（Tenant）模型
 
 `tenant_id` 是所有业务表的主键前缀，代表一个数据隔离域。首期 MVP 中：
-- SSP 的 `ssp_db` 中存在一个 `tenant` 表，描述 SSP 侧的租户元数据；SSP 管理 API 的所有资源（Publisher、Property、Placement、DSP Endpoint）均以调用方 `tenant_id` 做行级过滤。
-- DSP 的 `dsp_db` 中同样存在一个独立的 `tenant` 表；DSP 管理 API 的 Advertiser、Campaign、LineItem、Creative 同样以调用方 `tenant_id` 做行级过滤。
+- SSP 的 `ssp_db` 中存在一个 `tenant` 表，描述 SSP 侧的租户元数据；管理 API 请求必须明确提供 `tenant_id`，Publisher、Property、Placement、DSP Endpoint 等资源查询均将其作为行级过滤条件。
+- DSP 的 `dsp_db` 中同样存在一个独立的 `tenant` 表；管理 API 请求必须明确提供 `tenant_id`，Advertiser、Campaign、LineItem、Creative 等资源查询均将其作为行级过滤条件。
 - DMP 使用 ClickHouse 的 `tenant_id` 列做逻辑分区过滤，不单独建租户表。
 - 跨服务调用时，SSP 将自身解析出的 `tenant_id` 放入内部服务请求 DTO（如 `audience:resolve` 的 `tenant_id` 字段）。SSP 发往 DSP 的 OpenRTB BidRequest 不携带 SSP `tenant_id`；DSP 的 `tenant_id` 来自其自身 bidder 接入 profile 中预先配置的 SSP partner→DSP tenant 映射。首期 MVP 两个 DB 中的 sandbox tenant 使用相同的 fixture UUID，便于本地联调。
 
@@ -323,117 +318,7 @@ CREATE TABLE tenant (
 - `default_currency = 'USD'`
 - `status = 'active'`
 
-### 1.2.2 管理员用户与 RBAC 角色
-
-SSP 与 DSP 各自在自己的数据库中维护 `admin_user` 表；DMP 首期没有自有的管理登录，管理员通过 SSP 的 super_admin 凭证、借 SSP 管理台的"Data 管理"tab 透传到 DMP 的 `/admin/v1/*`（SSP 管理面内部再调用 DMP），因此 DMP 不建立独立的 `admin_user` 表。
-
-首期 MVP 的角色集：
-
-| 角色 | 适用服务 | 能力边界 |
-|---|---|---|
-| `super_admin` | SSP、DSP | 可操作本服务内所有 tenant；创建/禁用其他管理员；新增/停用 tenant；财务对账/账本冲正 |
-| `ssp_admin` | SSP | 仅在自己所属 tenant 内对 Publisher、Property、Placement、Supply/DSP Endpoint、Identity 全部管理资源有写权限 |
-| `dsp_admin` | DSP | 仅在自己所属 tenant 内对 Advertiser、Campaign、LineItem、Creative、Budget、Targeting 全部管理资源有写权限 |
-| `ssp_viewer` | SSP | 仅在自己所属 tenant 内可读管理资源与运营报表，无写权限 |
-| `dsp_viewer` | DSP | 仅在自己所属 tenant 内可读管理资源与运营报表，无写权限 |
-
-首期 MVP 数据库迁移脚本在 **两个** DB 中各预置 1 条 super_admin fixture 记录，用于本地联调：
-- `username = 'admin@openads.local'`
-- password：由部署环境变量 `OPENADS_MVP_ADMIN_PASSWORD` 指定；**不得写死在代码、迁移脚本常量或 HTML 中**
-- password 存储：使用 Argon2id（推荐参数 `t=3, m=64MB, p=2, salt_len=16, key_len=32`）或等价强度的 password-hash 库；DB 只存 salted hash + 参数元组版本，不存明文
-
-```sql
--- ssp_db 与 dsp_db 分别独立建表
-CREATE TABLE admin_user (
-  tenant_id BINARY(16) NOT NULL,
-  admin_user_id BINARY(16) NOT NULL,
-  username VARCHAR(255) NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  password_hash_version SMALLINT UNSIGNED NOT NULL,
-  role_set JSON NOT NULL,
-  status VARCHAR(16) NOT NULL,
-  last_login_at DATETIME(6) NULL,
-  created_at DATETIME(6) NOT NULL,
-  updated_at DATETIME(6) NOT NULL,
-  version BIGINT UNSIGNED NOT NULL,
-  PRIMARY KEY (tenant_id, admin_user_id),
-  UNIQUE KEY uq_admin_username (username)
-) ENGINE=InnoDB;
-```
-
-角色行级过滤规则：每个 `/admin/v1/*` handler 在进入业务逻辑前，先从鉴权中间件取出会话中的 `tenant_id`、`subject_admin_user_id`、`role_set`：
-- 含 `super_admin` 时，允许通过 `X-Tenant-Override` header 操作其他 tenant；无 override 时默认使用会话中该管理员的归属 tenant。
-- 不含 `super_admin` 时，会话 tenant 强制等于 SQL 查询条件中的 `tenant_id`，任何 `X-Tenant-Override` 都被忽略并记一次告警。
-- `version` 乐观锁：写操作必须通过 `If-Match` 传入 ETag（即资源 `version` 字段），版本冲突返回 `409`。
-
-### 1.2.3 Portal 登录与会话机制
-
-Test Portal 是 SSP 托管的静态资源包（或独立静态站点），其登录/会话全部依赖 SSP 的 `/portal/v1/*` 接口（**不在 DSP 或 DMP 开放登录**）。首期 MVP 不引入 JWT；统一使用 opaque session_id + HttpOnly Secure cookie，避免把 signing key 管理引入首版。后续生产如需服务间调用或非浏览器 client（如 CI/CD 发布 campaign），可再引入 service account + signed JWT 或 mTLS client cert。
-
-**登录接口（SSP 新增，需同步更新 API.md SSP §2.3）：**
-
-| Method / path | 调用方 | 认证 | 请求/响应 |
-|---|---|---|---|
-| `POST /portal/v1/auth/login` | Portal 登录页 | allowlisted Origin + CSRF double-submit；首次登录无 session | `{username, password}` → `{tenant_id, roles, expires_at}`；同时 Set-Cookie 两个 HttpOnly Secure SameSite=Lax cookie |
-| `POST /portal/v1/auth/logout` | 已登录 Portal | 同 session + CSRF | 空 body → `204`；删除服务端 session，浏览器清除 cookie |
-| `GET /portal/v1/auth/session` | 已登录 Portal | 同 session | 返回当前 `{tenant_id, admin_user_id, roles, expires_at}`；用于 Portal 首屏鉴权 |
-
-登录成功的会话建立步骤（SSP login handler）：
-1. 校验 `Origin` 精确命中 Portal allowlist（配置项，首期可 `https://portal.test.example` 或本地 `http://localhost:5173`）。
-2. 读取 double-submit CSRF：请求 header `CSRF-Token` 必须等于 cookie `openads_portal_csrf`（登录请求允许带 0 值占位 token，因为首次请求还没 session；登录接口 handler 内部对登录请求放宽到"无 cookie 时不校验 CSRF，仅校验 Origin"，避免鸡生蛋）。
-3. Argon2id 校验 username/password，成功则创建新 session 记录。
-4. 生成三条安全 cookie（`Secure` + `HttpOnly` + `SameSite=Lax` + `Path=/` + `Max-Age=3600`；HTTPS 环境必须追加 `Secure`，本地 `http://localhost` 开发可临时取消 `Secure`，但必须有显式配置开关而非默认关闭）：
-   - `openads_portal_sid`：128-bit 随机 hex（opaque session_id）
-   - `openads_portal_csrf`：32-byte 随机 CSRF token 的 double-submit 副本
-   - `openads_portal_tenant`：明文 `tenant_id` hex，供 Portal UI 做只读展示；**不作为鉴权依据**，服务端只信 session store
-5. Session 存储：首期 MVP 优先写 Valkey（SSP 侧专用 ACL/keyspace，key 为 `ssp:portal:session:v1:<sid>`，TTL 1h；value 包含 `tenant_id, admin_user_id, roles, csrf_token, issued_at, expires_at, rotated_sid_of_prev`），保证多实例部署可用；Valkey 不可用时降级到 `ssp_db.portal_session`（下面 DDL），但必须告警。
-
-```sql
--- ssp_db 仅作 session fallback 存储；正常走 Valkey
-CREATE TABLE portal_session (
-  session_id BINARY(16) NOT NULL,
-  tenant_id BINARY(16) NOT NULL,
-  admin_user_id BINARY(16) NOT NULL,
-  role_set JSON NOT NULL,
-  csrf_token BINARY(32) NOT NULL,
-  issued_at DATETIME(6) NOT NULL,
-  expires_at DATETIME(6) NOT NULL,
-  PRIMARY KEY (session_id),
-  KEY idx_portal_session_expiry (expires_at)
-) ENGINE=InnoDB;
-```
-
-**会话鉴权中间件**（应用到所有 `/portal/v1/*` 与 `/admin/v1/*`）：
-1. 读取 `openads_portal_sid` cookie → 查 session store（先 Valkey，未命中则 fallback ssp_db）→ 确认未过期、关联 `admin_user.status='active'`。
-2. 取会话中的 `tenant_id`、`role_set`、`csrf_token`、`admin_user_id` 注入请求 context。
-3. 对非 GET/HEAD/OPTIONS 的写操作，额外校验 `CSRF-Token` header 值与会话中的 `csrf_token` 完全一致（constant-time 比较）。
-4. **会话续期与轮转**：剩余 TTL < 10min 时，服务端原子生成新 session_id + 新 csrf_token，把旧 session 的 `rotated_sid_of_prev` 指向前一个，写入 1 分钟 TTL 的"旧 sid → 新 sid"重定向映射，再下发新 cookie。单个 session 的**最长总登录时长上限为 12h**，到期强制重新登录，防止无限续期。
-
-失败响应：统一返回 `401 { "code":"AUTH_FAILED", "message":"invalid credentials or session expired", "request_id":"..." }`，不区分用户不存在 vs 密码错误，避免账号枚举。
-
-### 1.2.4 管理面审计日志
-
-所有 `/admin/v1/*` 写操作在 handler 层统一追加 `admin_audit_log` 记录（仅追加，无 UPDATE，无 DELETE），写入各自 DB。
-
-```sql
--- ssp_db 与 dsp_db 独立建表
-CREATE TABLE admin_audit_log (
-  tenant_id BINARY(16) NOT NULL,
-  audit_id BINARY(16) NOT NULL,
-  admin_user_id BINARY(16) NOT NULL,
-  action VARCHAR(64) NOT NULL,
-  resource_type VARCHAR(64) NOT NULL,
-  resource_id BINARY(16) NULL,
-  before_snapshot JSON NULL,
-  after_snapshot JSON NULL,
-  request_id VARCHAR(128) NOT NULL,
-  occurred_at DATETIME(6) NOT NULL,
-  PRIMARY KEY (tenant_id, audit_id),
-  KEY idx_audit_admin_time (tenant_id, admin_user_id, occurred_at)
-) ENGINE=InnoDB;
-```
-
-敏感字段（`password_hash`、`auth_secret_ref` 的明文、identity 的密文 buyeruid、creative 的 `asset_sha256` 外的任意 secret）在写入审计快照前必须置空或替换为引用键 ID；绝不把完整请求体、完整 DB 行或原始 SQL 写入审计日志。
+管理操作应记录审计事件，并对敏感字段脱敏。写操作使用 body 中的 `version` 字段进行乐观锁校验，不使用 HTTP `ETag` / `If-Match`。
 
 ## 2. SSP LLD
 
@@ -561,7 +446,7 @@ AuctionPolicy 快照字段（首期 MVP 只暴露少量可配置字段；其余�
 ```
 
 **Win/Loss Notice 的失败语义：**
-- 方法、宏展开（如 `${AUCTION_PRICE}` 精确替换为 `settle_price_cpm_micros / 1_000_000.0` 的十进制字符串，half-even 舍入到 micro 精度）、认证（DSP endpoint profile 中配置的 mTLS / HMAC-SHA256 请求签名）按双方接入 profile 执行。
+- 方法、宏展开（如 `${AUCTION_PRICE}` 精确替换为 `settle_price_cpm_micros / 1_000_000.0` 的十进制字符串，half-even 舍入到 micro 精度）按双方接入 profile 执行。
 - 超时、5xx、429（含 Retry-After）：**最多重试 `max_notice_retries`（默认 3）次，带抖动指数退避，最长重试窗口不超过该 DSP notice grace window；超过仍失败的条目写入 `ssp_delivery_event` 中一条 `notice_delivery_failed` 审计事件，不无限阻塞也不重复到账务层**——因为 win notice 本身不记账、不扣预算（记账只走 `burl` billable notice，见 LLD §3.3），win/loss 的最终状态以 DSP 侧 billable 事件的成功为准，win notice 失败不影响账务正确性。
 - `lurl` 失败：该 bid 对应 reservation 在 DSP 侧将按 `settlement_grace_until` 到期由 lease 回收逻辑自动释放（见 LLD §3.3），因此 SSP 侧 `lurl` 失败不做告警级 P0，只做指标 `lost_loss_notice_delivery_failed`；连续失败率超阈值时升级告警。
 
@@ -575,7 +460,6 @@ Client API 是 SSP 面向测试门户/浏览器 SDK 的独立版本化契约，�
 
 ```http
 POST /sdk/v1/ad-requests
-Authorization: Bearer <short-lived-test-token>
 Content-Type: application/json
 Origin: https://portal.test.example
 ```
@@ -612,7 +496,7 @@ Origin: https://portal.test.example
 }
 ```
 
-无广告返回 `200` 和 `status: "no_fill"`，不把 no-fill 当成 transport error。`diagnostics` 只在 test token 有 `diagnostics:read` scope 时存在；去敏且不包含完整 OpenRTB payload、用户标识、DSP 密钥或未授权竞价数据。响应设置 `Cache-Control: no-store`；`render_url` 必须短时有效且指向受控 render host。
+无广告返回 `200` 和 `status: "no_fill"`，不把 no-fill 当成 transport error。可选 `diagnostics` 内容需去敏，不包含完整 OpenRTB payload、用户标识、DSP 密钥或不应展示的竞价数据。响应设置 `Cache-Control: no-store`；`render_url` 必须短时有效且指向受控 render host。
 
 首期 renderer 只返回 SSP 托管的静态 image iframe，不执行 DSP HTML/JavaScript。`render_url` token 绑定 tenant、placement、auction、bid、imp、creative 和 expiry；`click_url` 绑定已保存的 landing URL，不接受调用方 redirect 参数。图片加载后 renderer 向 `POST /sdk/v1/impressions` 发送 event token、稳定 event ID 和 occurred_at。SSP 校验签名、有效期、绑定关系和一次性约束，从竞价记录恢复金额/currency/reservation；客户端不得提交这些财务字段。Sandbox profile 可将通过校验的首个 impression 记作演示 billable event，并在同一 MariaDB 事务写唯一 delivery event、PublisherPayableLedger 和 DSP billable outbox。该 tracker signal 不提供生产级 IVT/可见性保证。
 
@@ -623,8 +507,7 @@ Origin: https://portal.test.example
 ```js
 const sdk = new OpenAdsSDK({
   baseUrl: "https://ssp.test.example",
-  placementId: "test-placement-id",
-  getAccessToken: () => portalSession.getEphemeralTestToken()
+  placementId: "test-placement-id"
 });
 
 const result = await sdk.requestAd({
@@ -637,7 +520,7 @@ if (result.status === "filled") {
 }
 ```
 
-SDK 最小能力：request/timeout/abort、no-fill/error 状态、请求 ID、一次性 render/destroy、事件回调和可选 test diagnostics。禁止默默重试广告请求导致重复 auction；调用方需显式发起新请求。渲染通过受控 HTTPS `render_url` 的 sandboxed iframe 完成；不对 SSP 返回的 markup 使用裸 `innerHTML`，iframe 不授予 `allow-same-origin`，设置 `referrerpolicy="no-referrer"`。不保存 bearer token 到 localStorage/cookie；token 只驻留内存。
+SDK 最小能力：request/timeout/abort、no-fill/error 状态、请求 ID、一次性 render/destroy、事件回调和可选 test diagnostics。禁止默默重试广告请求导致重复 auction；调用方需显式发起新请求。渲染通过受控 HTTPS `render_url` 的 sandboxed iframe 完成；不对 SSP 返回的 markup 使用裸 `innerHTML`，iframe 不授予 `allow-same-origin`，设置 `referrerpolicy="no-referrer"`。
 
 `POST /sdk/v1/events` 和 click redirect 仅记录 click/render_error 等非账务测量事件；click 永不计费。Impression 是不可信客户端输入，只有首期 sandbox profile 中通过 token、绑定和幂等校验的 SSP tracker impression 才可记演示账本；DSP spend 只能由持久 outbox 发出的双方约定 billable notice 触发。生产财务入账前必须批准 IVT/可见性、争议处理和对账规则。
 
@@ -652,15 +535,15 @@ SDK 最小能力：request/timeout/abort、no-fill/error 状态、请求 ID、�
 
 ### 2.2.2 Test Portal
 
-Portal 是独立静态页面/文件包，不增加 Go 业务服务、数据库或领域模型；在测试环境由静态站点托管。登录通过受保护的测试会话，之后调用 `POST /portal/v1/test-tokens` 获取短期 token。token scope 限定 test tenant、允许的 placement、Portal origin、速率和到期时间；签发接口不得向普通生产站点开放。
+Portal 是独立静态页面/文件包，不增加 Go 业务服务、数据库或领域模型；在测试环境由静态站点托管，仅调用 SSP Client API 的 sandbox endpoint。
 
-测试页面提供：选择 test tenant/placement/slot 尺寸、加载 consent fixture、请求/重试一次广告、渲染或清空广告位、显示 request ID/状态/耗时/去敏诊断摘要、展示 no-fill/error。默认不自动向正式 DSP 或财务链路制造 billable event；需要演示埋点时使用明确标注的 sandbox test event。
+测试页面提供：选择 placement/slot 尺寸、加载 consent fixture、请求/重试一次广告、渲染或清空广告位、显示 request ID/状态/耗时/去敏诊断摘要、展示 no-fill/error。首期只使用预置 sandbox tenant；默认不自动向正式 DSP 或财务链路制造 billable event，需要演示埋点时使用明确标注的 sandbox test event。
 
-安全边界：SSP 对 Portal origin 做精确 CORS allowlist；不使用 `*` 搭配 credentials。短期 token 不含服务端密钥；接口校验 placement 与 token tenant 绑定，实施 payload 上限、QPS 配额、重放/滥用防护。Portal 和 renderer 使用 CSP；跨域 iframe sandbox 禁止访问 SSP origin/cookie。测试环境与生产环境 endpoint、数据库及 token issuer 分离。
+安全边界：SSP 对 Portal origin 做精确 CORS allowlist；Client API 根据 placement 记录解析其所属 `tenant_id`，不接受客户端指定或覆盖租户，并实施 payload 上限、QPS 配额和滥用防护。Portal 和 renderer 使用 CSP；跨域 iframe sandbox 禁止访问 SSP origin/cookie。测试环境与生产环境 endpoint、数据库隔离。
 
 ### 2.2.3 生产供给授权与透明度
 
-生产流量接入除 supply credential 外，还须验证 publisher 对对应 seller/account 的授权。SSP 维护 ads.txt/app-ads.txt 抓取、解析、缓存和过期策略，并将 seller account 与 sellers.json 中的 seller 身份关联；解析失败、未授权或 seller 信息冲突时，按供给 profile 隔离或拒绝库存，不能静默当作已授权。
+生产流量接入须验证 publisher 对对应 seller/account 的授权。SSP 维护 ads.txt/app-ads.txt 抓取、解析、缓存和过期策略，并将 seller account 与 sellers.json 中的 seller 身份关联；解析失败、未授权或 seller 信息冲突时，按供给 profile 隔离或拒绝库存，不能静默当作已授权。
 
 SSP 生成发往 DSP 的 OpenRTB `source.schain`，遵循 SupplyChain Object 的节点顺序和 `asi`/`sid`/`hp` 语义；保留可验证的上游节点与 complete 标志，不得伪造缺失链路为 complete。每个 supply profile 定义缺失/无效 schain 的处理策略、seller ID 映射及授权文件刷新 SLA。Sandbox 可以用固定 fixture，不能据此推断生产授权。
 
@@ -669,14 +552,13 @@ SSP 生成发往 DSP 的 OpenRTB `source.schain`，遵循 SupplyChain Object 的
 ```http
 POST /internal/v1/audience:resolve
 Content-Type: application/json
-Authorization: service identity
 ```
 
 请求字段：`request_id`、`tenant_id`、`provider_id`（可选）、`namespace`、`subject_token`、`consent_context`、`purposes`、`max_segments`。`subject_token` 是按 namespace 生成的伪名化标识，不传原始邮箱、电话或原始设备 ID。无合法处理依据时 SSP 不调用此 API。
 
 响应字段：`request_id`、`snapshot_id`、`provider_id`、`segments: [{id}]`、`resolved_at`。返回值按 `max_segments` 截断，segments 的 `id`/`name` 可映射到 OpenRTB `user.data[].segment[]`。DMP 不向 SSP 暴露 profile 细节、分数或 ClickHouse 字段。
 
-错误语义：400 表示契约无效；401/403 表示服务身份/权限失败；429 表示限流；503 表示暂不可用；超时由调用方截止时间控制。合法请求但无匹配受众返回空 segments，不返回 404。
+错误语义：400 表示契约无效；429 表示限流；503 表示暂不可用；超时由调用方截止时间控制。合法请求但无匹配受众返回空 segments，不返回 404。
 
 ### 2.4 SSP MariaDB 持久化
 
@@ -731,7 +613,6 @@ CREATE TABLE supply_endpoint (
   endpoint_id BINARY(16) NOT NULL,
   property_id BINARY(16) NOT NULL,
   protocol_version VARCHAR(16) NOT NULL,
-  auth_secret_ref VARCHAR(255) NULL,
   status VARCHAR(16) NOT NULL,
   version BIGINT UNSIGNED NOT NULL,
   PRIMARY KEY (tenant_id, endpoint_id),
@@ -980,7 +861,7 @@ delivery event 是高写入量数据，需批量落库、定义保留/归档周�
 
 ### 3.1.1 Targeting 精确匹配规则（规范化 + 匹配算法）
 
-Targeting 的 JSON DTO 见 [API.md §3.2 line-items DTO 示例](file:///Users/songfei/Develop/github.com/songfei1983/open-ads/docs/design/API.md#L187-L202)。所有字符串在进入只读编译快照前**先规范化**，再以规范化形式做匹配；匹配失败的 line item 不进入候选集。
+Targeting 的 JSON DTO 见 [API.md](API.md) §3.2 的 line-items DTO 示例。所有字符串在进入只读编译快照前**先规范化**，再以规范化形式做匹配；匹配失败的 line item 不进入候选集。
 
 #### 3.1.1.1 规范化步骤（publish 编译时执行一次，不是每个 bid request 都做）
 
@@ -1284,17 +1165,17 @@ CREATE TABLE line_item_creative (
 
 #### 3.2.1.3 从 Upload → Creative Publish → DSP Bid → SSP 白名单 → Renderer 读的完整链路
 
-1. **上传（DSP 控制面）**：`POST /dsp/admin/v1/creative-assets` multipart → DSP 按上面规则落盘 → 返回 asset_ref 与服务端重算元组。同时 DSP 内部写入 `dsp_db.creative_asset_registry(tenant_id, asset_ref, sha256, size, width, height, mime, uploaded_by_admin_id, uploaded_at)` 作为审计；asset_bytes 只在 FS。
+1. **上传（DSP 控制面）**：`POST /dsp/admin/v1/creative-assets` multipart → DSP 按上面规则落盘 → 返回 asset_ref 与服务端重算元组。同时 DSP 内部写入 `dsp_db.creative_asset_registry(tenant_id, asset_ref, sha256, size, width, height, mime, uploaded_at)` 作为审计；asset_bytes 只在 FS。
 2. **创建 Creative（DSP 控制面）**：`POST /dsp/admin/v1/creatives` DTO 中 asset_ref 必须已存在 registry（否则 `404 asset_not_found`），asset_ref/sha256/size/w/h/mime 必须与 registry 完全一致（管理员不能在 DB 里改）。
 3. **Creative 注册到 SSP 白名单（DSP↔SSP 最小同步流程，首期 MVP 走管理员显式同步 UI 按钮 + 内部 API）**：
    - 背景：LLD §2.2.0.1 Bid 校验第 6 条要求 SSP 在接 Bid 时有「该 DSP dsp_id → 允许的 creative hash/size 白名单」。首期 MVP 不引入消息总线，用显式同步 API 加管理员操作（按钮 "发布到 SSP"）：
-   - DSP 管理员点击"同步到 SSP"时，DSP 控制面以服务身份调用 `POST /ssp/internal/v1/dsp-endpoints/{dsp_endpoint_id}/creative-registry:upsert`（SSP 新增的 internal API，仅允许 DSP 服务身份、dsp_endpoint_id 必须是该 SSP partner 的绑定 endpoint），body 为 `[{creative_id, asset_sha256_bin, asset_width_px, asset_height_px, mime, landing_url_host, status, version}]`。
+    - DSP 管理员点击"同步到 SSP"时，DSP 控制面调用 `POST /ssp/internal/v1/dsp-endpoints/{dsp_endpoint_id}/creative-registry:upsert`（`dsp_endpoint_id` 必须是该 SSP partner 的绑定 endpoint），body 为 `[{creative_id, asset_sha256_bin, asset_width_px, asset_height_px, mime, landing_url_host, status, version}]`。
    - SSP 收到后写入 `ssp_db.dsp_endpoint_creative_whitelist(tenant_id, dsp_endpoint_id, asset_sha256 PK, width PK, height PK, mime, landing_url_host, status, synced_at, version)`；后续 SSP Bid 校验第 6 条直接从 Valkey 缓存的白名单编译快照查。
    - 管理员也可通过 SSP `/ssp/admin/v1/dsp-endpoints/{id}/creatives` UI 手填单行白名单（用于联调阶段没有自动化同步的情况）。
    - 失败语义：SSP 不持有 asset bytes，白名单只记录 hash/size/mime，**不做任何 hash 与文件一致性的二次校验**（由 DSP 上传端保证 hash 与 bytes 一致，SSP renderer 读文件后会再重算一次 hash 用于反篡改，见下）。
 4. **DSP Bid → SSP Receive**：DSP 在 `seatbid[].bid[].ext.openads.asset_ref / asset_sha256 / width / height / landing_url` 中自报。SSP Bid 校验第 6 条查白名单 → 不一致则 bid 丢弃。
 5. **SSP Renderer 最终 Render（浏览器请求 `GET /render/v1/{render_token}` → 出图）**：
-   - renderer 是 SSP 内部的 HTTP handler（**不需要独立服务进程**，作为 SSP 一个子路由挂载；但它有独立的只读 credential 访问 Asset Store root，与 SSP 管理控制面的写权限隔离）。
+    - renderer 是 SSP 内部的 HTTP handler（**不需要独立服务进程**，作为 SSP 一个子路由挂载；对 Asset Store 仅有独立只读权限，与 SSP 管理控制面的写权限隔离）。
    - `render_token` 短时有效（TTL 与 SDK response 中的 `expires_at` 一致，默认 ≤5 分钟）、opaque、HMAC-SHA256 签名；token 内绑定 `tenant_id + placement_id + auction_id + bid_id + imp_id + creative_id + asset_sha256_bin + asset_width_px + asset_height_px + landing_url_allowlist_host + expires_at + key_version`。renderer 校验签名、expiry、绑定关系后才允许读文件。
    - 读文件：从 token 解出的 asset_ref（**不从 query/form 读 asset_ref 防止 URL 注入**；asset_ref 只作为 render_token 内已签名字段）→ 严格按正则 `^as:[0-9a-f]{32}:[0-9a-f]{64}$` 取 tenant_hex 和 sha256_hex → 拼接 `<ASSET_STORE_ROOT>/<tenant_hex>/assets/<sha[0:2]>/<sha[2:4]>/<sha256_hex>` → open 文件，流式读取。
    - **读时二次 hash 校验（防篡改）**：读 bytes 过程中流式重算 SHA-256，读完后与 render_token 内绑定的 `asset_sha256_bin` 精确比较；不一致 → `503 asset_tampered_detected` + 立即告警（P0），不返回 bytes，不落 audit log 之外的普通日志。
@@ -1321,7 +1202,6 @@ CREATE TABLE dsp_creative_asset_registry (
   width_px SMALLINT UNSIGNED NOT NULL,
   height_px SMALLINT UNSIGNED NOT NULL,
   mime_type VARCHAR(32) NOT NULL,
-  uploaded_by_admin_id BINARY(16) NOT NULL,
   uploaded_at DATETIME(6) NOT NULL,
   PRIMARY KEY (tenant_id, asset_ref),
   UNIQUE KEY uq_dsp_asset_sha256 (tenant_id, content_sha256)
@@ -1482,7 +1362,7 @@ DSP 的 spend 幂等键优先继承双方 profile 约定的稳定 billable event
 
 - `POST /openrtb2/bid`：OpenRTB 2.6 BidRequest，返回标准 BidResponse 或标准 no-bid。解析/评估受请求 deadline 限制。
 - `GET /healthz`、`GET /readyz`：仅报告进程健康和关键依赖/快照准备度，不暴露业务数据。
-- BidResponse 的 `nurl`、`lurl`、`burl` 是 bidder 提供的 notice URL。OpenRTB 2.6 不定义通用 JSON notice body；exchange 与 bidder 必须在接入 profile 中约定每类 notice 的 HTTP 方法（win notice 可由 exchange 选择 GET 或 POST）、宏/价格单位、服务身份、签名 reservation reference、终态互斥、超时、重试和响应确认。`nurl` 只更新 win 状态；`lurl`/`burl` 对同一 reservation 只能有一个终态成功。
+- BidResponse 的 `nurl`、`lurl`、`burl` 是 bidder 提供的 notice URL。OpenRTB 2.6 不定义通用 JSON notice body；exchange 与 bidder 必须在接入 profile 中约定每类 notice 的 HTTP 方法（win notice 可由 exchange 选择 GET 或 POST）、宏/价格单位、reservation reference、终态互斥、超时、重试和响应确认。`nurl` 只更新 win 状态；`lurl`/`burl` 对同一 reservation 只能有一个终态成功。
 - Campaign/LineItem/Creative 控制 API 属首期必需控制面；仅复杂审核工作流可后续扩展。至少须能创建、更新、暂停、校验并发布版本化 campaign、targeting、creative 和预算配置，bidder 只消费已发布快照。
 
 ### 3.5 DSP 热缓存与零 DB 读取热路径
@@ -1623,7 +1503,7 @@ DMP 在线撤回 gate 使用独立 Valkey ACL/keyspace，key 为 tenant/namespac
 |---|---|---|
 | `POST /internal/v1/audience:resolve` | 实时查询某 token 的 segment IDs | 限制结果数；无结果返回空集合；只查已发布快照 |
 | `POST /internal/v1/identity:revoke` | 登记某 namespace subject 的撤回 | 原子阻止新 admission、持久化 tombstone 并 drain 旧 lookup；返回 `202 pending` 或 `completed`；completed 表示在线抑制生效，不代表历史快照物理删除完成 |
-| `GET /internal/v1/identity-revocations/{revocation_id}` | 查询撤回处理状态 | SSP service identity/mTLS | 从状态追加表按 `status_version` 取最新记录，返回 `online_status`、`gate_epoch`、`drained_lookup_count` 和 `physical_delete_status`；仅原请求租户可查询 |
+| `GET /internal/v1/identity-revocations/{revocation_id}` | 查询撤回处理状态 | revocation ID | 从状态追加表按 `status_version` 取最新记录，返回 `online_status`、`gate_epoch`、`drained_lookup_count` 和 `physical_delete_status`；仅原请求租户可查询 |
 | `POST /internal/v1/events:batch` | 批量写入去敏事件 | 有界批量；成功仅在 ClickHouse insert 达到约定持久化确认后返回；允许重复投递 |
 | `POST /internal/v1/snapshots` | 创建/登记导入任务（仅在控制面开放时） | 版本化；不可直接发布未校验快照 |
 | `POST /internal/v1/snapshots/{id}:publish` | 校验完成后发布 | 校验租户/provider/namespace/行数/校验和后追加 publication marker |
@@ -1644,12 +1524,12 @@ DMP 在线撤回 gate 使用独立 Valkey ACL/keyspace，key 为 tenant/namespac
 
 - OpenRTB 2.6 bid request/response 样例的 JSON encode/decode round-trip。
 - Client API contract 测试覆盖 `filled`/`no_fill`/错误状态、请求 ID、超时/取消、响应 cache headers 与版本兼容。
-- Portal/SDK 安全测试覆盖过期或越权 test token、tenant/placement 不匹配、非 allowlisted Origin、payload 上限、rate limit 和重放。
+- Portal/SDK 安全测试覆盖 tenant/placement 不匹配、非 allowlisted Origin、payload 上限、rate limit 和重放。
 - Renderer 测试覆盖恶意 markup、跨域 iframe sandbox/CSP、destroy 清理和过期 render URL；合法 sandbox impression 最多生成一条 payable/spend 账务链路，伪造/过期/重放 impression 与任意 click 不生成财务分录。
 - Asset upload/render 测试覆盖伪造 MIME、损坏图片、尺寸/大小限制、hash 不匹配、上传宽高与 creative/`ext.openads` 宽高不一致、未授权 asset_ref 和对象存储不可用；DSP bidder 引用只允许映射到该 DSP 已发布 creative。
 - 并发撤回测试覆盖 gate admission 与 revoke 原子竞争、已登记 lookup/auction drain、迟到 DMP response 丢弃、Valkey epoch 丢失及从 MariaDB 重建 SSP deny gate；`completed` 后不得有该 subject 的受众/身份进入 DSP 请求。
 - DSP billable notice 测试覆盖事务提交后才返回 204、相同 event 重放、相同 ID 不同 body 冲突、5xx/timeout 重试及 grace 到期隔离。
-- Portal smoke test 覆盖登录换 token、加载 SDK、请求广告、渲染及 no-fill 诊断；diagnostics scope 缺失时响应不含调试字段。
+- Portal smoke test 覆盖加载 SDK、请求广告、渲染及 no-fill 诊断。
 - 请求 `id`、imp ID、`tmax`、`at`、currency、`user.data[].segment[]` 的映射与边界测试。
 - DSP 响应 request ID 不匹配、未知 imp、非法价格/币种、超时、空 seatbid 和无效 creative 的拒绝/no-bid 测试。
 - DMP segment 映射保留 provider/segment 标识，不泄漏 token；无 consent、不支持目的和 DMP timeout 的 fail-closed 测试。

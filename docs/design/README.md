@@ -27,7 +27,7 @@
 - Sandbox 的有效、签名 impression tracker event 是演示账本的 billable trigger；同一 bid 最多计一次，click 只记录测量事件。此规则不构成生产反作弊或付款依据；启用生产结算前必须批准 IVT/可见性规则、publisher 合同和账务对账策略。
 - MVP publisher payable 暂按有效 DSP billable 金额的 100% 记账，不计税费或 SSP fee；收入分成、付款/打款和多币种换汇不在首期范围。SDK/管理控制面只用于 sandbox。
 - DMP audience 可选，MVP 默认不传用户身份；只有有授权且 deny gate 可用时才解析受众。DMP 撤回完成语义由 ClickHouse 持久 tombstone 与 DMP 专用 Valkey deny gate 共同保证。
-- 生产供给接入还须定义 `ads.txt`/`app-ads.txt` 授权校验、`sellers.json` seller 映射和 OpenRTB `source.schain` 的生成/透传策略；它们与 Supply credential 认证互补，不能互相替代。仅 sandbox 流量可暂缓。
+- 生产供给接入还须定义 `ads.txt`/`app-ads.txt` 授权校验、`sellers.json` seller 映射和 OpenRTB `source.schain` 的生成/透传策略。仅 sandbox 流量可暂缓。
 - Test Portal/JavaScript SDK 到 SSP 使用 `/sdk/v1` client API；该 API 只返回浏览器渲染所需的安全字段，禁止让浏览器直接访问 DSP、DMP 或 MariaDB。
 - OpenRTB `user.id`、`buyeruid`、`eids` 按各自标准语义使用；不创建在三个应用间共享的全局 user ID。
 
@@ -52,7 +52,7 @@
 7. **事件与财务分层**：账务事实及必须可靠传播的领域事件在各自 MariaDB 事务中写入账本/outbox；普通竞价诊断和 DMP 分析事件可经 Valkey Stream at-least-once 批量投递，必须定义保留、积压、丢弃和允许丢失目标。SSP 账本表达 publisher 应付，DSP 账本表达 advertiser 消耗；不跨库共享账务模型。
 8. **计费语义**：OpenRTB `nurl` 是赢标通知，不代表已展示或可计费；DSP spend 以经验证的 `burl`/双方约定 billable event 入账。Publisher payable 由 SSP 的 publisher 合同计费策略计算。
 9. **投放审计**：实时接口只保留必要的去敏事件字段。敏感标识使用受控的伪名化 token；原始 IP、完整 user ID、consent string 和完整 BidRequest 不写普通日志。
-10. **测试入口**：门户使用测试租户/fixture 和短期、受限的 SDK token；线上长期密钥、数据库凭证和 DSP endpoint secret 不进入 HTML、JavaScript bundle 或浏览器存储。
+10. **测试入口**：门户使用独立的测试租户/fixture；测试环境与生产环境隔离。
 11. **身份隔离**：SSP 是 exchange identity mapping 的拥有者；为每个 publisher/partner 建 pairwise alias。DMP 只用 tenant/namespace-scoped HMAC token 查受众，DSP 只接收自身 `buyeruid` 和明确授权的 `eids`；无同意/无映射时不传身份，不做 fingerprinting。
 12. **投放控制范围**：频次上限和 pacing 属于 DSP 投放策略，不等同于竞价预算租约，且明确不在首期 MVP 支持范围。首期 daily budget 按 UTC 自然日重置；后续若增加频控/pacing，必须先定义维度、窗口/时区、状态存储和跨实例一致性。
 
