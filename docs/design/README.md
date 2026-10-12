@@ -43,10 +43,11 @@
 | SSP | 供给侧拍卖与广告投放入口，负责接入流量、OpenRTB 竞价编排和 publisher payable 逻辑 | README / HLD / LLD / API |
 | DSP | 广告主侧出价与投放决策服务，负责 campaign/line item/creative/targeting/budget 相关决策 | README / HLD / LLD / API |
 | DMP | 受众管理与成员快照服务，负责身份/受众解析、撤回门禁和快照发布 | README / HLD / LLD |
-| Valkey | 仅作为热缓存和有界事件缓冲层，不是 SSP/DSP/DMP 的事实源 | README / HLD / LLD |
+| Valkey | 热配置缓存、有界事件缓冲及有持久权威记录支撑的安全协调状态（identity deny gate、admission lease）；不是财务或广告投放事实源 | README / HLD / LLD |
 | fact source | 业务事实的权威持久化来源，SSP/DSP 为 MariaDB，DMP 为 ClickHouse | README / HLD / LLD |
 | reservation | 单次出价从租约额度中扣留的最大计费风险；与 account/lease 状态分开管理，不等同于租约本身 | HLD / LLD |
 | billable event | 影响收入、支出或对账结算的有效计费事件；必须进入账务账本和幂等结算流程 | HLD / LLD |
+| bearer token | AEAD 加密并认证的短期凭据；claims 不可由客户端读取，按用途、audience 和期限限制，且不得记入日志 | README / HLD / LLD / API |
 | deny gate | 用于阻止无授权、无同意或已撤回主体进入受众解析/启用的安全门禁 | HLD / LLD |
 | outbox | 与源事务绑定的可靠事件投递通道，保证必须可靠传播的业务事实不丢失 | HLD / LLD |
 | no-bid | 由于超时、预算、策略或隐私条件而拒绝参与竞价；不等同于失败并发或系统错误 | README / HLD / API |
@@ -61,7 +62,7 @@
 - **DSP**：接收 OpenRTB BidRequest、做广告候选筛选和出价。业务事实存储在 MariaDB 独立数据库 `dsp_db`，Valkey 仅缓存热数据。
 - **DMP**：管理受众数据和快照，提供受众解析及事件写入 API。业务数据存储使用 ClickHouse。
 
-三个应用各自拥有领域模型、数据库所有权、迁移/发布流程和运行时配置。SSP 与 DSP 可部署在同一 MariaDB 集群，但必须使用不同数据库、账号、迁移流程和最小权限授权；不能跨库查询或共享表。DMP 独立使用 ClickHouse。Valkey keyspace 按应用和 ACL 隔离：SSP/DSP 用于可重建缓存/短期缓冲；SSP/DMP identity deny gate 与短期 admission lease 是有界安全协调状态，必须可从各自持久撤回记录恢复，不能承载财务或广告投放事实。禁止共享领域实体、存储模型、Go `common` 业务包或跨库查询。服务间只通过有版本的 HTTP 契约交互。
+三个应用各自拥有领域模型、数据库所有权、迁移/发布流程和运行时配置。SSP 与 DSP 可部署在同一 MariaDB 集群，但必须使用不同数据库、账号、迁移流程和最小权限授权；不能跨库查询或共享表。DMP 独立使用 ClickHouse。Valkey keyspace 按应用和 ACL 隔离：SSP/DSP 用于可重建缓存/短期缓冲；SSP/DMP identity deny gate 与短期 admission lease 是有持久撤回记录支撑的安全协调状态，必须可恢复，不能承载财务或广告投放事实。服务间不得共享领域存储；Creative Asset Store 是明确例外的无领域模型对象存储基础设施，DSP 以写权限上传不可变素材，SSP 以只读权限渲染，双方只交换受版本控制的 asset_ref/元数据和 HTTP 契约。禁止共享领域实体、存储模型、Go `common` 业务包或跨库查询。
 
 开发语言为 Go；HTTP 使用标准库 `net/http`，业务层不依赖 Web 框架。数据库驱动和 OpenRTB wire DTO 属于基础设施依赖，不构成领域共享。
 
@@ -97,7 +98,7 @@
 1. **实时边界**：SSP 并发调用 DMP 与多个 DSP，并以 OpenRTB `tmax` 为总截止时间；DMP 查询和 DSP 调用各自有更短的可配置超时。预算耗尽时不等待完整超时，立即按配置降级。
 2. **DMP 降级**：无标识、无授权、缓存未命中且 DMP 超时等情况下，不发送受众数据；SSP 是否继续竞价由 Placement 的隐私/受众策略决定，默认继续无受众竞价。任何策略都不得绕过 consent。
 3. **SSP/DSP 热路径**：MariaDB 是各自业务事实源；配置变更经版本化刷新到 Valkey 和进程内只读快照。RTB 请求只读缓存/内存，不回源 MariaDB；缓存未预热或超过新鲜度上限时，实例不就绪或对受影响业务 no-bid。
-4. **DSP 预算**：第一期仅支持 LineItem 的 daily/lifetime 预算，不设独立 Campaign 总预算。竞价决策不在每个 bid request 上读取 MariaDB；预算以后台预分配的有界额度租约供实例使用。节点发送 bid 前在本地从租约可用额扣留最大计费风险，DSP 在 notice URL 中携带签名 reservation reference。loss 与 billable notice 都通过 MariaDB 事务按 reservation ID 幂等结算：loss 释放全局预留，billable 将预留转为实际 spend 并释放差额；已释放额度只进入全局可用池，不补回旧实例租约。实例失联时，未结算额度继续占用预算到结算宽限期结束；迟到 notice 隔离对账。
+4. **DSP 预算**：第一期仅支持 LineItem 的 daily/lifetime 预算，不设独立 Campaign 总预算。竞价决策不在每个 bid request 上读取 MariaDB；预算以后台预分配的有界额度租约供实例使用。节点发送 bid 前在本地从租约可用额扣留最大计费风险，DSP 在 notice URL 中携带 AEAD 加密认证的 reservation reference。loss 与 billable notice 都通过 MariaDB 事务按 reservation ID 幂等结算：loss 释放全局预留，billable 将预留转为实际 spend 并释放差额；已释放额度只进入全局可用池，不补回旧实例租约。实例失联时，未结算额度继续占用预算到结算宽限期结束；迟到 notice 隔离对账。
 5. **DMP 查询模型**：ClickHouse 保存追加式事件和不可变受众快照。先完整写入并校验快照，再追加发布标记；解析只读已发布版本，不依赖跨表事务或 `FINAL`。
 6. **缓存职责**：Valkey 存 SSP/DSP 热配置快照、短期受众解析结果和有明确保留策略的短期缓冲数据；MariaDB 才是 SSP/DSP 持久业务事实源。Valkey Stream 是有界事件缓冲，不称为事务 outbox，也不承诺超出其持久化/保留配置的零丢失。
 7. **事件与财务分层**：账务事实及必须可靠传播的领域事件在各自 MariaDB 事务中写入账本/outbox；普通竞价诊断和 DMP 分析事件可经 Valkey Stream at-least-once 批量投递，必须定义保留、积压、丢弃和允许丢失目标。SSP 账本表达 publisher 应付，DSP 账本表达 advertiser 消耗；不跨库共享账务模型。
@@ -124,18 +125,24 @@ flowchart LR
   SSP -->|OpenRTB 2.6 BidRequest| DSP[DSP Go App]
   DSP -->|OpenRTB 2.6 BidResponse| SSP
   SSP -->|OpenRTB Win notice callback| DSP
-  SSP -->|批量事件 REST / 重试| DMP
+  SSP -->|DMP 分析事件 REST / 重试| DMP
   SSP --- SSPDB[(MariaDB / ssp_db)]
   DSP --- DSPDB[(MariaDB / dsp_db)]
+  DSP -->|不可变素材写入| ASSET[(共享只读边界 Asset Store)]
+  SSP -->|受控只读渲染| ASSET
   SSP -. 热缓存 .-> VK[(Valkey)]
   DSP -. 热缓存 .-> VK
+  SSP -. 身份 deny gate / lease .-> VK
+  DMP -. 身份 deny gate / lease .-> VK
   DMP --- CH[(ClickHouse)]
+  DSP -->|nurl / lurl / burl callbacks| SSP
+  SSP -->|持久 burl outbox| DSP
   SSP -->|OpenRTB 2.6 响应| Supply
 ```
 
 ## 6. 设计验收门槛
 
-开发前必须确认：峰值 QPS、请求体大小、调用地域/网络拓扑、OpenRTB 媒体格式、拍卖类型、超支容忍度及预算舍入/结算策略、reservation 最大有效窗口、频控/pacing 首期范围、publisher payable 与 advertiser billable 的业务依据、供给授权/透明度范围、缓存最大陈旧时间、DMP 数据新鲜度、撤回生效 SLA、隐私法规和数据保留期限。所有 `*_micros` 金额字段固定表示百万分之一主币单位；预算和账本按币种分别记账，最终结算到 ISO-4217 最小单位时按已约定规则舍入。随后用目标规模压测验证 SSP 总延迟分配、Valkey 缓存命中/内存、MariaDB 控制面/账务写入与后台预算租约、ClickHouse 受众查询 P95/P99；另验证重复/冲突 notice、迟到 billable notice 与租约回收竞争、跨节点撤回屏障、事件积压/丢失目标、缓存冷启动和 MariaDB 故障期间的行为。
+开发前必须确认：峰值 QPS、请求体大小、调用地域/网络拓扑、OpenRTB 媒体格式、拍卖类型、超支容忍度及预算舍入/结算策略、reservation 最大有效窗口、频控/pacing 首期范围、publisher payable 与 advertiser billable 的业务依据、供给授权/透明度范围、缓存最大陈旧时间、DMP 数据新鲜度、撤回生效 SLA、隐私法规和数据保留期限。MariaDB 首期最低版本为 10.6，以满足 `SELECT ... FOR UPDATE SKIP LOCKED` 的实现约束。所有 `*_micros` 金额字段固定表示百万分之一主币单位；预算和账本按币种分别记账，最终结算到 ISO-4217 最小单位时按已约定规则舍入。随后用目标规模压测验证 SSP 总延迟分配、Valkey 缓存命中/内存、MariaDB 控制面/账务写入与后台预算租约、ClickHouse 受众查询 P95/P99；另验证重复/冲突 notice、迟到 billable notice 与租约回收竞争、跨节点撤回屏障、事件积压/丢失目标、缓存冷启动和 MariaDB 故障期间的行为。
 
 特别注意：ClickHouse 面向分析和批量写入，不是传统 OLTP。若 DMP 逐用户查询的吞吐/尾延迟无法通过快照布局、SSP 短 TTL 缓存和压测目标，需在开发前重新评估“DMP 仅使用 ClickHouse”这一约束，不能通过掩盖查询延迟来宣称满足在线服务等级。
 
@@ -148,8 +155,11 @@ flowchart LR
 - 预算账户/租约与单次 reservation 是不同粒度：账户额度由全局可租、已租额度及已花费额度约束；租约到期停止新出价，未结算额度保留至 grace 结束。
 - 单次 reservation 在出价前从本地租约可用额中原子扣留最大计费风险。收到 `nurl` 只记录非计费 win，不改变 reservation 或 held 额度。
 - 同一 reservation 的 `lurl` loss 与 `burl` billable 是互斥终态：loss 释放全部预留额；billable 将实际金额转为 spend 并释放差额。grace 后未结算 reservation 才可回收；迟到或冲突结果隔离对账。
+- 预算租约首期参数：每实例/LineItem/预算范围初始最多租取该范围可租余额的 10%，单次租额上限为预算限额的 5%；租约 TTL 为 30 秒，剩余可用额度低于租额的 25% 或租约剩余 TTL 低于 10 秒时异步续租。续租只能从全局可租余额分配；失联租额在 held 风险结算/宽限后回收。运营压测可调小但不得扩大配置定义的上限。
+- 租约按 `daily` 与 `lifetime` scope 分别建立 `budget_account`；daily 账户在 UTC 日期首次租额申请时以唯一键惰性创建。lifetime 的 `period_start` 是 LineItem 生效起点 UTC 日期（LineItem 可继承 Campaign 起止时间，也可定义更窄的起止时间）。下调限额若低于已花费金额则拒绝；若 `spent + leased` 高于新限额，提交后暂停新租额/出价，已持有 reservation 仍按原状态结算，直至余额回到限额内。
 - 通知去重与账务幂等使用不同标识：`notice_id` 去重 notice 投递/记录，`reservation_id` 标识预算预留，`source_event_key` 标识账务事件。各自必须跨重试稳定，但不得混作同一个幂等键；账务事务按 reservation 与 source event 规则共同校验。
 - 账务冲正必须以新分录记录，不允许直接更新历史金额。
+- 授权的部分冲正必须关联原分录；同一原分录累计冲正绝对值不得超过原金额，币种相同且方向相反，并在锁定原分录的事务中校验。
 
 ### 7.2 数据与隐私边界
 
@@ -160,7 +170,7 @@ flowchart LR
 
 ### 7.3 缓存与事件边界
 
-- Valkey 只承担热配置缓存、短期可重建缓存和有界事件缓冲，不作为事实源。
+- Valkey 承担热配置缓存、短期可重建缓存、有界事件缓冲及安全协调状态；不作为财务或广告投放事实源。deny gate/lease 的持久权威记录必须在 SSP/DMP 各自事实源中，Valkey 使用 no-eviction 策略并可按 epoch 重建。
 - 缓存丢失必须可恢复，不能造成业务事实丢失。
 - 账务事实必须写入事务账本或事务 outbox；非账务事件可使用有界缓冲并允许在积压时丢弃或裁剪。
 
@@ -183,6 +193,14 @@ flowchart LR
 - DMP deny gate fail-closed
 - cache miss behavior
 - outbox replay behavior
+- 多 scope 预算扣留的全有或全无及失败回滚
+- 被 floor/币种/creative/deadline 校验丢弃的已收到 bid 的 loss notice 与 reservation 回收；未收到响应的 reservation grace 回收
+- 多实例配置发布/manifest 轮询、版本加载报告和 readiness 陈旧摘除
+- key rotation 时撤回覆盖所有有效/历史 key version，并以全版本 deny 确认后才标记 completed
+- 清空 Valkey 后仅凭 AEAD event token 从 impression 可靠恢复财务上下文并入账
+- 篡改、跨用途、错误 audience、过期和未知 key version 的 AEAD token 必须 fail closed；轮换旧 key 前验证其 token 与关联 reservation 全部过期
+- 部分/全额冲正、重复冲正、并发冲正、超原金额和币种不匹配均按 ledger 规则处理
+- `site.page` 完整 URL 保留及 `site.ext.openads.normalized_page_path` 的编码斜杠、尾点、IDN、端口规范化向量
 - version conflict handling
 
 本节要求与 [HLD](HLD.md) 与 [LLD](LLD.md) 的实现门槛保持一致，确保设计、实现和验证用同一套边界和语义。

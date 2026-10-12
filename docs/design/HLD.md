@@ -19,11 +19,11 @@
 
 ## 2. 系统上下文
 
-三个服务独立部署、独立故障域、独立数据所有权。服务发现、TLS、密钥分发和部署平台暂不绑定特定云或编排系统。内网 API 使用加密传输；公网 SSP 入口另有流量清洗、限流和请求体上限。
+三个服务独立部署、独立故障域、独立数据所有权。服务发现、TLS、密钥分发和部署平台暂不绑定特定云或编排系统。内网 API 使用 mTLS，并以服务身份/tenant 授权；公网 SSP 入口另有流量清洗、限流和请求体上限。Supply 通过已登记的 supply endpoint 凭据映射到 tenant、publisher 和 placement，不从 OpenRTB 请求体推断身份；DSP bidder 以 mTLS 服务身份映射到唯一 partner/tenant profile。详见 [API.md](API.md) §1.2。
 
 SSP 与 DSP 的业务事实分别存放在 MariaDB 的 `ssp_db`、`dsp_db`，使用独立数据库账号、授权、迁移和连接池；可先共用 MariaDB 集群，但应用没有跨库查询权限。Valkey 的 SSP/DSP keyspace 是热缓存，不是事实源；DMP 另有隔离 ACL/keyspace 的在线撤回 deny gate，其持久权威记录仍是 ClickHouse tombstone。RTB 竞价路径不得因缓存 miss 同步回源 MariaDB。
 
-Test Portal 是独立静态测试客户端，不增加第四个广告业务域或数据库。原生 JS SDK 调用 SSP Client API；SSP 将 client request 映射成 OpenRTB 2.6 BidRequest，DSP 仍只接收标准 OpenRTB。Portal 仅连接 sandbox/test 环境。
+Test Portal 是独立静态测试客户端，不增加第四个广告业务域或数据库。原生 JS SDK 调用 SSP Client API；SSP 将 client request 映射成 OpenRTB 2.6 BidRequest，DSP 仍只接收标准 OpenRTB。Portal 仅连接 sandbox/test 环境。共享 Asset Store 是无领域状态的基础设施例外：DSP 使用受控写身份，SSP renderer 使用只读身份；不得共享 MariaDB、领域存储或凭据。
 
 | 调用方 | 被调用方 | 契约 | 同步性 | 超时/失败行为 |
 |---|---|---|---|---|
@@ -33,8 +33,10 @@ Test Portal 是独立静态测试客户端，不增加第四个广告业务域�
 | SSP | DMP | 内部 `Audience Resolve v1` | 同步，可短 TTL 缓存 | 超时不阻塞整个拍卖；按 Placement 策略无受众继续或 no-bid |
 | SSP | DMP | 内部 `Event Batch v1` | 异步重试，经有界 Valkey Stream | 分析事件按 at-least-once 投递；最大积压、保留期和允许丢失目标必须配置并告警；若某事件必须可靠传播，改用与源事务绑定的 MariaDB outbox |
 | SSP | DSP | OpenRTB `nurl`/`lurl`/`burl` notice URL | 异步回调，按双方 profile | `nurl` 只记 win 且不释放 reservation；`lurl` 与 `burl` 是互斥结算终态；方法、宏和重试策略由接入 profile 确定 |
-| Browser render iframe | SSP | `POST /sdk/v1/impressions`、`POST /sdk/v1/events` | 异步 | 校验签名 event token、期限、auction/bid/imp 绑定及唯一 event key；MVP impression 最多 billable 一次，click 永不触发财务 |
+| Browser render iframe | SSP | `POST /sdk/v1/impressions`、`POST /sdk/v1/events` | 异步 | 解封并校验 AEAD event token、期限、auction/bid/imp 绑定及唯一 event key；impression endpoint token-only、无 cookie，接受 sandbox iframe 的 opaque `Origin: null` 但不开放通用 CORS；MVP impression 最多 billable 一次，click 永不触发财务 |
 | SSP tracker | DSP | bidder 返回的 `burl`（双方约定 JSON POST profile） | 持久 outbox 异步重试 | 仅在 impression/payable 事务提交后发送；DSP 按 reservation/event ID 幂等结算，重试不重复扣预算 |
+| DSP 控制面 | SSP | Creative Registry Sync v1 | 异步 HTTP | mTLS partner identity + tenant/endpoint 绑定；幂等版本更新，失败可重试 |
+| SSP Supply adapter | SSP | Supply Impression callback | 异步 HTTP | 只接受已认证 Supply endpoint 的 Supply-audience AEAD token；与 SDK tracker 共用 event key、账务事务，但 token audience 独立 |
 
 OpenRTB 的 no-bid 语义和 HTTP 表达按 2.6 契约实现；不得把内部 DMP API 包装成 OpenRTB endpoint。
 
@@ -144,13 +146,13 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 
 ### 3.1 Sandbox billable event 顺序
 
-首期 sandbox 的受控 render endpoint 返回 SSP 托管的静态图片 iframe 文档和短期 event token。图片加载后 iframe POST impression signal；SSP 校验 token 签名/期限、tenant/placement/auction/bid/imp 绑定和一次性 event key，在同一 MariaDB 事务中插入唯一 billable delivery event、PublisherPayableLedger 分录及 DSP billable outbox 记录。事务提交后异步向 DSP `burl` 发送稳定 `event_id`、reservation reference、金额和币种；DSP 验证后在原子结算事务中记 AdvertiserSpendLedger 和预算。点击通过 SSP redirect 记录非账务事件后跳转 allowlisted landing URL。过期、重放或绑定不匹配的事件不得记账。该规则只供 sandbox 账本验收，不代表生产 IVT/可见性保证；生产付款必须另行批准验证、争议和对账规则。
+首期 sandbox 的受控 render endpoint 返回 SSP 托管的静态图片 iframe HTML 壳和独立图片字节端点，短期 AEAD event token 加密并认证金额、币种、reservation reference 和已登记 DSP `burl` 目标，不依赖可丢失的 Valkey 竞价缓冲。图片加载后 iframe POST impression signal；SSP 解封并校验 token 的期限、tenant/placement/auction/bid/imp 绑定和一次性 event key，在同一 MariaDB 事务中插入唯一 billable delivery event、PublisherPayableLedger 分录及 DSP billable outbox 记录。事务提交后异步向 DSP `burl` 发送稳定 `event_id`；DSP 验证后在原子结算事务中记 AdvertiserSpendLedger 和预算。Supply 直连路径向 Supply 返回受控 `adm` iframe markup，并返回 SSP 拥有的 `nurl`/`lurl` 回调；Supply 需通过认证 impression callback 交付账务信号，使用绑定 Supply audience 的独立 AEAD token，但复用相同 event key 与账务幂等事务，SSP 再向 DSP 发 `burl`。点击通过 SSP redirect 记录非账务事件后跳转 allowlisted landing URL。过期、重放或绑定不匹配的事件不得记账。该规则只供 sandbox 账本验收，不代表生产 IVT/可见性保证；生产付款必须另行批准验证、争议和对账规则。
 
 ### 3.2 DSP 预算风险生命周期
 
-预算总额按币种、LineItem 和预算周期维护 `spent + leased_total <= limit`。`leased_total` 包含实例本地可用额度及已扣留的在途风险，不重复相加。后台把额度租给唯一进程 incarnation；实例发 bid 前以稳定 reservation ID 在本地原子扣留该 bid 的最大 billable 金额，并在 DSP 返回的 notice URL 中放入签名 reservation reference。reference 至少绑定 tenant、line item、所有适用预算 lease/scope、auction/bid/imp、最大金额、币种、expiry 和 key version，不含用户标识。RTB 热路径不写 MariaDB。
+预算总额按币种、LineItem 和预算周期维护 `spent + leased_total <= limit`。`leased_total` 包含实例本地可用额度及已扣留的在途风险，不重复相加。后台把额度租给唯一进程 incarnation；实例发 bid 前以稳定 reservation ID 在本地原子扣留该 bid 的最大 billable 金额，并在 DSP 返回的 notice URL 中放入 AEAD reservation reference。reference 至少绑定 tenant、line item、所有适用预算 lease/scope、auction/bid/imp、最大金额、币种、expiry 和 key version，不含用户标识。RTB 热路径不写 MariaDB。
 
-收到合法 `lurl` 或 `burl` 后，DSP 在 MariaDB 单事务内插入唯一 reservation settlement，并校验租约状态/宽限期、币种和上限；事务先查询 reservation 的既有终态，重复同结果即使迟到也返回幂等成功，reservation ID 对应不同结果则隔离冲突。只有未结算且超过 grace 的 reservation 才隔离。loss 从各适用账户和 lease 的 `leased/held` 中扣除最大预留额，将额度退回全局池；billable 扣除同一预留额并增加实际 spend，预留与实际金额的差额回到全局池。已释放金额不补回原实例租约，因此重复 loss 不能恢复本地出价额度。一个 reservation 覆盖的所有预算范围须在同一事务成功，否则整体回滚。租约到期停止新 bid，但未结算的 held 额度保留到宽限期；`settlement_grace_until` 至少为 `expires_at + 接入 profile 最大通知延迟 + 最大重试窗口 + 时钟偏差余量`。期满仍未收到终态 notice 的余额才回收。超出窗口的未结算 notice 隔离对账，不得使预算账户超限。
+收到合法 `lurl` 或 `burl` 后，DSP 在 MariaDB 单事务内插入唯一 reservation settlement，并校验租约状态/宽限期、币种和上限；事务先查询 reservation 的既有终态，重复同结果即使迟到也返回幂等成功，reservation ID 对应不同结果则隔离冲突。只有未结算且超过 grace 的 reservation 才隔离。loss 从各适用账户和 lease 的 `leased/held` 中扣除最大预留额，将额度退回全局池；billable 扣除同一预留额并增加实际 spend，预留与实际金额的差额回到全局池。已释放金额不补回原实例租约，因此重复 loss 不能恢复本地出价额度。一个 reservation 覆盖的所有预算范围须在同一事务成功，否则整体回滚。租约到期停止新 bid，但未结算的 held 额度保留到宽限期；`settlement_grace_until` 至少覆盖 `max(expires_at, reservation.expires_at, render_token.expires_at + 最大展示延迟) + 接入 profile 最大通知延迟 + 最大重试窗口 + 时钟偏差余量`。reservation TTL 不得短于 render token TTL 加最大展示延迟。期满仍未收到终态 notice 的余额才回收。超出窗口的未结算 notice 进入 quarantine，不得使预算账户超限。
 
 ## 4. 服务与领域边界
 
@@ -187,8 +189,8 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 
 - **SSP / MariaDB + Valkey**：`ssp_db` 是 SSP 配置/供给数据事实源，InnoDB 事务提交后由后台刷新器更新版本化 Valkey 缓存和进程内快照。Valkey 丢失可重建；RTB 缓存 miss 不允许直接读 DB，实例需使用仍在有效期的本地快照，否则对受影响 placement no-bid/不就绪。
 - **DSP / MariaDB + Valkey**：`dsp_db` 是 DSP 配置、预算和 advertiser spend 结算事实源；daily budget scope 按 UTC 自然日、`00:00 UTC` 切换。独立事务保证预算账本和 billable settlement 一致性。Campaign 发布以版本号刷新 Valkey/内存快照；预算租约由后台预分配，实例报告已加载版本，发布控制面等待或告警未跟上的实例。
-- **SSP 财务事件**：同一 MariaDB 事务插入去重后的 billable delivery event、追加 PublisherPayableLedger 分录并更新可重建的余额/日报汇总。应付分录不可覆盖；冲正以带原分录引用的新负分录表达。
-- **DSP 财务事件**：同一 MariaDB 事务按 reservation ID 去重并核验终态，插入 delivery event、追加 AdvertiserSpendLedger 分录，并同步更新所有适用的 lease 与 BudgetAccount；重复 notice 幂等成功，冲正使用新分录。
+- **SSP 财务事件**：同一 MariaDB 事务插入去重后的 billable delivery event、追加 PublisherPayableLedger 分录并更新可重建的余额/日报汇总。应付分录不可覆盖；授权冲正以同币种、相反方向且关联原分录的新分录表达，支持部分冲正但累计不得超过原分录金额。
+- **DSP 财务事件**：同一 MariaDB 事务按 reservation ID 去重并核验终态，插入 delivery event、追加 AdvertiserSpendLedger 分录，并同步更新所有适用的 lease 与 BudgetAccount；重复 notice 幂等成功，冲正规则与 SSP ledger 一致。
 - **日志语义**：delivery event 是追加式事件，至少一次投递，以稳定 event ID 去重；财务账本是可审计权威记录。运营报表可由日志/账本生成，汇总表可重建，不得反向覆盖账本。
 - **跨系统对账**：SSP 与 DSP 通过 exchange/auction/bid/imp 标识和双方确认的计费事件做定期文件/API 对账；各服务只读写自己的库，不执行跨库 join。SSP publisher payable 与 DSP advertiser spend 金额允许按合同不同，差额应拆解为 fee/revenue share/tax/rounding 等显式项目。
 - **身份映射**：身份 link 只由 SSP 持有且按 publisher/partner 隔离；DMP 收到 HMAC namespace token，DSP 收到自己的 buyeruid。不是三边复制同一个 user ID，也不创建跨库 user table。
@@ -213,7 +215,7 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 
 每个服务拥有独立配置、健康检查、版本、指标和发布回滚。标准库 `net/http` 配合轻量中间件函数实现 request ID、deadline、结构化日志和 metrics/tracing 接口，不要求采用 Web 框架。
 
-最低指标：入口 QPS/错误率/延迟分位数；SSP 各 DSP 响应时延、no-bid、超时和清算差异；SSP/DSP delivery event 接收/积压/去重数；publisher payable 与 DSP spend 入账金额、冲正金额、ledger 写入失败/延迟、DSP budget ledger reconciliation 差异；SSP/DSP Valkey 命中率、缓存版本与陈旧度；DMP cache hit、ClickHouse lookup 延迟、快照版本/新鲜度；DSP 预算租约余量和 settlement 重复率；Valkey 内存/淘汰率；分别按 `ssp_db`、`dsp_db` 观测 MariaDB 连接池、事务冲突和慢查询；ClickHouse insert/query 延迟及 parts/磁盘水位。
+最低指标：入口 QPS/错误率/延迟分位数；SSP 各 DSP 响应时延、no-bid、超时和清算差异；SSP/DSP delivery event 接收/积压/去重数；publisher payable 与 DSP spend 入账金额、冲正金额、ledger 写入失败/延迟、DSP budget ledger reconciliation 差异；SSP/DSP Valkey 命中率、缓存版本与陈旧度；DMP cache hit、ClickHouse lookup 延迟、快照版本/新鲜度；DSP 预算租约余量、`held_micros / leased_micros`、超 grace quarantine 数和 settlement 重复率；各实例已加载配置版本及相对 manifest 的滞后；Valkey 内存/淘汰率；分别按 `ssp_db`、`dsp_db` 观测 MariaDB 连接池、事务冲突和慢查询；ClickHouse insert/query 延迟及 parts/磁盘水位。
 
 ## 8. 容量参数与 SLA 输入项
 
