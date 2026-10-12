@@ -1,8 +1,25 @@
 # Open Ads 低层设计（LLD）
 
-本文定义建议的聚合、端口、领域内 REST 契约、存储布局和失败语义。按服务整理的 API 路由、请求/响应与失败语义见 [API 设计](API.md)。数据库版本、驱动、部署拓扑和规模指标待评审后锁定。
+状态：提交版实现设计，供工程实施、代码评审和测试门槛使用。本文档与 [README.md](README.md) 和 [HLD.md](HLD.md) 使用统一术语、统一边界和统一验收口径，确保从架构总览到实现细节是一套一致的设计提交物。
 
-## 1. Go 应用结构
+本文定义实现级约束、领域结构、数据布局、状态机和失败语义，适用于工程落地和代码设计评审。本文不重复阐述系统目标，而是补充“如何组织代码、如何存储数据、如何保证状态一致性”。按服务整理的 API 路由、请求/响应与失败语义见 [API 设计](API.md)。数据库版本、驱动、部署拓扑和规模指标待评审后锁定。
+
+## 0. 术语与文档定位
+
+共享术语以 [README.md](README.md) §0.2 为准。LLD 仅定义实现级字段、状态和约束；如需增加实现专用术语，必须保持与总览定义一致。
+
+## 1. 设计目标与落地边界
+
+本章节面向开发人员，明确以下关键问题：
+
+- 代码如何按应用拆分：SSP、DSP、DMP 各自的模块职责
+- 数据如何落库：MariaDB/ClickHouse/Valkey 的事实源与缓存职责划分
+- 关键状态如何保证一致性：budget reservation、deny gate、outbox 和 revocation
+- 实现中必须遵守的边界：领域隔离、幂等、可恢复性和审计要求
+
+以下内容是后续模块设计和代码实现的底线，不得在实现阶段被绕开。
+
+### 1.1 Go 应用结构
 
 三个应用分别位于独立仓库或独立 Go module；以下目录在各自仓库内，不建立共享领域包：
 
@@ -18,6 +35,12 @@ internal/<app>/observability/
 ```
 
 wire DTO 和 OpenRTB 类型留在对应服务 adapter 内。领域层不导入 `net/http`、Valkey 客户端、SQL 驱动或 ClickHouse 客户端。应用层依赖本应用定义的窄接口，依赖方向指向 domain/application。
+
+### 1.2 实施门槛
+
+进入实现阶段的统一门槛和验收场景见 [README.md](README.md) §7。本文件后续章节给出这些门槛对应的实现约束与数据结构，不重复维护另一份门槛清单。
+
+### 1.3 数据类型、金额与标识符约束
 
 货币字段统一以整数微单位存储，`1 currency unit = 1,000,000 micros`；`*_micros` 表示主币单位的百万分之一，`*_cpm_micros` 表示每 1,000 次展示的 CPM 主币微单位。OpenRTB wire `price` 仍按协议以十进制 CPM 传输。对 CPM 计价的 billable event，单次金额按 `round_half_even(cpm_micros * quantity / 1000)` 计算为主币微单位；未提供 `qty.multiplier` 时 quantity 为 1。非 CPM 计价须在交易 profile 定义等价转换。计算使用十进制定点/有理数并检查溢出，不得使用 binary float 累计。对外付款/报表按 ISO-4217 币种最小单位和合同约定的舍入时点转换。
 
@@ -38,7 +61,7 @@ wire DTO 和 OpenRTB 类型留在对应服务 adapter 内。领域层不导入 `
 | 事件分录类：`delivery_event.amount_micros` | 允许 `NULL`（未结算 / 非 billable event）；非 NULL 时 `CHECK (amount_micros IS NULL OR amount_micros >= 0)`。首期 Sandbox 印象/点击/渲染事件中非 billable 的 click/render_error 一律存 `NULL`，禁止存 0（0 会在统计中被误当 0 元 billable 事件） |
 | 账本分录类：`publisher_payable_ledger.amount_micros`、`advertiser_spend_ledger.amount_micros` | 允许负数（冲正）；`CHECK (amount_micros != 0)`（零值分录无意义，禁止入库）。冲正必须写一条与原分录金额绝对值相等、符号相反的新分录（附带关联原分录 ID），绝不 UPDATE 历史分录的 `amount_micros`。 |
 
-后续所有 `CREATE TABLE` 中的 `_micros BIGINT UNSIGNED NOT NULL` 应视为 `_micros BIGINT SIGNED NOT NULL CHECK (_micros >= 0)` 的简写。`_micros BIGINT NULL` 与 `_micros BIGINT NOT NULL` 的语义差异必须与上表匹配，不能照搬草稿中的 SIGNED/UNSIGNED 差异。实现时由数据库迁移脚本强制执行上面表中的类型和 CHECK 约束，迁移 review 时的 checklist 条目见本节末尾「DDL review checklist」。
+所有 CREATE TABLE 必须显式使用 `BIGINT SIGNED` 并按字段语义声明 CHECK；禁止将 UNSIGNED 简写为有符号约束。可空事件金额与可负账本分录遵循上表各自语义，迁移 review 必须逐列核验类型和约束。
 
 建议端口形态（每个应用自行定义，不跨 module 共享）：
 
@@ -65,14 +88,22 @@ type ID interface {
 
 每个服务的 repository/client 接口使用自己的 domain 类型；不创建通用 `Repository[T]` 或 `common.Entity`。
 
-### 1.1 数据库 ER 图
+### 1.4 数据库 ER 图
 
 以下图依据本节后续的表定义绘制。MariaDB 图中标为 `FK` 的关系对应 DDL 外键；标为 `logical, no FK` 的关系仅表示字段关联，数据库不强制完整性。`ssp_db`、`dsp_db` 与 ClickHouse 相互独立，不存在跨库关系。
+
+SSP 与 DSP 图中的 `TENANT` 对应各自 MariaDB 内独立的 `tenant` 表；DMP 图中的 `TENANT` 是逻辑分区根，ClickHouse 不建 tenant 表。图中所有租户边均表示 `tenant_id` 作用域关系，不代表数据库外键。
 
 #### SSP (`ssp_db`)
 
 ```mermaid
 erDiagram
+  TENANT {
+    binary16 tenant_id PK
+    varchar display_name
+    varchar status
+    char default_currency
+  }
   PUBLISHER {
     binary16 tenant_id PK
     binary16 publisher_id PK
@@ -88,12 +119,29 @@ erDiagram
     binary16 tenant_id PK
     binary16 placement_id PK
     binary16 property_id FK
+    binary16 auction_policy_id FK
     char currency
   }
   SUPPLY_ENDPOINT {
     binary16 tenant_id PK
     binary16 endpoint_id PK
     binary16 property_id FK
+  }
+  DSP_ENDPOINT {
+    binary16 tenant_id PK
+    binary16 dsp_endpoint_id PK
+    varchar bid_url
+    json callback_host_allowlist
+    int priority
+    int timeout_ms
+  }
+  AUCTION_POLICY {
+    binary16 tenant_id PK
+    binary16 auction_policy_id PK
+    tinyint auction_type
+    varchar tie_breaker
+    varchar floor_enforcement
+    varchar currency_policy
   }
   SSP_CONFIG_OUTBOX {
     binary16 event_id PK
@@ -115,6 +163,14 @@ erDiagram
     varchar partner_id PK
     binary partner_user_id_hmac
   }
+  SSP_IDENTITY_REVOCATION {
+    binary16 tenant_id PK
+    binary16 revocation_id PK
+    binary16 publisher_id
+    binary16 subject_id
+    bigint gate_generation
+    varchar status
+  }
   SSP_DELIVERY_EVENT {
     binary16 tenant_id PK
     binary16 event_id PK
@@ -122,6 +178,14 @@ erDiagram
     binary16 publisher_id
     binary16 property_id
     binary16 placement_id
+  }
+  SSP_BILLABLE_OUTBOX {
+    binary16 tenant_id PK
+    binary16 event_id PK
+    binary source_event_key
+    binary16 dsp_id
+    varbinary reservation_ref
+    bigint amount_micros
   }
   PUBLISHER_PAYABLE_LEDGER {
     binary16 tenant_id PK
@@ -132,27 +196,58 @@ erDiagram
     char currency
   }
 
+  TENANT ||--o{ PUBLISHER : "logical tenant_id, no FK"
+  TENANT ||--o{ PROPERTY : "logical tenant_id, no FK"
+  TENANT ||--o{ PLACEMENT : "logical tenant_id, no FK"
+  TENANT ||--o{ SUPPLY_ENDPOINT : "logical tenant_id, no FK"
+  TENANT ||--o{ DSP_ENDPOINT : "logical tenant_id, no FK"
+  TENANT ||--o{ AUCTION_POLICY : "logical tenant_id, no FK"
+  TENANT ||--o{ SSP_CONFIG_OUTBOX : "logical tenant_id, no FK"
+  TENANT ||--o{ PUBLISHER_SUBJECT : "logical tenant_id, no FK"
+  TENANT ||--o{ PARTNER_IDENTITY_LINK : "logical tenant_id, no FK"
+  TENANT ||--o{ SSP_IDENTITY_REVOCATION : "logical tenant_id, no FK"
+  TENANT ||--o{ SSP_DELIVERY_EVENT : "logical tenant_id, no FK"
+  TENANT ||--o{ SSP_BILLABLE_OUTBOX : "logical tenant_id, no FK"
+  TENANT ||--o{ PUBLISHER_PAYABLE_LEDGER : "logical tenant_id, no FK"
   PUBLISHER ||--o{ PROPERTY : "FK tenant_id,publisher_id"
   PROPERTY ||--o{ PLACEMENT : "FK tenant_id,property_id"
+  AUCTION_POLICY ||--o{ PLACEMENT : "FK tenant_id,auction_policy_id"
   PROPERTY ||--o{ SUPPLY_ENDPOINT : "FK tenant_id,property_id"
   PUBLISHER ||--o{ PUBLISHER_SUBJECT : "FK tenant_id,publisher_id"
   PUBLISHER_SUBJECT ||--o{ PARTNER_IDENTITY_LINK : "FK tenant_id,publisher_id,subject_id"
+  PUBLISHER_SUBJECT ||--o{ SSP_IDENTITY_REVOCATION : "FK tenant_id,publisher_id,subject_id"
+  SSP_DELIVERY_EVENT ||--o{ SSP_BILLABLE_OUTBOX : "FK tenant_id,event_id"
+  DSP_ENDPOINT ||--o{ SSP_DELIVERY_EVENT : "logical, no FK"
+  DSP_ENDPOINT ||--o{ SSP_BILLABLE_OUTBOX : "logical, no FK"
   SSP_DELIVERY_EVENT ||--o{ PUBLISHER_PAYABLE_LEDGER : "FK tenant_id,event_id"
   PUBLISHER ||--o{ SSP_DELIVERY_EVENT : "logical, no FK"
   PROPERTY ||--o{ SSP_DELIVERY_EVENT : "logical, no FK"
   PLACEMENT ||--o{ SSP_DELIVERY_EVENT : "logical, no FK"
 ```
 
-`ssp_config_outbox.aggregate_type`/`aggregate_id` 是多态聚合引用，不是外键；delivery event 中的 publisher/property/placement ID 也未在 DDL 声明外键。DDL 的唯一约束均为复合键，例如 property 的 `(tenant_id, property_type, external_id)`、subject 的来源 HMAC、partner identity 和 event/ledger 幂等键；图中不把它们误表示为单列唯一。
+`ssp_config_outbox.aggregate_type`/`aggregate_id` 是多态聚合引用，不是外键；delivery event 中的 publisher/property/placement/endpoint ID 和 billable outbox 中的 endpoint ID 也未在 DDL 声明外键。`ssp_billable_outbox.event_id` 与 `ssp_identity_revocation` 到 subject 的关系有 DDL 外键。DDL 的唯一约束均为复合键，例如 property 的 `(tenant_id, property_type, external_id)`、subject 的来源 HMAC、partner identity 和 event/ledger 幂等键；图中不把它们误表示为单列唯一。
 
 #### DSP (`dsp_db`)
 
 ```mermaid
 erDiagram
+  TENANT {
+    binary16 tenant_id PK
+    varchar display_name
+    varchar status
+    char default_currency
+  }
   ADVERTISER {
     binary16 tenant_id PK
     binary16 advertiser_id PK
     char default_currency
+  }
+  DSP_CONFIG_OUTBOX {
+    binary16 event_id PK
+    binary16 tenant_id
+    varchar aggregate_type
+    binary16 aggregate_id
+    bigint aggregate_version
   }
   CAMPAIGN {
     binary16 tenant_id PK
@@ -172,6 +267,13 @@ erDiagram
     varchar asset_ref
     uint16 asset_width_px
     uint16 asset_height_px
+  }
+  DSP_CREATIVE_ASSET_REGISTRY {
+    binary16 tenant_id PK
+    varchar asset_ref PK
+    binary asset_sha256
+    bigint content_size_bytes
+    varchar mime_type
   }
   LINE_ITEM_CREATIVE {
     binary16 tenant_id PK
@@ -219,10 +321,23 @@ erDiagram
     bigint amount_micros
   }
 
+  TENANT ||--o{ ADVERTISER : "logical tenant_id, no FK"
+  TENANT ||--o{ DSP_CONFIG_OUTBOX : "logical tenant_id, no FK"
+  TENANT ||--o{ CAMPAIGN : "logical tenant_id, no FK"
+  TENANT ||--o{ LINE_ITEM : "logical tenant_id, no FK"
+  TENANT ||--o{ CREATIVE : "logical tenant_id, no FK"
+  TENANT ||--o{ DSP_CREATIVE_ASSET_REGISTRY : "logical tenant_id, no FK"
+  TENANT ||--o{ LINE_ITEM_CREATIVE : "logical tenant_id, no FK"
+  TENANT ||--o{ BUDGET_ACCOUNT : "logical tenant_id, no FK"
+  TENANT ||--o{ BUDGET_LEASE : "logical tenant_id, no FK"
+  TENANT ||--o{ BUDGET_RESERVATION_SETTLEMENT : "logical tenant_id, no FK"
+  TENANT ||--o{ DSP_DELIVERY_EVENT : "logical tenant_id, no FK"
+  TENANT ||--o{ ADVERTISER_SPEND_LEDGER : "logical tenant_id, no FK"
   ADVERTISER ||--o{ CAMPAIGN : "FK tenant_id,advertiser_id"
   CAMPAIGN ||--o{ LINE_ITEM : "FK tenant_id,campaign_id"
   LINE_ITEM ||--o{ LINE_ITEM_CREATIVE : "FK tenant_id,line_item_id"
   CREATIVE ||--o{ LINE_ITEM_CREATIVE : "FK tenant_id,creative_id"
+  DSP_CREATIVE_ASSET_REGISTRY ||--o{ CREATIVE : "logical tenant_id,asset_ref; no FK"
   LINE_ITEM ||--o{ BUDGET_ACCOUNT : "FK tenant_id,line_item_id"
   BUDGET_LEASE ||--o{ BUDGET_RESERVATION_SETTLEMENT : "FK tenant_id,lease_id"
   LINE_ITEM ||--o{ BUDGET_LEASE : "logical, no FK"
@@ -230,12 +345,15 @@ erDiagram
   DSP_DELIVERY_EVENT ||--o{ ADVERTISER_SPEND_LEDGER : "FK tenant_id,event_id"
 ```
 
-`budget_lease` 的 line item/scope/period 和 `budget_reservation_settlement` 的预算范围、delivery event 的 advertiser/campaign/line item ID 是逻辑引用；表定义没有对应外键。settlement 的 source event key 也没有直接指向 delivery event 的外键。DDL 中 source event 和幂等唯一键均包含 tenant/scope 等列，图中只列键字段，不表示其为单列唯一。
+`dsp_config_outbox.aggregate_type`/`aggregate_id` 是多态聚合引用，不是外键。`dsp_creative_asset_registry` 通过 `(tenant_id, asset_ref)` 与 creative 逻辑关联，DDL 不声明外键。`budget_lease` 的 line item/scope/period 和 `budget_reservation_settlement` 的预算范围、delivery event 的 advertiser/campaign/line item ID 是逻辑引用；表定义没有对应外键。settlement 的 source event key 也没有直接指向 delivery event 的外键。DDL 中 source event 和幂等唯一键均包含 tenant/scope 等列，图中只列键字段，不表示其为单列唯一。
 
 #### DMP (ClickHouse)
 
 ```mermaid
 erDiagram
+  TENANT {
+    uuid tenant_id PK
+  }
   DMP_SNAPSHOT_PUBLICATION {
     uuid tenant_id
     string provider_id
@@ -279,6 +397,12 @@ erDiagram
     string segment_id
   }
 
+  TENANT ||--o{ DMP_SNAPSHOT_PUBLICATION : "logical tenant_id, no tenant table"
+  TENANT ||--o{ DMP_MEMBERSHIP_SNAPSHOT : "logical tenant_id, no tenant table"
+  TENANT ||--o{ DMP_SEGMENT_DEFINITION_VERSION : "logical tenant_id, no tenant table"
+  TENANT ||--o{ DMP_IDENTITY_REVOCATION : "logical tenant_id, no tenant table"
+  TENANT ||--o{ DMP_IDENTITY_REVOCATION_STATUS : "logical tenant_id, no tenant table"
+  TENANT ||--o{ DMP_EVENT : "logical tenant_id, no tenant table"
   DMP_SNAPSHOT_PUBLICATION ||--o{ DMP_MEMBERSHIP_SNAPSHOT : "logical tenant,provider,namespace,snapshot"
   DMP_SEGMENT_DEFINITION_VERSION ||--o{ DMP_MEMBERSHIP_SNAPSHOT : "logical provider,segment"
   DMP_IDENTITY_REVOCATION ||--o{ DMP_IDENTITY_REVOCATION_STATUS : "logical tenant,revocation_id history"
@@ -288,7 +412,7 @@ erDiagram
 
 ClickHouse 表不声明主键或外键；图中的 DMP 连线都是查询/版本关联，不提供数据库级 referential integrity。各表的 `ORDER BY` 是 MergeTree 排序键，不等同于唯一键。
 
-## 1.2 租户（Tenant）模型
+### 1.5 租户（Tenant）模型
 
 `tenant_id` 是所有业务表的主键前缀，代表一个数据隔离域。首期 MVP 中：
 - SSP 的 `ssp_db` 中存在一个 `tenant` 表，描述 SSP 侧的租户元数据；管理 API 请求必须明确提供 `tenant_id`，Publisher、Property、Placement、DSP Endpoint 等资源查询均将其作为行级过滤条件。
@@ -355,19 +479,18 @@ Auction 是短生命周期对象，默认只存在于请求上下文中；竞价
 
 ##### 2.2.0.1 Bid 合法性校验（每个 Bid 独立执行；校验失败的 Bid 被静默丢弃，不进入候选，不触发 loss）
 
-对每个 DSP endpoint 返回的 OpenRTB BidResponse（不区分成功/超时）做以下 9 步：
+对每个 DSP endpoint 返回的 OpenRTB BidResponse（不区分成功/超时）做以下 8 步：
 
 | # | 校验项 | 失败语义 |
 |---|---|---|
 | 1 | `BidResponse.id == BidRequest.id`（精确 byte-wise 匹配） | 整个 BidResponse 丢弃 |
 | 2 | `seatbid[].bid[].impid` 存在且精确等于请求中某个 imp.id（首期 MVP 只 1 imp，因此必须 == 该 imp.id） | 该 bid 丢弃 |
 | 3 | **币种**：`BidResponse.cur == placement.currency`（首期 MVP 不做汇率换算；请求时 SSP 已把 `BidRequest.cur[] = [placement.currency]` 发给 DSP；仍需防御性校验） | 该 bid 丢弃；若该 DSP 所有 bid 币种不符，记一次 `dsp_currency_mismatch` 指标 |
-| 4 | **Floor**：把 wire `bid.price`（十进制 float CPM）转换为整数微单位 `bid_cpm_micros = round_half_even_to_uint64(bid.price * 1_000_000)`；校验 `bid_cpm_micros >= placement.floor_cpm_micros`（floor 为 placement 域的权威值）；低于 floor → 该 bid 丢弃 | 记 `below_floor_discarded` 指标，不触发 loss |
+| 4 | **Floor**：把 wire `bid.price`（十进制 CPM）以定点/有理数转换为有符号整数微单位 `bid_cpm_micros = round_half_even_to_int64(bid.price * 1_000_000)`，并检查溢出；校验 `bid_cpm_micros >= placement.floor_cpm_micros`（floor 为 placement 域的权威值）；低于 floor → 该 bid 丢弃 | 记 `below_floor_discarded` 指标，不触发 loss |
 | 5 | **尺寸/格式**：bid.w/h == placement 的实际 imp 尺寸（请求里的 banner 宽高）；若 bid 未带 w/h 则从 DSP 的 `ext.openads.asset_width_px/asset_height_px` 读取，仍缺失则丢弃 | 该 bid 丢弃 |
-| 6 | **Creative 元数据一致性**：bid.ext.openads 中必须有 `asset_ref`、`asset_sha256`、`asset_width_px`、`asset_height_px`、`landing_url`；其中 `asset_sha256`、`asset_width_px`、`asset_height_px` 必须与 DSP Endpoint profile 中该 `dsp_id` → 已发布 creative_id（由 DSP 管理员注册的 creative 元数据白名单）**完全一致**。首期 MVP 采用「DSP 管理员先通过 `/dsp/admin/v1/creatives` 注册 creative → SSP 管理台通过 `/ssp/admin/v1/dsp-endpoints/{id}/creatives` 把允许的 creative hash/size 同步到 SSP」的最小白名单模型（避免恶意 DSP 自报任意尺寸/hash 导致渲染不一致）；如果 SSP 侧没有该 creative 的白名单记录则 bid 丢弃。 | 该 bid 丢弃，记 `creative_not_whitelisted`，不触发 loss |
-| 7 | **Landing URL allowlist**：`ext.openads.landing_url` 的 host 必须命中 DSP endpoint profile 中配置的 `allowlisted_landing_hosts[]`；首期 MVP 不允许任意 landing URL，防止 SSRF/绕过域名安全。 | 该 bid 丢弃 |
-| 8 | **Win/Loss/Bill notice URL host**：bid 返回的 `nurl` / `lurl` / `burl` 的 host 必须精确命中 DSP endpoint profile 中配置的 `allowlisted_callback_hosts[]`，未命中则用该 DSP 默认回调模板覆盖或（默认策略）**丢弃该 bid**，防止 SSP 被利用为 SSRF 代理。 | 该 bid 丢弃 |
-| 9 | **Deadline 剩余时间**：距 `tmax` 剩余 < `config.min_render_token_sanity_ms`（默认 1ms）时，该 bid 不进入候选；winner 选择必须有足够时间构造 render token、写 Valkey auction 结果缓冲、序列化响应。 | 该 bid 丢弃 |
+| 6 | **Creative 元数据一致性**：标准字段 `bid.crid` 必须匹配白名单中的 `creative_id`；`bid.ext.openads` 必须含 `asset_ref`、`asset_sha256`、`asset_width_px`、`asset_height_px`、`landing_url`，并与该 endpoint 下对应 creative 记录完全一致。`mime_type` 由 SSP 白名单记录提供，不接受 bidder 覆盖；`landing_url` 的 host 必须等于白名单 `landing_url_host`。首期 MVP 采用 DSP 注册后同步 creative 元数据到 SSP 的显式白名单模型；缺少记录或任一字段不匹配则丢弃该 bid。 | 该 bid 丢弃，记 `creative_not_whitelisted`，不触发 loss |
+| 7 | **Win/Loss/Bill notice URL host**：bid 返回的 `nurl` / `lurl` / `burl` 的 host 必须精确命中 DSP endpoint profile 的 `callback_host_allowlist`，未命中则用该 DSP 默认回调模板覆盖或（默认策略）**丢弃该 bid**，防止 SSP 被利用为 SSRF 代理。 | 该 bid 丢弃 |
+| 8 | **Deadline 剩余时间**：距 `tmax` 剩余 < `config.min_render_token_sanity_ms`（默认 1ms）时，该 bid 不进入候选；winner 选择必须有足够时间构造 render token、写 Valkey auction 结果缓冲、序列化响应。 | 该 bid 丢弃 |
 
 校验阶段丢弃的 bid **不触发 loss notice**（因为从未真正进入候选池，等价于该 DSP 该次 bid 在 SSP 侧被视为未提交）。
 
@@ -388,17 +511,18 @@ if len(valid_bids) == 0 {
     return NO_FILL
 }
 
-// 排序：先按 bid_cpm_micros DESC（first-price，谁出价高谁赢）；同分进入 tie-break 链：
-//   tie-break ①：DSP endpoint priority INT ASC（小值优先；管理员在 SSP `/admin/v1/dsp-endpoints` 里配置，默认 0；用于 Deal 或信任度分层。首期 MVP 全 0，本条不会触发分歧）
-//   tie-break ②：placement.floor_cpm_micros 与 bid_cpm_micros 的差值 ASC（越接近 floor 的优先？NO：first-price 下应越贵越好，本条只用来防御 bid 完全相等时的稳定排序；因此等价于 bid_cpm_micros 后比较以下可重复确定值）
-//   tie-break ③：auction_policy.tie_breaker == "bid_id_asc" → bid.ID 字节序 ASC；管理员可配置，默认 "bid_id_asc"。
+// 排序：先按 bid_cpm_micros DESC（first-price，谁出价高谁赢）；同分后严格按配置执行：
+//   "bid_id_asc"：按 bid.ID 字节序 ASC。
+//   "dsp_priority_then_bid_id_asc"：先按 DSP endpoint priority INT ASC，再按 bid.ID 字节序 ASC。
 //
-// 排序的核心不变量：bid_cpm_micros DESC 优先，其余一切 tie-break 只是保证完全相同价格时的稳定可重复。
+// 所有 tie-break 仅在价格相同时生效，保证结果稳定且可重复。
 sort.SliceStable(valid_bids, func(i, j int) bool {
     a, b := valid_bids[i], valid_bids[j]
     if a.BidCpmMicros != b.BidCpmMicros { return a.BidCpmMicros > b.BidCpmMicros }
-    if a.DSPPriority != b.DSPPriority { return a.DSPPriority < b.DSPPriority }
     switch auctionPolicy.TieBreaker {
+  case "dsp_priority_then_bid_id_asc":
+    if a.DSPPriority != b.DSPPriority { return a.DSPPriority < b.DSPPriority }
+    return a.BidID < b.BidID
     case "bid_id_asc":
         return a.BidID < b.BidID
     default: // 非法 tie-breaker 在 publish 编译时就拒绝；运行时 fallback 到 bid_id_asc + 告警
@@ -435,7 +559,7 @@ AuctionPolicy 快照字段（首期 MVP 只暴露少量可配置字段；其余�
 - valid_bids[] 为空但某 DSP 实际提交了非空 seatbid（且其内部 bid 全在 §2.2.0.1 被丢弃 → 这些 bid 本身不触发 loss，但 DSP 端如果提供了「整次请求没赢」的 fallback `lurl` 在 BidResponse 根而非 bid 级，SSP 应按接入 profile 约定是否调用；**首期 MVP 所有 loss 都在 Bid 级（seatbid[].bid[].lurl），不处理 BidResponse 根 lurl**）
 - Winner → **触发 win**（`nurl`）；不触发 loss。
 
-**触发时机：** 不阻塞 OpenRTB 响应的 HTTP 返回。**先把 Supply/SDK 的 BidResponse 发出去**，再在独立的 goroutine 池里异步触发 win/loss notice（以及后续 billable outbox 流程）。原因：调用 DSP notice 的网络延迟会拖慢 Supply 的 tmax deadline，违反 HLD §2 中 SSP 总 tmax 截止的不变量。
+**触发时机：** 不阻塞 OpenRTB 响应的 HTTP 返回。**先把 Supply/SDK 的 BidResponse 发出去**，再在独立的 goroutine 池里异步触发 win/loss notice（以及后续 billable outbox 流程）。原因：调用 DSP notice 的网络延迟会拖慢 Supply 的 tmax deadline，违反 HLD §2.1 中 SSP 总 tmax 截止的不变量。
 
 ```
 时序摘要：
@@ -447,10 +571,10 @@ AuctionPolicy 快照字段（首期 MVP 只暴露少量可配置字段；其余�
 
 **Win/Loss Notice 的失败语义：**
 - 方法、宏展开（如 `${AUCTION_PRICE}` 精确替换为 `settle_price_cpm_micros / 1_000_000.0` 的十进制字符串，half-even 舍入到 micro 精度）按双方接入 profile 执行。
-- 超时、5xx、429（含 Retry-After）：**最多重试 `max_notice_retries`（默认 3）次，带抖动指数退避，最长重试窗口不超过该 DSP notice grace window；超过仍失败的条目写入 `ssp_delivery_event` 中一条 `notice_delivery_failed` 审计事件，不无限阻塞也不重复到账务层**——因为 win notice 本身不记账、不扣预算（记账只走 `burl` billable notice，见 LLD §3.3），win/loss 的最终状态以 DSP 侧 billable 事件的成功为准，win notice 失败不影响账务正确性。
+- 超时、5xx、429（含 Retry-After）：**最多重试 `max_notice_retries`（默认 3）次，带抖动指数退避，最长重试窗口不超过该 DSP notice grace window；超过仍失败的条目写入 `ssp_delivery_event` 中一条 `notice_delivery_failed` 审计事件，不无限阻塞也不重复到账务层**。notice 投递状态与 reservation 结算状态分离；`nurl` 不记账、不扣预算，reservation 只由 `lurl` loss 或 `burl` billable 终态结算（见 LLD §3.3），因此 win notice 失败不改变账务结果。
 - `lurl` 失败：该 bid 对应 reservation 在 DSP 侧将按 `settlement_grace_until` 到期由 lease 回收逻辑自动释放（见 LLD §3.3），因此 SSP 侧 `lurl` 失败不做告警级 P0，只做指标 `lost_loss_notice_delivery_failed`；连续失败率超阈值时升级告警。
 
-**去重保证：** 每个 `nurl`/`lurl` 调用带全局唯一 `notice_id = sha256("notice" + auction_id + ":" + bid_id + ":" + outcome)`，由 SSP 侧 `ssp_notice_outbox`（如果后续引入；首期 MVP 直接把 notice_id 放入 HTTP 请求的 `X-Notice-ID` header 供 DSP 幂等）用于 DSP 去重日志，不做账务幂等；账务幂等由后续 `burl` 的 `reservation_ref` + `source_event_key` 负责，二者解耦。
+**去重保证：** 每个 `nurl`/`lurl` 调用带稳定 `notice_id = sha256("notice" + auction_id + ":" + bid_id + ":" + outcome)`，通过 `X-Notice-ID` header 去重 notice 投递/记录；该 ID 不用于账务幂等。账务使用 reservation reference 中的 `reservation_id` 及 billable `source_event_key` 独立校验，按 README §7.1 处理。
 
 ### 2.2.1 SSP Client API 与 JavaScript SDK
 
@@ -524,7 +648,7 @@ SDK 最小能力：request/timeout/abort、no-fill/error 状态、请求 ID、�
 
 `POST /sdk/v1/events` 和 click redirect 仅记录 click/render_error 等非账务测量事件；click 永不计费。Impression 是不可信客户端输入，只有首期 sandbox profile 中通过 token、绑定和幂等校验的 SSP tracker impression 才可记演示账本；DSP spend 只能由持久 outbox 发出的双方约定 billable notice 触发。生产财务入账前必须批准 IVT/可见性、争议处理和对账规则。
 
-### 2.2.1.1 OpenRTB identity mapping
+#### 2.2.1.1 OpenRTB identity mapping
 
 - `user.id` 使用 SSP exchange-scoped opaque ID；除非 buyer/seller 另有明确约定，不放 publisher 原始账号 ID。
 - 每个 DSP 的 `user.buyeruid` 从 SSP `PartnerIdentityLink` 独立查出；DSP A 的 buyer ID 不得发送给 DSP B。无有效 link 时省略 `buyeruid`。
@@ -591,12 +715,27 @@ CREATE TABLE property (
     REFERENCES publisher (tenant_id, publisher_id)
 ) ENGINE=InnoDB;
 
+CREATE TABLE auction_policy (
+  tenant_id BINARY(16) NOT NULL,
+  auction_policy_id BINARY(16) NOT NULL,
+  auction_type TINYINT UNSIGNED NOT NULL,
+  tie_breaker VARCHAR(32) NOT NULL,
+  floor_enforcement VARCHAR(16) NOT NULL,
+  currency_policy VARCHAR(24) NOT NULL,
+  version BIGINT UNSIGNED NOT NULL,
+  updated_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (tenant_id, auction_policy_id)
+) ENGINE=InnoDB;
+
+-- 数据库列 auction_type 映射到领域字段 AuctionPolicy.at；其余策略字段与配置快照同名。
+
 CREATE TABLE placement (
   tenant_id BINARY(16) NOT NULL,
   placement_id BINARY(16) NOT NULL,
   property_id BINARY(16) NOT NULL,
+  auction_policy_id BINARY(16) NOT NULL,
   media_type VARCHAR(24) NOT NULL,
-  floor_cpm_micros BIGINT UNSIGNED NOT NULL,
+  floor_cpm_micros BIGINT SIGNED NOT NULL CHECK (floor_cpm_micros >= 0),
   currency CHAR(3) NOT NULL,
   privacy_policy VARCHAR(24) NOT NULL,
   status VARCHAR(16) NOT NULL,
@@ -605,7 +744,9 @@ CREATE TABLE placement (
   PRIMARY KEY (tenant_id, placement_id),
   KEY idx_placement_property (tenant_id, property_id, status),
   CONSTRAINT fk_placement_property FOREIGN KEY (tenant_id, property_id)
-    REFERENCES property (tenant_id, property_id)
+    REFERENCES property (tenant_id, property_id),
+  CONSTRAINT fk_placement_auction_policy FOREIGN KEY (tenant_id, auction_policy_id)
+    REFERENCES auction_policy (tenant_id, auction_policy_id)
 ) ENGINE=InnoDB;
 
 CREATE TABLE supply_endpoint (
@@ -621,6 +762,21 @@ CREATE TABLE supply_endpoint (
     REFERENCES property (tenant_id, property_id)
 ) ENGINE=InnoDB;
 
+CREATE TABLE dsp_endpoint (
+  tenant_id BINARY(16) NOT NULL,
+  dsp_endpoint_id BINARY(16) NOT NULL,
+  bid_url VARCHAR(2048) NOT NULL,
+  openrtb_profile VARCHAR(32) NOT NULL,
+  callback_host_allowlist JSON NOT NULL,
+  priority INT SIGNED NOT NULL DEFAULT 0,
+  timeout_ms INT UNSIGNED NOT NULL,
+  status VARCHAR(16) NOT NULL,
+  version BIGINT UNSIGNED NOT NULL,
+  updated_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (tenant_id, dsp_endpoint_id),
+  KEY idx_dsp_endpoint_status_priority (tenant_id, status, priority)
+) ENGINE=InnoDB;
+
 CREATE TABLE ssp_config_outbox (
   event_id BINARY(16) NOT NULL,
   tenant_id BINARY(16) NOT NULL,
@@ -629,6 +785,9 @@ CREATE TABLE ssp_config_outbox (
   aggregate_version BIGINT UNSIGNED NOT NULL,
   created_at DATETIME(6) NOT NULL,
   published_at DATETIME(6) NULL,
+  failed_attempts SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+  last_failed_at DATETIME(6) NULL,
+  last_error_sanitized VARCHAR(512) NULL,
   PRIMARY KEY (event_id),
   KEY idx_ssp_outbox_pending (published_at, created_at)
 ) ENGINE=InnoDB;
@@ -690,7 +849,7 @@ CREATE TABLE partner_identity_link (
 ) ENGINE=InnoDB;
 ```
 
-控制面在一个 MariaDB 事务内提交聚合变更和 `ssp_config_outbox` 记录。publisher subject 的外部 pseudonym 仅存 HMAC 索引，不存明文。identity link 中 partner ID 只以应用层 envelope encryption 密文保存，并带 encryption key version；HMAC 索引使用独立密钥，不能从 HMAC 反推出原值。只允许 SSP identity service 解密，不写日志。表结构是概念草案，软删除、Deal/AuctionPolicy 表和索引需按管理查询模型细化。
+控制面在一个 MariaDB 事务内提交聚合变更和 `ssp_config_outbox` 记录。publisher subject 的外部 pseudonym 仅存 HMAC 索引，不存明文。identity link 中 partner ID 只以应用层 envelope encryption 密文保存，并带 encryption key version；HMAC 索引使用独立密钥，不能从 HMAC 反推出原值。只允许 SSP identity service 解密，不写日志。`dsp_endpoint` 与 `auction_policy` 为首期持久化模型；Deal 等非首期配置表和软删除策略后续按管理查询模型细化。
 
 #### 2.4.1 SSP 配置刷新器（Config Refresher）默认策略
 
@@ -713,23 +872,11 @@ CREATE TABLE partner_identity_link (
    - Valkey：以 pipeline + EVAL（Lua）写 `ssp:cache:v1:{tenant}:<type>:<id>`，保证 `schema_version`、`snapshot_version`、`payload`、`published_at` 字段同时落地；TTL 不依赖过期（配置永不过期，TTL 仅设为 7 天「无人访问则清理」的兜底被动清理，**不负责删除**）。写入成功后做一次 `ssp:cache:v1:{tenant}:manifest:v1`（本 tenant 下所有聚合的 `(type, id, version)` 列表）的增量更新，用于实例启动时全量拉取。
    - 进程内：以 `atomic.Value` / copy-on-write 方式原子替换本实例的进程只读 map；所有 bid handler **只读该快照 map**，不做 Valkey 回源（Valkey 是实例新启动时的 snapshot 源，正常稳态下热路径不走 Valkey）。
 6. **outbox 最终态写入**：成功（或 payload_hash 未变的跳过）后在同事务内 `UPDATE ssp_config_outbox SET published_at = NOW(6) WHERE event_id IN (...)`。若本轮有任一 outbox 的构建失败（例如聚合 ID 在 DB 中找不到——通常是 race 被其他操作先删了），该条 outbox 单独：
-   - 写入 `failed_attempts = failed_attempts + 1`，`last_failed_at = NOW(6)`，`last_error_msg = <sanitized, no SQL>`（需在 outbox 表中加 3 列，见下补充 DDL）。
+  - 写入 `failed_attempts = failed_attempts + 1`，`last_failed_at = NOW(6)`，`last_error_sanitized = <sanitized, no SQL>`；三个字段在 SSP/DSP outbox 的建表定义中直接声明。
    - `failed_attempts >= 5` 后停止自动重试，管理员需通过 `/admin/v1/config-outbox/{event_id}:retry` 或全量重放按钮手动重放，并触发告警（P1，指标 `config_outbox_failed_total{reason="exhausted_retries"}`）。
    - 任何单条失败不阻塞本轮其他 outbox 成功推进。
 7. **冷启动/新实例启动全量初始化**：实例启动时不等待 outbox 逐步推进，直接读取 Valkey manifest → 批量 `MGET` 所有快照到进程 map；manifest 缺失或陈旧时才 fallback 从 DB 聚合全量重建一次并回填 Valkey（启动链路 ≤ 5s 允许，超过则 readiness 失败，防止带空快照入流量）。
 8. **最大陈旧容忍度**：进程快照相对 outbox 版本落后 > `snapshot_max_staleness = 10s`（可配置）时，readiness probe 的 `readyz` 返回失败，负载均衡摘除该实例的 bid 流量，但该实例仍持续跑 refresher 追赶。
-
-补充 outbox DDL 列（SSP、DSP 两个 outbox 表一致）：
-```sql
-ALTER TABLE ssp_config_outbox
-  ADD COLUMN failed_attempts SMALLINT UNSIGNED NOT NULL DEFAULT 0,
-  ADD COLUMN last_failed_at DATETIME(6) NULL,
-  ADD COLUMN last_error_sanitized VARCHAR(512) NULL;
-ALTER TABLE dsp_config_outbox -- DSP 侧同样的 3 列
-  ADD COLUMN failed_attempts SMALLINT UNSIGNED NOT NULL DEFAULT 0,
-  ADD COLUMN last_failed_at DATETIME(6) NULL,
-  ADD COLUMN last_error_sanitized VARCHAR(512) NULL;
-```
 
 `publisher_subject.source_subject_hmac` 用于将重复 publisher-scoped pseudonym 稳定映射到 SSP subject；无外部 ID 时由 SSP 生成随机 `subject_id`，consent 允许后由 SDK 保存在 publisher origin 的 first-party storage。optional redirect sync 的 single-use state 只存在有 TTL 的 Valkey entry，与 subject、partner、consent version 绑定，DSP callback 成功后立即删除。
 
@@ -779,10 +926,10 @@ CREATE TABLE ssp_delivery_event (
   publisher_id BINARY(16) NOT NULL,
   property_id BINARY(16) NOT NULL,
   placement_id BINARY(16) NOT NULL,
-  dsp_id VARCHAR(128) NULL,
-  creative_id VARCHAR(128) NULL,
+  dsp_id BINARY(16) NULL,
+  creative_id BINARY(16) NULL,
   currency CHAR(3) NULL,
-  amount_micros BIGINT NULL,
+  amount_micros BIGINT SIGNED NULL CHECK (amount_micros IS NULL OR amount_micros >= 0),
   occurred_at DATETIME(6) NOT NULL,
   received_at DATETIME(6) NOT NULL,
   schema_version SMALLINT UNSIGNED NOT NULL,
@@ -796,12 +943,12 @@ CREATE TABLE ssp_billable_outbox (
   tenant_id BINARY(16) NOT NULL,
   event_id BINARY(16) NOT NULL,
   source_event_key BINARY(32) NOT NULL,
-  dsp_id VARCHAR(128) NOT NULL,
+  dsp_id BINARY(16) NOT NULL,
   auction_id VARCHAR(128) NOT NULL,
   bid_id VARCHAR(128) NOT NULL,
   imp_id VARCHAR(128) NOT NULL,
   reservation_ref VARBINARY(2048) NOT NULL,
-  amount_micros BIGINT UNSIGNED NOT NULL,
+  amount_micros BIGINT SIGNED NOT NULL CHECK (amount_micros >= 0),
   currency CHAR(3) NOT NULL,
   occurred_at DATETIME(6) NOT NULL,
   attempt_count INT UNSIGNED NOT NULL DEFAULT 0,
@@ -823,7 +970,7 @@ CREATE TABLE publisher_payable_ledger (
   auction_id VARCHAR(128) NOT NULL,
   imp_id VARCHAR(128) NOT NULL,
   entry_type VARCHAR(16) NOT NULL,
-  amount_micros BIGINT NOT NULL,
+  amount_micros BIGINT SIGNED NOT NULL CHECK (amount_micros <> 0),
   currency CHAR(3) NOT NULL,
   publisher_policy_version BIGINT UNSIGNED NOT NULL,
   occurred_at DATETIME(6) NOT NULL,
@@ -869,7 +1016,7 @@ Targeting 的 JSON DTO 见 [API.md](API.md) §3.2 的 line-items DTO 示例。�
 |---|---|---|
 | `site_domains` | 1) 取 host（去掉 scheme、port、userinfo、path、query、fragment）<br>2) 转为 US-ASCII 小写（非 ASCII 域名执行 Punycode/IDNA ToASCII）<br>3) 去掉末尾 `.`（FQDN 尾点）<br>4) publish 时校验 host 非空且不含 `/`、`?`、`#`、空白字符；非法 → publish 返回 `422` | **精确匹配（集合 OR）**：从 OpenRTB `BidRequest.site.domain` 取字段后执行同一份规范化 → 在 `site_domains[]` 中查找；有**任何一个命中**即该维度通过。targeting 省略该字段（或为 `null`/`[]`）→ 该维度不限。 |
 | `page_path_prefixes` | 1) 若 OpenRTB `site.page` 是完整 URL，先 RFC 3986 解析取 `path` 再处理；若已是 path 则直接用<br>2) 执行 `%XX` 解码为 UTF-8 字节，再对 path 段做 percent-encode（unreserved 字符保留，其余按字节编码大写 `%HH`），连续 `/` 折叠为 `/`，空 path 归一化为 `/`，`.`/`..` 段按 RFC 3986 §5.2.4 Remove Dot Segments 处理<br>3) publish 时校验每条 path 以 `/` 开头、非空、无 `?`/`#`/控制字符；非法 → `422` | **路径段边界前缀匹配（列表 OR）**：规范化后的 request `path` 与 targeting 中 `p` 任一前缀满足以下条件即通过：`path == p` **或** `strings.HasPrefix(path, p + "/")`。即 `/sports` 匹配 `/sports`、`/sports/football`，**不匹配** `/sports2`、`/foo/sports`。大小写：默认**区分大小写**；若后续要改，必须在 `placement`/`line_item` 里加显式布尔开关，**不得默认 case-insensitive 否则与 URL RFC 不一致**。 |
-| `banner_sizes` | publish 时校验 `w`/`h` 均为 ≥ 1 的正整数、对 ≤ `10000`（防止异常大位图）；非法 → `422` | **精确宽高匹配（列表 OR）**：OpenRTB `imp[i].banner.w` 和 `imp[i].banner.h`（取 `banner.format[].w/h` 或 `banner.w/h`，请求里若两者冲突以 `banner.w/h` 优先，都没有则跳过该 imp 的 banner 候选），任一 size 命中该列表则维度通过。同一 line item targeting 列表内重复 size 在 publish 编译阶段去重。 |
+| `banner_sizes` | publish 时校验 `w`/`h` 均为 ≥ 1 的正整数、对 ≤ `10000`（防止异常大位图）；非法 → `422` | **精确宽高匹配（列表 OR）**：OpenRTB `imp[i].banner.w` 和 `imp[i].banner.h`（取 `banner.format[].w/h` 或 `banner.w/h`，请求里若两者冲突以 `banner.w/h` 优先，都没有则跳过该 imp 的 banner 候选），任一 size 命中该列表则维度通过。省略、`null` 或空列表表示该维度不限；同一 line item targeting 列表内重复 size 在 publish 编译阶段去重。 |
 
 **请求侧字段提取规则（SSP 先规范化，DSP 只信任 OpenRTB wire）：**
 - SSP 在把 SDK Client Request 映射到 OpenRTB `site.domain` 时，从 `page.origin`（例：`https://publisher.test`）里取出 host 并按上面规范化后写入 `site.domain`；从 `page.path`（例：`/demo`）按上面规范化后写入 `site.page`。SSP 对 Supply 直连的 OpenRTB 请求也要执行同样的规范化流程后再发 DSP，确保 DSP 侧接收的 `site.domain`/`site.page` 已规范化 → DSP 热路径只需直接 compare，不再重复规范化。
@@ -895,7 +1042,7 @@ Go 风格伪代码：
 // 请求 deadline 剩余 > config.min_bid_deadline（否则立即 no-bid）。
 
 imp := request.Imp[0]
-tenant := dsp_bidder_profile.ResolveTenant(ssp_partner_id) // 见 LLD §1.2.1 跨服务 tenant 映射
+tenant := dsp_bidder_profile.ResolveTenant(ssp_partner_id) // 见 LLD §1.5 租户模型中的跨服务映射
 
 // —— 步骤 1：从 OpenRTB 取请求上下文（SSP 已规范化，不再重复规范化）——
 normSiteDomain := ""
@@ -908,7 +1055,10 @@ if imp.Banner != nil {
     if imp.Banner.W != 0 && imp.Banner.H != 0 { bannerW, bannerH = uint16(imp.Banner.W), uint16(imp.Banner.H) }
     else if len(imp.Banner.Format) > 0 { bannerW, bannerH = uint16(imp.Banner.Format[0].W), uint16(imp.Banner.Format[0].H) }
 }
-currency := "USD" // 首期 MVP 固定 USD；实际实现按 bidder profile 校验 request.cur 允许列表
+if len(request.Cur) != 1 || request.Cur[0] != "USD" {
+  return NoBid("unsupported_currency")
+}
+currency := request.Cur[0] // 首期 bidder profile 仅支持 USD；必须与 SSP placement/line item 的单币种配置一致
 now := clock.Now().UTC()
 if bannerW == 0 || bannerH == 0 { return NoBid("banner_size_missing") }
 
@@ -940,9 +1090,12 @@ for _, li := range candidateIndex[tenant] {
         }
     }
     if !ok_path { continue }
-    ok_size := false
-    for _, sz := range li.Targeting.BannerSizes {
+    ok_size := true
+    if len(li.Targeting.BannerSizes) > 0 {
+      ok_size = false
+      for _, sz := range li.Targeting.BannerSizes {
         if sz.W == bannerW && sz.H == bannerH { ok_size = true; break }
+      }
     }
     if !ok_size { continue }
 
@@ -1028,7 +1181,7 @@ return BidResponse{ID: request.ID, Cur: currency, SeatBid: []SeatBid{{Seat: bidd
 
 #### Bid Selection 不变量与失败语义（保证实现者行为一致）
 
-1. **`nurl` win notice 绝不直接扣预算**；只有 `burl` billable notice 进入 `budget_reservation_settlement` 的 billable 分支。见 HLD §3 预算风险生命周期。
+1. **`nurl` win notice 绝不直接扣预算或释放 held 额度**；只有 `lurl` loss 或 `burl` billable notice 可成为 reservation 的互斥终态。见 HLD §3.2 预算风险生命周期。
 2. **floor 校验在哪侧执行：** DSP 不知道 Placement floor（placement 属于 SSP），因此 floor 检查放在 **SSP 收到 BidResponse 后执行**（见下一节 SSP Winner Selection）。DSP 自己只保证 `bid_cpm_micros` ≥ 管理员在 line_item 上配置的 `min_bid_cpm_micros`（如后续添加；首期 MVP 不设 line_item min bid，等效 min=0 micros，floor 全由 SSP placement 负责）。
 3. **候选集到 #1 的穿透不回退到 #2**：一旦 sort 选中 #1 但在 lease 扣留发生竞争失败，直接返回 NoBid，不降级用 #2。降级会让排序靠前的 line item 的「高 bid 优先」契约失效；下一次 bid request 会重新评估，行为稳定。
 4. **币种强制统一**：首期 MVP 不做汇率换算。SSP Placement、DSP LineItem、Creative 关联、OpenRTB BidRequest.cur 与 BidResponse.cur 必须完全一致；否则：
@@ -1041,6 +1194,21 @@ return BidResponse{ID: request.ID, Cur: currency, SeatBid: []SeatBid{{Seat: bidd
 DSP 使用独立 MariaDB 数据库 `dsp_db`，与 SSP 的 `ssp_db` 分开授权、连接池、迁移和备份。全部业务表使用 InnoDB、明确主键、UTC 时间和外键/唯一约束；tenant 条件需进入唯一键与查询索引。
 
 ```sql
+CREATE TABLE dsp_config_outbox (
+  event_id BINARY(16) NOT NULL,
+  tenant_id BINARY(16) NOT NULL,
+  aggregate_type VARCHAR(32) NOT NULL,
+  aggregate_id BINARY(16) NOT NULL,
+  aggregate_version BIGINT UNSIGNED NOT NULL,
+  created_at DATETIME(6) NOT NULL,
+  published_at DATETIME(6) NULL,
+  failed_attempts SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+  last_failed_at DATETIME(6) NULL,
+  last_error_sanitized VARCHAR(512) NULL,
+  PRIMARY KEY (event_id),
+  KEY idx_dsp_outbox_pending (published_at, created_at)
+) ENGINE=InnoDB;
+
 CREATE TABLE advertiser (
   tenant_id BINARY(16) NOT NULL,
   advertiser_id BINARY(16) NOT NULL,
@@ -1072,9 +1240,9 @@ CREATE TABLE line_item (
   campaign_id BINARY(16) NOT NULL,
   status VARCHAR(16) NOT NULL,
   currency CHAR(3) NOT NULL,
-  bid_cpm_micros BIGINT UNSIGNED NOT NULL,
-  daily_budget_micros BIGINT UNSIGNED NOT NULL,
-  lifetime_budget_micros BIGINT UNSIGNED NOT NULL,
+  bid_cpm_micros BIGINT SIGNED NOT NULL CHECK (bid_cpm_micros >= 0),
+  daily_budget_micros BIGINT SIGNED NOT NULL CHECK (daily_budget_micros >= 0),
+  lifetime_budget_micros BIGINT SIGNED NOT NULL CHECK (lifetime_budget_micros >= 0),
   targeting_version BIGINT UNSIGNED NOT NULL,
   version BIGINT UNSIGNED NOT NULL,
   updated_at DATETIME(6) NOT NULL,
@@ -1100,12 +1268,13 @@ CREATE TABLE creative (
   creative_id BINARY(16) NOT NULL,
   status VARCHAR(16) NOT NULL,
   format VARCHAR(24) NOT NULL,
-  asset_ref VARCHAR(255) NOT NULL,
+  asset_ref VARCHAR(128) NOT NULL,
   asset_sha256 BINARY(32) NOT NULL,
   asset_width_px SMALLINT UNSIGNED NOT NULL,
   asset_height_px SMALLINT UNSIGNED NOT NULL,
   landing_url VARCHAR(2048) NOT NULL,
   version BIGINT UNSIGNED NOT NULL,
+  updated_at DATETIME(6) NOT NULL,
   PRIMARY KEY (tenant_id, creative_id),
   KEY idx_creative_format (tenant_id, format, status)
 ) ENGINE=InnoDB;
@@ -1120,6 +1289,7 @@ CREATE TABLE line_item_creative (
   CONSTRAINT fk_lic_creative FOREIGN KEY (tenant_id, creative_id)
     REFERENCES creative (tenant_id, creative_id)
 ) ENGINE=InnoDB;
+```
 
 ### 3.2.1 Creative Asset Store（MVP 实现方案 + asset_ref 生成规则 + SSP renderer 读路径）
 
@@ -1149,7 +1319,7 @@ CREATE TABLE line_item_creative (
 
 #### 3.2.1.2 `asset_ref` 生成规则与约束（DSP 控制面生成，SSP 只信任白名单中已注册的 ref）
 
-`asset_ref` = `"as:" + <tenant_id_hex> + ":" + <sha256_hex>`。例如 tenant=0x0001 的 32 字节 hex，文件 SHA-256 = `deadbeef...` → `as:00000000000000000000000000000001:deadbeefcafebabe...(64 chars 总长度)`。
+`asset_ref` = `"as:" + <tenant_id_hex> + ":" + <sha256_hex>`。例如 tenant=0x0001 的 32 字节 hex，文件 SHA-256 = `deadbeef...` → `as:00000000000000000000000000000001:deadbeefcafebabe...`（SHA-256 段为 64 个 hex 字符，整个 `asset_ref` 共 100 个 ASCII 字符）。
 
 不变量：
 1. **纯 ASCII、无 `/`、无 `..`、无 URL escape、无换行/控制字符**。SSP renderer 在把 `asset_ref` 映射回文件系统路径时，必须用正则 `^as:[0-9a-f]{32}:[0-9a-f]{64}$` 强校验；不符合该正则的 asset_ref 一律返回 `400 invalid_asset_ref`，防止任意路径穿越。
@@ -1165,14 +1335,14 @@ CREATE TABLE line_item_creative (
 
 #### 3.2.1.3 从 Upload → Creative Publish → DSP Bid → SSP 白名单 → Renderer 读的完整链路
 
-1. **上传（DSP 控制面）**：`POST /dsp/admin/v1/creative-assets` multipart → DSP 按上面规则落盘 → 返回 asset_ref 与服务端重算元组。同时 DSP 内部写入 `dsp_db.creative_asset_registry(tenant_id, asset_ref, sha256, size, width, height, mime, uploaded_at)` 作为审计；asset_bytes 只在 FS。
-2. **创建 Creative（DSP 控制面）**：`POST /dsp/admin/v1/creatives` DTO 中 asset_ref 必须已存在 registry（否则 `404 asset_not_found`），asset_ref/sha256/size/w/h/mime 必须与 registry 完全一致（管理员不能在 DB 里改）。
-3. **Creative 注册到 SSP 白名单（DSP↔SSP 最小同步流程，首期 MVP 走管理员显式同步 UI 按钮 + 内部 API）**：
-   - 背景：LLD §2.2.0.1 Bid 校验第 6 条要求 SSP 在接 Bid 时有「该 DSP dsp_id → 允许的 creative hash/size 白名单」。首期 MVP 不引入消息总线，用显式同步 API 加管理员操作（按钮 "发布到 SSP"）：
-    - DSP 管理员点击"同步到 SSP"时，DSP 控制面调用 `POST /ssp/internal/v1/dsp-endpoints/{dsp_endpoint_id}/creative-registry:upsert`（`dsp_endpoint_id` 必须是该 SSP partner 的绑定 endpoint），body 为 `[{creative_id, asset_sha256_bin, asset_width_px, asset_height_px, mime, landing_url_host, status, version}]`。
-   - SSP 收到后写入 `ssp_db.dsp_endpoint_creative_whitelist(tenant_id, dsp_endpoint_id, asset_sha256 PK, width PK, height PK, mime, landing_url_host, status, synced_at, version)`；后续 SSP Bid 校验第 6 条直接从 Valkey 缓存的白名单编译快照查。
-   - 管理员也可通过 SSP `/ssp/admin/v1/dsp-endpoints/{id}/creatives` UI 手填单行白名单（用于联调阶段没有自动化同步的情况）。
-   - 失败语义：SSP 不持有 asset bytes，白名单只记录 hash/size/mime，**不做任何 hash 与文件一致性的二次校验**（由 DSP 上传端保证 hash 与 bytes 一致，SSP renderer 读文件后会再重算一次 hash 用于反篡改，见下）。
+1. **上传（DSP 控制面）**：`POST /admin/v1/creative-assets` multipart → DSP 按上面规则落盘 → 返回 asset_ref 与服务端重算元组。同时 DSP 内部写入 `dsp_db.dsp_creative_asset_registry(tenant_id, asset_ref, asset_sha256, size, width, height, mime, uploaded_at)` 作为审计；asset_bytes 只在 FS。`asset_ref` 按 tenant 与内容 SHA-256 确定性生成，以主键约束保证同租户同内容唯一。
+2. **创建 Creative（DSP 控制面）**：`POST /admin/v1/creatives` DTO 中 asset_ref 必须已存在 `dsp_creative_asset_registry`（否则 `404 asset_not_found`），asset_ref/sha256/size/w/h/mime 必须与 registry 完全一致（管理员不能在 DB 里改）。
+3. **Creative 注册到 SSP 白名单（DSP 内部同步为唯一写入路径）**：
+  - 背景：LLD §2.2.0.1 Bid 校验第 6 条要求 SSP 在接 Bid 时有「该 DSP dsp_id → 允许的 creative hash/size 白名单」。首期 MVP 不引入消息总线，由 DSP 管理台触发下述内部同步 API；该 API 是白名单表唯一写入者：
+    - DSP 管理员点击"同步到 SSP"时，DSP 控制面调用 `POST /ssp/internal/v1/dsp-endpoints/{dsp_endpoint_id}/creative-registry:upsert`（`dsp_endpoint_id` 必须是该 SSP partner 的绑定 endpoint），body 为 `[{creative_id, asset_ref, asset_sha256, width_px, height_px, mime_type, landing_url_host, status, version}]`。`asset_sha256` 在线路上为 64 位小写 hex，SSP 解码为 32-byte binary 后持久化。
+    - SSP 收到后写入 `ssp_db.dsp_endpoint_creative_whitelist(tenant_id, dsp_endpoint_id, creative_id, asset_ref, asset_sha256, width_px, height_px, mime_type, landing_url_host, status, version, synced_at)`；按 `(tenant_id, dsp_endpoint_id, creative_id)` 唯一标识记录，后续 Bid 校验从 Valkey 编译快照校验 ID 与素材元数据。
+    - SSP 管理 API 仅提供白名单查询，不接受人工写入；若同步失败，修复 DSP registry 后重试内部同步，避免跨来源 last-writer-wins。
+  - 失败语义：SSP 不持有 asset bytes，白名单记录素材引用与已验证元数据；SSP 不在同步时读取素材 bytes，renderer 读文件后仍须重算 hash 用于反篡改，见下。
 4. **DSP Bid → SSP Receive**：DSP 在 `seatbid[].bid[].ext.openads.asset_ref / asset_sha256 / width / height / landing_url` 中自报。SSP Bid 校验第 6 条查白名单 → 不一致则 bid 丢弃。
 5. **SSP Renderer 最终 Render（浏览器请求 `GET /render/v1/{render_token}` → 出图）**：
     - renderer 是 SSP 内部的 HTTP handler（**不需要独立服务进程**，作为 SSP 一个子路由挂载；对 Asset Store 仅有独立只读权限，与 SSP 管理控制面的写权限隔离）。
@@ -1188,7 +1358,7 @@ CREATE TABLE line_item_creative (
      - `Referrer-Policy: no-referrer`
      - `Content-Security-Policy: default-src 'none'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`（最强 CSP，iframe 只能显示图片本身，不能执行任何脚本、不能加载任何外部资源）
    - **不允许 render 直接返回 302 到对象存储 URL**（因为会把对象存储 URL 暴露给浏览器，造成凭据泄漏与越权）；renderer 必须以「服务端代理读 + 服务端受控响应」方式出图。
-6. **对象存储不可用/文件缺失/Hash 不匹配**：renderer 一律返回 `503 asset_unavailable`（空 body 或最小占位 SVG；占位 SVG 不含任何可识别的 creative 信息，只显示 "asset unavailable" 文本）+ 指标/告警，绝不返回 200 + 错误图片 + 错误 impression（否则会造成计费错配）。Impression tracker 只在浏览器成功加载了 render 的 iframe 里的图片后才会发；render 503 不会触发 billable impression。
+6. **对象存储不可用/文件缺失/Hash 不匹配**：renderer 一律返回 `503 asset_unavailable` 和空 body，并发出指标/告警；不返回占位 SVG 或其他图片，避免掩盖素材配置错误或产生错误 impression。Impression tracker 只在浏览器成功加载 render iframe 中的图片后才会发；render 503 不会触发 billable impression。
 
 #### 3.2.1.4 上传与同步的 DDL 补充（两 DB 分别）
 
@@ -1197,30 +1367,31 @@ CREATE TABLE line_item_creative (
 CREATE TABLE dsp_creative_asset_registry (
   tenant_id BINARY(16) NOT NULL,
   asset_ref VARCHAR(128) NOT NULL,
-  content_sha256 BINARY(32) NOT NULL,
+  asset_sha256 BINARY(32) NOT NULL,
   content_size_bytes BIGINT UNSIGNED NOT NULL,
   width_px SMALLINT UNSIGNED NOT NULL,
   height_px SMALLINT UNSIGNED NOT NULL,
   mime_type VARCHAR(32) NOT NULL,
   uploaded_at DATETIME(6) NOT NULL,
-  PRIMARY KEY (tenant_id, asset_ref),
-  UNIQUE KEY uq_dsp_asset_sha256 (tenant_id, content_sha256)
+  PRIMARY KEY (tenant_id, asset_ref)
 ) ENGINE=InnoDB;
 
 -- ssp_db：DSP creative 白名单编译快照源表；publish/同步 API 写入后由配置刷新器编译进 Valkey + 进程快照
 CREATE TABLE dsp_endpoint_creative_whitelist (
   tenant_id BINARY(16) NOT NULL,
   dsp_endpoint_id BINARY(16) NOT NULL,
-  content_sha256 BINARY(32) NOT NULL,
+  creative_id BINARY(16) NOT NULL,
+  asset_ref VARCHAR(128) NOT NULL,
+  asset_sha256 BINARY(32) NOT NULL,
   width_px SMALLINT UNSIGNED NOT NULL,
   height_px SMALLINT UNSIGNED NOT NULL,
   mime_type VARCHAR(32) NOT NULL,
   landing_url_host VARCHAR(255) NOT NULL,
-  entry_status VARCHAR(16) NOT NULL,
-  synced_version BIGINT UNSIGNED NOT NULL,
+  status VARCHAR(16) NOT NULL,
+  version BIGINT UNSIGNED NOT NULL,
   synced_at DATETIME(6) NOT NULL,
-  PRIMARY KEY (tenant_id, dsp_endpoint_id, content_sha256, width_px, height_px),
-  KEY idx_dsp_whitelist_endpoint (tenant_id, dsp_endpoint_id, entry_status)
+  PRIMARY KEY (tenant_id, dsp_endpoint_id, creative_id),
+  KEY idx_dsp_whitelist_endpoint (tenant_id, dsp_endpoint_id, status)
 ) ENGINE=InnoDB;
 ```
 
@@ -1243,15 +1414,16 @@ MVP 实现为 `LocalFSLayer`（遵守 3.2.1.1 根目录与两级前缀、正则�
 - Exists 做 `HeadObject`。
 上层调用者（upload handler、creative publish validator、renderer token 校验与读）完全不需要改。
 
+```sql
 CREATE TABLE budget_account (
   tenant_id BINARY(16) NOT NULL,
   line_item_id BINARY(16) NOT NULL,
   budget_scope VARCHAR(16) NOT NULL,
   period_start DATE NOT NULL,
   currency CHAR(3) NOT NULL,
-  budget_limit_micros BIGINT UNSIGNED NOT NULL,
-  spent_micros BIGINT UNSIGNED NOT NULL,
-  leased_micros BIGINT UNSIGNED NOT NULL,
+  budget_limit_micros BIGINT SIGNED NOT NULL CHECK (budget_limit_micros >= 0),
+  spent_micros BIGINT SIGNED NOT NULL CHECK (spent_micros >= 0),
+  leased_micros BIGINT SIGNED NOT NULL CHECK (leased_micros >= 0),
   version BIGINT UNSIGNED NOT NULL,
   updated_at DATETIME(6) NOT NULL,
   PRIMARY KEY (tenant_id, line_item_id, budget_scope, period_start),
@@ -1266,8 +1438,8 @@ CREATE TABLE budget_lease (
   budget_scope VARCHAR(16) NOT NULL,
   period_start DATE NOT NULL,
   owner_instance VARCHAR(128) NOT NULL,
-  amount_micros BIGINT UNSIGNED NOT NULL,
-  held_micros BIGINT UNSIGNED NOT NULL,
+  amount_micros BIGINT SIGNED NOT NULL CHECK (amount_micros >= 0),
+  held_micros BIGINT SIGNED NOT NULL CHECK (held_micros >= 0),
   settlement_grace_until DATETIME(6) NOT NULL,
   status VARCHAR(16) NOT NULL,
   expires_at DATETIME(6) NOT NULL,
@@ -1284,8 +1456,8 @@ CREATE TABLE budget_reservation_settlement (
   lease_id BINARY(16) NOT NULL,
   source_event_key BINARY(32) NOT NULL,
   outcome VARCHAR(16) NOT NULL,
-  reserved_max_micros BIGINT UNSIGNED NOT NULL,
-  actual_amount_micros BIGINT UNSIGNED NOT NULL,
+  reserved_max_micros BIGINT SIGNED NOT NULL CHECK (reserved_max_micros >= 0),
+  actual_amount_micros BIGINT SIGNED NOT NULL CHECK (actual_amount_micros >= 0),
   currency CHAR(3) NOT NULL,
   settled_at DATETIME(6) NOT NULL,
   PRIMARY KEY (tenant_id, reservation_id, budget_scope, period_start),
@@ -1307,7 +1479,7 @@ CREATE TABLE dsp_delivery_event (
   line_item_id BINARY(16) NOT NULL,
   creative_id BINARY(16) NULL,
   currency CHAR(3) NOT NULL,
-  amount_micros BIGINT NULL,
+  amount_micros BIGINT SIGNED NULL CHECK (amount_micros IS NULL OR amount_micros >= 0),
   occurred_at DATETIME(6) NOT NULL,
   received_at DATETIME(6) NOT NULL,
   schema_version SMALLINT UNSIGNED NOT NULL,
@@ -1326,7 +1498,7 @@ CREATE TABLE advertiser_spend_ledger (
   campaign_id BINARY(16) NOT NULL,
   line_item_id BINARY(16) NOT NULL,
   entry_type VARCHAR(16) NOT NULL,
-  amount_micros BIGINT NOT NULL,
+  amount_micros BIGINT SIGNED NOT NULL CHECK (amount_micros <> 0),
   currency CHAR(3) NOT NULL,
   occurred_at DATETIME(6) NOT NULL,
   recorded_at DATETIME(6) NOT NULL,

@@ -1,6 +1,57 @@
 # Open Ads 系统概要设计
 
-状态：设计提案，尚未进入开发。本文用于评审边界、数据责任和关键风险；吞吐、地域、隐私法规和服务等级目标仍需业务确认。
+状态：设计提案，尚未进入开发。本文为提交版设计总览，用于定义系统边界、数据责任、关键决策、验收门槛和落地要求；吞吐、地域、隐私法规和服务等级目标仍需业务确认。
+
+## 0. 文档职责与阅读顺序
+
+本目录下的设计文档按“职责分层”组织，目标是让架构师、开发人员和接口集成方以从总体到细节的方式阅读设计，避免职责混淆：
+
+| 文档 | 主要职责 | 读者关注点 | 适合场景 |
+|---|---|---|---|
+| README | 系统级总览、边界、关键决策、风险、验收门槛和审查项 | 业务边界、数据责任、开放问题、启动条件 | 架构评审、需求确认、开发前门槛审核 |
+| HLD.md | 高层架构、服务职责、部署边界、跨服务交互、非功能要求 | 服务边界、时序、故障域、隐私与安全、容量与可观测性 | 架构设计讨论、跨团队协作 |
+| LLD.md | 低层结构、模块划分、存储布局、算法约束、数据约束、实现门槛 | 实现方式、表结构、状态机、幂等和一致性规则 | 实施设计、代码结构、数据库与接口落地 |
+| API.md | 协议契约、HTTP 路径、字段、版本、错误语义 | 请求/响应结构、版本策略、契约兼容性 | 接口开发与集成测试 |
+
+设计文档的阅读顺序建议为：
+1. 先阅读 README，掌握系统边界、职责和验收门槛。
+2. 再阅读 HLD，理解服务关系、时序和关键安全/容量问题。
+3. 再阅读 LLD，确认实现结构、状态和数据层约束。
+4. 最后查看 API，作为协议实施和集成测试依据。
+
+> 说明：README 负责定义“什么是应该做的事情”和“什么不能做”；HLD 负责定义“系统怎么拆”；LLD 负责定义“实现要怎么做”；API 负责定义“对外怎么交互”。
+
+### 0.1 提交版结构说明
+
+本设计文档按以下结构组织，便于从整体架构到实现细节逐步展开：
+
+1. 目标与约束、标准与系统边界（§1-2）。
+2. 领域职责与关键设计决策（§3-4）。
+3. 组件视图与首期 MVP 范围（§4.1-5）。
+4. 设计验收门槛与实施前一致性要求（§6-7）。
+
+可观测性、部署与容量/SLA 输入项由 [HLD.md](HLD.md) §7-8 展开定义；接口契约由 [API.md](API.md) 定义。
+
+此结构适用于提交给架构师和开发团队审阅，能够直接支撑后续开发、接口设计和测试设计。
+
+### 0.2 提交版术语表
+
+为保证 README、HLD、LLD 与 API 在口径上保持一致，本设计采用统一术语，并以本表为主语义表：
+
+| 术语 | 定义 | 适用文档 |
+|---|---|---|
+| SSP | 供给侧拍卖与广告投放入口，负责接入流量、OpenRTB 竞价编排和 publisher payable 逻辑 | README / HLD / LLD / API |
+| DSP | 广告主侧出价与投放决策服务，负责 campaign/line item/creative/targeting/budget 相关决策 | README / HLD / LLD / API |
+| DMP | 受众管理与成员快照服务，负责身份/受众解析、撤回门禁和快照发布 | README / HLD / LLD |
+| Valkey | 仅作为热缓存和有界事件缓冲层，不是 SSP/DSP/DMP 的事实源 | README / HLD / LLD |
+| fact source | 业务事实的权威持久化来源，SSP/DSP 为 MariaDB，DMP 为 ClickHouse | README / HLD / LLD |
+| reservation | 单次出价从租约额度中扣留的最大计费风险；与 account/lease 状态分开管理，不等同于租约本身 | HLD / LLD |
+| billable event | 影响收入、支出或对账结算的有效计费事件；必须进入账务账本和幂等结算流程 | HLD / LLD |
+| deny gate | 用于阻止无授权、无同意或已撤回主体进入受众解析/启用的安全门禁 | HLD / LLD |
+| outbox | 与源事务绑定的可靠事件投递通道，保证必须可靠传播的业务事实不丢失 | HLD / LLD |
+| no-bid | 由于超时、预算、策略或隐私条件而拒绝参与竞价；不等同于失败并发或系统错误 | README / HLD / API |
+
+本设计中，只有在 README 中给出“总览定义”的概念才作为统一语义，HLD 与 LLD 对同一术语的解释必须与 README 保持一致；如需扩展术语，仅在相关章节中进行限定说明，不得改变总览中已定义的语义。
 
 ## 1. 目标与约束
 
@@ -56,7 +107,7 @@
 11. **身份隔离**：SSP 是 exchange identity mapping 的拥有者；为每个 publisher/partner 建 pairwise alias。DMP 只用 tenant/namespace-scoped HMAC token 查受众，DSP 只接收自身 `buyeruid` 和明确授权的 `eids`；无同意/无映射时不传身份，不做 fingerprinting。
 12. **投放控制范围**：频次上限和 pacing 属于 DSP 投放策略，不等同于竞价预算租约，且明确不在首期 MVP 支持范围。首期 daily budget 按 UTC 自然日重置；后续若增加频控/pacing，必须先定义维度、窗口/时区、状态存储和跨实例一致性。
 
-## 4.1 首期 MVP 范围
+### 4.1 首期 MVP 范围
 
 首期以可完整演示的 sandbox 闭环为验收目标：管理员配置 Supply/Placement 和 DSP advertiser/campaign/line item/creative；Supply 或 SDK 发起请求；SSP 并发调用 DSP；DSP 按已发布 targeting 与预算快照出价；SSP 返回受控图片 render URL；有效 impression 经 SSP tracker 去重后写 SSP payable ledger，并通过持久 outbox 通知 DSP 写 spend ledger。Click 只产生非账务测量事件。Test Portal 能查看 no-fill、request ID、阶段耗时和脱敏诊断。
 
@@ -87,5 +138,53 @@ flowchart LR
 开发前必须确认：峰值 QPS、请求体大小、调用地域/网络拓扑、OpenRTB 媒体格式、拍卖类型、超支容忍度及预算舍入/结算策略、reservation 最大有效窗口、频控/pacing 首期范围、publisher payable 与 advertiser billable 的业务依据、供给授权/透明度范围、缓存最大陈旧时间、DMP 数据新鲜度、撤回生效 SLA、隐私法规和数据保留期限。所有 `*_micros` 金额字段固定表示百万分之一主币单位；预算和账本按币种分别记账，最终结算到 ISO-4217 最小单位时按已约定规则舍入。随后用目标规模压测验证 SSP 总延迟分配、Valkey 缓存命中/内存、MariaDB 控制面/账务写入与后台预算租约、ClickHouse 受众查询 P95/P99；另验证重复/冲突 notice、迟到 billable notice 与租约回收竞争、跨节点撤回屏障、事件积压/丢失目标、缓存冷启动和 MariaDB 故障期间的行为。
 
 特别注意：ClickHouse 面向分析和批量写入，不是传统 OLTP。若 DMP 逐用户查询的吞吐/尾延迟无法通过快照布局、SSP 短 TTL 缓存和压测目标，需在开发前重新评估“DMP 仅使用 ClickHouse”这一约束，不能通过掩盖查询延迟来宣称满足在线服务等级。
+
+## 7. 实施前一致性要求
+
+为保证系统能够从设计走到真实开发，以下要求必须在实现前形成统一理解，并在后续实现和测试中持续遵守：
+
+### 7.1 预算与结算一致性
+
+- 预算账户/租约与单次 reservation 是不同粒度：账户额度由全局可租、已租额度及已花费额度约束；租约到期停止新出价，未结算额度保留至 grace 结束。
+- 单次 reservation 在出价前从本地租约可用额中原子扣留最大计费风险。收到 `nurl` 只记录非计费 win，不改变 reservation 或 held 额度。
+- 同一 reservation 的 `lurl` loss 与 `burl` billable 是互斥终态：loss 释放全部预留额；billable 将实际金额转为 spend 并释放差额。grace 后未结算 reservation 才可回收；迟到或冲突结果隔离对账。
+- 通知去重与账务幂等使用不同标识：`notice_id` 去重 notice 投递/记录，`reservation_id` 标识预算预留，`source_event_key` 标识账务事件。各自必须跨重试稳定，但不得混作同一个幂等键；账务事务按 reservation 与 source event 规则共同校验。
+- 账务冲正必须以新分录记录，不允许直接更新历史金额。
+
+### 7.2 数据与隐私边界
+
+- DMP 的 segment 在首期 MVP 中仅用于 SSP→DSP 透传，不参与 DSP 投放筛选和出价决策。
+- DSP 首期仅消费 `site.domain`、`site.page`、banner 尺寸和预算快照，不读取 `user.data[].segment[]`。
+- `targeting.segments` 必须在发布校验阶段拒绝，避免业务误以为 segment targeting 已启用。
+- consent、deny gate、identity revocation 与 subject lease 必须 fail-closed，不能在状态不确定时继续投放。
+
+### 7.3 缓存与事件边界
+
+- Valkey 只承担热配置缓存、短期可重建缓存和有界事件缓冲，不作为事实源。
+- 缓存丢失必须可恢复，不能造成业务事实丢失。
+- 账务事实必须写入事务账本或事务 outbox；非账务事件可使用有界缓冲并允许在积压时丢弃或裁剪。
+
+### 7.4 实施顺序
+
+设计与开发应按风险优先级推进：
+1. 基础 RTB 协议与请求流
+2. 预算状态机与结算闭环
+3. DMP 透传与隐私门禁
+4. 账务 outbox 与事件投递
+5. Portal/SDK 与 sandbox 渲染链路
+6. 生产增强项（延期实现）
+
+### 7.5 验收要求
+
+实现前必须完成测试设计，至少覆盖以下场景：
+- budget lease workflow
+- duplicate notice handling
+- loss vs billable precedence
+- DMP deny gate fail-closed
+- cache miss behavior
+- outbox replay behavior
+- version conflict handling
+
+本节要求与 [HLD](HLD.md) 与 [LLD](LLD.md) 的实现门槛保持一致，确保设计、实现和验证用同一套边界和语义。
 
 详细内容见 [HLD](HLD.md)、[LLD](LLD.md) 与 [API 设计](API.md)。

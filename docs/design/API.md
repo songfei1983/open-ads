@@ -1,6 +1,22 @@
-# 服务 API 设计
+# Open Ads 接口契约设计（API）
 
-状态：接口设计草案。所有 API 由 SSP、DSP、DMP 各自拥有 DTO、校验器、版本策略和测试；禁止跨服务复用领域类型。路径和字段可在评审时调整，协议边界不应被弱化。
+状态：设计提案，尚未进入开发。本文为提交版接口契约，供服务实现、接口集成和契约测试使用；所有 API 由 SSP、DSP、DMP 各自拥有 DTO、校验器、版本策略和测试，禁止跨服务复用领域类型。具体路径和字段仍可经设计变更评审调整，但不得弱化本文定义的协议、安全与幂等边界。
+
+## 0. 文档定位与术语
+
+本文定义 SSP、DSP、DMP 的 HTTP/OpenRTB 接口契约，包括调用方、请求/响应、版本、错误语义、安全要求和兼容规则。系统目标与服务职责见 [README.md](README.md)，跨服务架构与交互见 [HLD.md](HLD.md)，领域模型、持久化和状态机实现约束见 [LLD.md](LLD.md)。本文件只定义接口边界，不重新定义领域事实或改变 OpenRTB 标准语义。
+
+领域术语以 [README.md](README.md) §0.2 为准；本表只定义接口层术语，不重复定义 reservation、billable event 等领域概念：
+
+| 术语 | 接口语义 |
+|---|---|
+| API version | 自有 JSON API 以路径版本标识；不兼容变更升主版本，OpenRTB 版本按 OpenRTB 契约协商和校验 |
+| no-bid 表达 | 领域语义见 README §0.2；OpenRTB endpoint 按协议表达，SDK Client API 映射为 `no_fill`，不代表传输错误 |
+| idempotency identifiers | `notice_id` 去重 notice 投递/记录；`reservation_id` 标识预算预留；`source_event_key` 标识账务事件；`Idempotency-Key` 用于自有 API 的逻辑操作。各 ID 按职责独立、跨对应重试稳定，不可互换 |
+| callback profile | 双方约定的 notice HTTP 方法、宏展开、payload、超时、重试和成功响应；不能假设 OpenRTB 为 notice 定义通用 JSON body |
+| error envelope | 自有 JSON API 的 `{code, message, request_id}` 错误结构；OpenRTB endpoint 遵循 OpenRTB no-bid 与 HTTP 语义，不套用该结构 |
+
+若本文件的接口级说明与 README/HLD/LLD 的领域或状态语义发生冲突，应按设计变更流程先统一文档，再实现接口；不得通过接口实现单方面改变共享语义。
 
 ## 1. 通用约定
 
@@ -13,7 +29,7 @@
 | 请求关联 | 接收/返回 `X-Request-ID`；没有时由服务生成；允许 `traceparent` 贯穿调用链 |
 | 时间 | RFC 3339 UTC；事件同时保留 `occurred_at` 和服务端 `received_at` |
 | 金额 | OpenRTB wire `price` 是十进制 CPM；领域/数据库 `*_micros` 使用整数主币微单位（1 主币 = 1,000,000 micros），并单独记录 ISO-4217 currency；不得用 binary float 累计 |
-| 幂等 | 账务/事件写入使用稳定 `source_event_key`、`reservation_id` 或 `Idempotency-Key`；重试复用同一 key |
+| 幂等 | 按操作类型使用稳定标识：`notice_id` 用于 notice 去重、`reservation_id` 与 `source_event_key` 用于账务结算校验、`Idempotency-Key` 用于自有 API 操作；重试复用对应标识，不得互换 |
 | 错误 | 自有 JSON API 使用 `{code, message, request_id}`；不回显堆栈、敏感标识或内部 SQL。OpenRTB 接口按 OpenRTB no-bid/HTTP 语义返回，不包通用错误信封 |
 | 分页 | 管理 API 使用 `limit` + opaque `cursor`；响应包含 `items`、`next_cursor` |
 | 并发更新 | 管理资源请求/响应 body 中包含 `version` 字段（64-bit 整数，自增）；更新请求体必须携带当前最新 `version`，版本冲突返回 `409`。MVP 阶段不使用 HTTP `ETag` / `If-Match` header（属于 API gateway 生产级特性，生产接入后启用） |
@@ -100,16 +116,17 @@ no-fill 使用 `200` + `{"request_id":"...","status":"no_fill"}`。错误响应�
 |---|---|---|---|
 | `GET /admin/v1/publishers` / `POST /admin/v1/publishers` | SSP 管理台 / 管理脚本 | Publisher 配置 DTO；响应包含 ID/version | — |
 | `GET /admin/v1/properties` / `POST /admin/v1/properties` | 同上 | Property 配置与 Publisher 外部 ID | — |
-| `GET /admin/v1/placements` / `POST /admin/v1/placements` | 同上 | 格式、floor、币种、隐私/计费策略版本 | — |
+| `GET /admin/v1/placements` / `POST /admin/v1/placements` | 同上 | `auction_policy_id`、格式、floor、币种、隐私/计费策略版本 | placement 关联已发布的 AuctionPolicy |
+| `GET /admin/v1/auction-policies` / `POST /admin/v1/auction-policies` / `PUT /admin/v1/auction-policies/{id}` | 同上 | `at`、`tie_breaker`、`floor_enforcement`、`currency_policy`；响应包含 ID/version | 策略发布后由 placement 引用；MVP 仅支持 `at=1`、已定义的 tie-break 与 exact-match 币种策略 |
 | `GET /admin/v1/supply-endpoints` / `PUT /admin/v1/supply-endpoints/{id}` | 同上 | Supply 协议 profile、ads.txt/app-ads.txt seller/account 映射、schain 策略和状态 | — |
-| `GET /admin/v1/dsp-endpoints` / `POST /admin/v1/dsp-endpoints` / `PUT /admin/v1/dsp-endpoints/{id}` | 同上 | DSP bid URL、支持的 OpenRTB profile、callback host allowlist、timeout/status | callback allowlist 用于 SSRF 防护（§2.4 中 notice URL 的目标域名白名单） |
-| `GET /admin/v1/dsp-endpoints/{id}/creative-whitelist` / `PUT /admin/v1/dsp-endpoints/{id}/creative-whitelist` | 同上 | `whitelist: [{creative_id, asset_sha256, asset_ref, width_px, height_px}]`；响应版本 | 管理员手动维护 DSP endpoint creative 白名单；自动同步路径见 LLD §3.2.1 同步 internal API |
+| `GET /admin/v1/dsp-endpoints` / `POST /admin/v1/dsp-endpoints` / `PUT /admin/v1/dsp-endpoints/{id}` | 同上 | `dsp_endpoint_id`、bid URL、OpenRTB profile、`callback_host_allowlist`、`priority`、`timeout_ms`、status、version | `callback_host_allowlist` 用于 SSRF 防护；`priority` 越小排序越优先，仅作为同价 tie-break |
+| `GET /admin/v1/dsp-endpoints/{id}/creative-whitelist` | 同上 | `whitelist: [{creative_id, asset_ref, asset_sha256, width_px, height_px, mime_type, landing_url_host, status, version}]` | 只读查询；白名单唯一写入路径为 DSP → SSP 内部同步 API；`asset_sha256` 为 64 位小写 hex |
 | `GET /admin/v1/config-outbox` | 同上 | `?status=pending|failed` + limit/cursor → 未发布 / 发布失败的 outbox 事件列表 | 管理台 UI 展示"配置发布进度与失败项"，配合 retry 手动重放 |
 | `POST /admin/v1/config-outbox/{event_id}:retry` | 同上 | event_id → `{status: accepted}` | 对 failed_attempts >= 5 的 outbox 手动重放，重置失败计数 |
 | `POST /internal/v1/identity-links:complete` | DSP identity-sync callback | sync token、DSP-specific user ID、consent receipt/version、expiry → link status/version | 将 DSP ID 映射为当前 SSP subject 的 pairwise `buyeruid`；不得接受任意 user ID upsert；sync token 生命周期绑定 partner+subject+consent，仅可消费一次 |
 | `POST /internal/v1/identity:revoke` | SSP → DMP internal 调用 | tenant、namespace、subject token、revocation ID、effective time → accepted/status | DMP 追加 revocation tombstone；解析排除该 token，物理清除历史快照按删除 SLA 异步完成 |
 | `DELETE /admin/v1/identity-links/{partner_id}/{subject_id}` | SSP 管理台隐私管理 tab | deletion reason/consent version → revocation status | 撤回后停止下发，并按保留策略清理/失效映射及缓存 |
-| `POST /ssp/internal/v1/dsp-endpoints/{dsp_endpoint_id}/creative-registry:upsert` | DSP → SSP（creative 白名单自动同步） | `tenant_id`、`creatives: [{creative_id, asset_ref, asset_sha256, width_px, height_px, sync_version}]` → `{accepted_count, rejected: [{creative_id, reason}]}` | DSP 管理台点"同步到 SSP"时批量上报；SSP 写入 `dsp_endpoint_creative_whitelist`；白名单以外的 DSP creative bid 直接 4xx 丢弃 |
+| `POST /ssp/internal/v1/dsp-endpoints/{dsp_endpoint_id}/creative-registry:upsert` | DSP → SSP（creative 白名单自动同步） | `tenant_id`、`creatives: [{creative_id, asset_ref, asset_sha256, width_px, height_px, mime_type, landing_url_host, status, version}]` → `{accepted_count, rejected: [{creative_id, reason}]}` | DSP 管理台点"同步到 SSP"时批量上报；记录字段与管理 API 一致；SSP 按 endpoint + creative_id 幂等更新 |
 | `GET /healthz` / `GET /readyz` | 运维探针 / 负载均衡 | 存活、配置快照就绪版本；不返回密钥或业务数据 | readyz 失败时摘除该实例的 RTB 流量（SSP bid handler、browser SDK handler、internal identity）；管理 API 与 refresh worker 即使 readyz 失败仍继续处理配置发布。 |
 
 SSP 管理变更写 `ssp_db` 与配置 outbox，由异步刷新器（见 LLD §2.4.1）更新 Valkey/进程快照；管理 API 不直接改缓存作为唯一写入。
@@ -143,7 +160,7 @@ DSP 的 bidder endpoint 与 advertiser/campaign 管理 API 分开部署或分开
 | Method / path | 调用方 | 请求/响应 | 语义 |
 |---|---|---|---|
 | `POST /openrtb2/bid` | SSP/exchange | OpenRTB 2.6 BidRequest → BidResponse 或 no-bid | 按 request deadline 和已加载快照决策；不得在 cache miss 时回源 MariaDB |
-| 按 bidder 返回的 `nurl` 调用（win notice） | SSP/exchange | GET 或 POST；按 OpenRTB 宏替换（`${AUCTION_PRICE}` 等） | 记录 win 状态，不直接扣 advertiser spend（仅 nurl 到达时释放 held reservation → 转为保留 win 终态，不写 spend ledger；最终 billable 仍以 burl 为准） |
+| 按 bidder 返回的 `nurl` 调用（win notice） | SSP/exchange | GET 或 POST；按 OpenRTB 宏替换（`${AUCTION_PRICE}` 等） | 仅记录非计费 win，不扣 advertiser spend，也不改变/释放 held reservation；reservation 仅由互斥的 `lurl` loss 或 `burl` billable 终态结算 |
 | 按 bidder 返回的 `lurl` 调用（loss notice） | SSP/exchange | GET 或 POST；loss code macro `${AUCTION_LOSS}` 已替换 | 记录 loss 状态；在同一事务中释放 reservation 的 held 额度 → 退回全局预算池（leased_total 下降、available 上升）；仅在确认不再 billable 后释放 |
 | 按 bidder 返回的 `burl` 调用（billable notice） | SSP/exchange | MVP：HTTPS POST JSON（body 见下方示例）；reservation_ref 与 source_event_key 在 body 中传递 | 校验 event/auction/bid/imp、reservation、币种/金额上限后，在事务中写 advertiser spend ledger 并更新所有适用预算范围的 spent_micros（reservation held 转为 spent_micros，不重复加回全局池）；重复 event 幂等成功 |
 | `GET /healthz` / `GET /readyz` | 运维探针 | 无业务 body | 报告服务存活、配置版本/预算租约可用状态 |

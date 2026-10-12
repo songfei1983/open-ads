@@ -1,6 +1,23 @@
 # Open Ads 高层设计（HLD）
 
-## 1. 系统上下文
+状态：提交版设计，供架构评审、跨团队协作和开发实施使用。本文档与 [README.md](README.md) 和 [LLD.md](LLD.md) 保持统一术语、统一边界与统一验收门槛，采用同一套提交口径描述系统设计。
+
+## 1. 设计目标与范围
+
+本章定义高层架构目标、系统边界和设计范围，聚焦于：
+
+- 三个核心应用的职责边界：SSP、DSP、DMP
+- 交互模型：OpenRTB、内部 REST、事件投递和审计链路
+- 数据归属：各自数据库所有权、缓存边界和事实来源
+- 非功能要求：性能、隐私、撤回、可观测性和扩展性
+
+本设计面向实现阶段的工程落地，不包含具体代码结构细节；代码级组织、数据表设计和接口契约在 [LLD.md](LLD.md) 与 [API.md](API.md) 中定义。
+
+### 1.1 统一术语
+
+共享术语以 [README.md](README.md) §0.2 为准。本文件只在需要时定义架构专用名称，不另行复制或改写全局定义。
+
+## 2. 系统上下文
 
 三个服务独立部署、独立故障域、独立数据所有权。服务发现、TLS、密钥分发和部署平台暂不绑定特定云或编排系统。内网 API 使用加密传输；公网 SSP 入口另有流量清洗、限流和请求体上限。
 
@@ -15,13 +32,15 @@ Test Portal 是独立静态测试客户端，不增加第四个广告业务域�
 | SSP | DSP | OpenRTB 2.6 BidRequest/BidResponse | 同步、并发 fan-out | 单 DSP 超时视为 no-bid；其余 DSP 继续 |
 | SSP | DMP | 内部 `Audience Resolve v1` | 同步，可短 TTL 缓存 | 超时不阻塞整个拍卖；按 Placement 策略无受众继续或 no-bid |
 | SSP | DMP | 内部 `Event Batch v1` | 异步重试，经有界 Valkey Stream | 分析事件按 at-least-once 投递；最大积压、保留期和允许丢失目标必须配置并告警；若某事件必须可靠传播，改用与源事务绑定的 MariaDB outbox |
-| SSP | DSP | OpenRTB `nurl`/`lurl`/`burl` notice URL | 异步回调，按双方 profile | win/loss 只记状态；仅 billable event 按合同触发 DSP spend；方法、宏和重试策略由接入 profile 确定 |
+| SSP | DSP | OpenRTB `nurl`/`lurl`/`burl` notice URL | 异步回调，按双方 profile | `nurl` 只记 win 且不释放 reservation；`lurl` 与 `burl` 是互斥结算终态；方法、宏和重试策略由接入 profile 确定 |
 | Browser render iframe | SSP | `POST /sdk/v1/impressions`、`POST /sdk/v1/events` | 异步 | 校验签名 event token、期限、auction/bid/imp 绑定及唯一 event key；MVP impression 最多 billable 一次，click 永不触发财务 |
 | SSP tracker | DSP | bidder 返回的 `burl`（双方约定 JSON POST profile） | 持久 outbox 异步重试 | 仅在 impression/payable 事务提交后发送；DSP 按 reservation/event ID 幂等结算，重试不重复扣预算 |
 
 OpenRTB 的 no-bid 语义和 HTTP 表达按 2.6 契约实现；不得把内部 DMP API 包装成 OpenRTB endpoint。
 
-## 2. 核心时序
+实施顺序、隐私/缓存/账务边界和验收门槛统一见 [README.md](README.md) §7；HLD 负责展开跨服务拓扑、时序、故障语义和非功能要求，不重复维护门槛清单。
+
+### 2.1 核心时序
 
 ```mermaid
 sequenceDiagram
@@ -54,7 +73,7 @@ sequenceDiagram
 
 实际实现可让 DMP 查询与 DSP fan-out 并行；只有需要受众数据的 DSP 请求必须等待解析，未配置受众依赖的 DSP 可以先并发发起。实现不得越过总 deadline。
 
-### Test Portal 与 JS SDK 请求流
+#### 2.1.1 Test Portal 与 JS SDK 请求流
 
 ```mermaid
 sequenceDiagram
@@ -74,7 +93,7 @@ sequenceDiagram
 
 Portal 的诊断视图默认去敏，不显示完整 OpenRTB 用户对象或身份 token；提供 request/response 的结构化脱敏摘要及各阶段 latency。
 
-### User ID sync 时序
+#### 2.1.2 User ID sync 时序
 
 ```mermaid
 sequenceDiagram
@@ -123,11 +142,11 @@ sequenceDiagram
 
 OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` 是 exchange 按约定 billable policy 调用的账单通知。publisher 应付金额按 SSP 与 publisher 的合同策略计算，可能基于有效展示或其他约定事件，不直接等同 DSP 的 bid price 或 advertiser spend。SSP gross revenue、publisher payable 和 SSP margin 是不同指标；本设计的 PublisherPayableLedger 只记录应付负债。
 
-### Sandbox billable event 顺序
+### 3.1 Sandbox billable event 顺序
 
 首期 sandbox 的受控 render endpoint 返回 SSP 托管的静态图片 iframe 文档和短期 event token。图片加载后 iframe POST impression signal；SSP 校验 token 签名/期限、tenant/placement/auction/bid/imp 绑定和一次性 event key，在同一 MariaDB 事务中插入唯一 billable delivery event、PublisherPayableLedger 分录及 DSP billable outbox 记录。事务提交后异步向 DSP `burl` 发送稳定 `event_id`、reservation reference、金额和币种；DSP 验证后在原子结算事务中记 AdvertiserSpendLedger 和预算。点击通过 SSP redirect 记录非账务事件后跳转 allowlisted landing URL。过期、重放或绑定不匹配的事件不得记账。该规则只供 sandbox 账本验收，不代表生产 IVT/可见性保证；生产付款必须另行批准验证、争议和对账规则。
 
-### DSP 预算风险生命周期
+### 3.2 DSP 预算风险生命周期
 
 预算总额按币种、LineItem 和预算周期维护 `spent + leased_total <= limit`。`leased_total` 包含实例本地可用额度及已扣留的在途风险，不重复相加。后台把额度租给唯一进程 incarnation；实例发 bid 前以稳定 reservation ID 在本地原子扣留该 bid 的最大 billable 金额，并在 DSP 返回的 notice URL 中放入签名 reservation reference。reference 至少绑定 tenant、line item、所有适用预算 lease/scope、auction/bid/imp、最大金额、币种、expiry 和 key version，不含用户标识。RTB 热路径不写 MariaDB。
 
@@ -135,7 +154,7 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 
 ## 4. 服务与领域边界
 
-### SSP
+### 4.1 SSP
 
 - OpenRTB ingress/egress 适配器只负责协议验证、映射和响应序列化。
 - Auction application service 协调 Placement 策略、DMP 解析、DSP 并发调用、响应校验、拍卖和 outbox。
@@ -145,7 +164,7 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 - SSP 自己定义 `DeliveryLog` 与 `PublisherPayableLedger`；publisher 账务依据 publisher contract policy 和有效 billable event，在 `ssp_db` 原子记录。
 - SSP 拥有 publisher-scoped subject 和 partner-specific identity link；pairwise mapping 在 `ssp_db` 持久化、Valkey/进程快照缓存。每个 OpenRTB outbound request 只取目标 DSP 对应 link。
 
-### DSP
+### 4.2 DSP
 
 - OpenRTB bidder adapter 校验版本、request ID、impression 和预算 deadline。
 - Bid application service 使用 DSP 自己的 campaign/line item/creative/targeting/budget 领域快照生成候选。**首期 MVP Targeting 只消费 `site.domain` / `site.page` / banner size，不读取 OpenRTB `user.data[].segment[]`（DMP segment）；SSP 把 DMP 结果原样透传，但 DSP Bid Selection 对 segments 透明、不对其做过滤或加权。这一限制必须在 DSP publish 校验阶段明确拒绝 `targeting.segments` 字段，防止管理员误认为 segment targeting 已生效。**
@@ -156,7 +175,7 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 - DSP 只接收其自己的 OpenRTB `buyeruid`/获准 `eids`，不读取 SSP identity link 或 DMP 身份映射；DSP 不因竞价要求反向索取全局 user ID。
 - 不调用 SSP/DMP 数据库。OpenRTB Win Notice 记为非计费赢标事件；DSP 只在 billable notice 到达后按内部唯一事件 ID 幂等扣减 advertiser spend。
 
-### DMP
+### 4.3 DMP
 
 - DMP API adapter 实现受众解析、快照发布和批量事件接入；只暴露 provider/segment 公开标识，不暴露 ClickHouse 行结构。
 - Audience application service 负责授权检查、快照选择和结果限制。
