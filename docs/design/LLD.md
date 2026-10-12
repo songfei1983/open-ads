@@ -1,6 +1,6 @@
 # Open Ads 低层设计（LLD）
 
-状态：提交版实现设计，供工程实施、代码评审和测试门槛使用。本文档与 [README.md](README.md) 和 [HLD.md](HLD.md) 使用统一术语、统一边界和统一验收口径，确保从架构总览到实现细节是一套一致的设计提交物。
+状态：实现设计提案，待跨职能评审批准，尚未进入开发。本文档与 [README.md](README.md) 和 [HLD.md](HLD.md) 使用统一术语、统一边界和统一验收口径，确保从架构总览到实现细节是一套一致的设计提交物。
 
 本文定义实现级约束、领域结构、数据布局、状态机和失败语义，适用于工程落地和代码设计评审。本文不重复阐述系统目标，而是补充“如何组织代码、如何存储数据、如何保证状态一致性”。按服务整理的 API 路由、请求/响应与失败语义见 [API 设计](API.md)。数据库版本、驱动、部署拓扑和规模指标待评审后锁定。
 
@@ -1004,7 +1004,7 @@ delivery event 是高写入量数据，需批量落库、定义保留/归档周�
 |---|---|---|
 | Advertiser | 广告主状态、允许币种 | 暂停广告主下 line item 不出价 |
 | Campaign | 活动状态、投放周期、投放目标 | 活动时间窗有效；第一期不支持独立 Campaign 总预算，预算限制在 LineItem 层 |
-| LineItem | 预算、bid strategy、targeting、频次/日限额 | 只有有效且预算租约充足时可候选 |
+| LineItem | 预算、bid strategy、targeting | 只有有效且预算租约充足时可候选 |
 | Creative | 素材格式、落地页、审核状态 | 素材须匹配 impression 格式和审核规则 |
 | BudgetAccount | 按 line item、预算范围/周期和币种维护限额、已花费、已租出金额 | 每个适用预算范围都满足 `spent + leased <= limit`；重复 billable event 不重复扣减 |
 | DeliveryEvent | bid/win/loss/billable/impression 等 DSP 本地事件 | 每个 source event 唯一；win event 本身不扣预算 |
@@ -1711,10 +1711,10 @@ CREATE TABLE dmp_event
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(event_date)
 ORDER BY (tenant_id, event_date, event_type, event_id)
-TTL event_date + INTERVAL 13 MONTH DELETE;
+TTL event_date + INTERVAL 12 MONTH DELETE;
 ```
 
-`snapshot_month` 固定为 `toStartOfMonth(dmp_snapshot_publication.created_at)` 的 UTC 月份，同一月创建的多个 snapshot 会共享分区；不得把它理解为每 snapshot 可独立 DROP 的分区。旧 snapshot 的逻辑停用立即通过 publication pointer 完成；物理回收按保留/撤回 SLA 评估 ClickHouse mutation，或重建去除目标 snapshot 的 shadow table 后受控切换。不得直接 DROP 共享月分区来删除单一 snapshot。发布前压测需记录 mutation bytes、parts 放大、磁盘余量和完成时延；超过物理删除 SLA 时提高重建/副本切换能力，而不是延长逻辑 deny。`FixedString(64)` 假设 token 是 64 位十六进制 HMAC 编码；namespace/token key 包含 key version。事件 TTL `13 MONTH` 只是示例占位，必须由合规/报表需求批准。
+`snapshot_month` 固定为 `toStartOfMonth(dmp_snapshot_publication.created_at)` 的 UTC 月份，同一月创建的多个 snapshot 会共享分区；不得把它理解为每 snapshot 可独立 DROP 的分区。subject/身份映射与 membership snapshot 的最长保留期为 3 个月，分析事件保留 12 个月，均从创建/入库时间起算且不无限续期。到期或撤回后，在线 deny-gate admission 立即关闭，ClickHouse 主存储须在触发后 30 天内完成物理删除，备份按 90 天滚动到期；撤回 tombstone 保留至关联快照物理删除完成，之后最多再保留 90 天用于审计。旧 snapshot 的逻辑停用立即通过 publication pointer 完成；物理回收按上述 SLA 评估 ClickHouse mutation，或重建去除目标 snapshot 的 shadow table 后受控切换。不得直接 DROP 共享月分区来删除单一 snapshot。发布前压测需记录 mutation bytes、parts 放大、磁盘余量和完成时延；超过物理删除 SLA 时提高重建/副本切换能力，而不是延长逻辑 deny。`FixedString(64)` 假设 token 是 64 位十六进制 HMAC 编码；namespace/token key 包含 key version。备份恢复后的 deny-gate 重建和 tombstone 清理需纳入故障恢复验证；法律审查不属于本轮设计评审范围。
 
 受众查询先解析当前已发布 snapshot，然后对该 namespace 当前和仍被快照引用的每个 key version，限定 `tenant_id + snapshot_id + namespace + subject_token + subject_token_key_version` 做精确匹配并限制 segment 数量；任一版本命中有效 revocation tombstone/deny 即排除主体。DMP import 只接收受信 tokenization adapter 生成的 `{subject_token, key_version}`，拒绝原始身份值。snapshot id 可在进程内短时间缓存；撤回 gate 不得使用无法同步失效的长 TTL 缓存。
 

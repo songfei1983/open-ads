@@ -225,6 +225,7 @@ MVP `burl` JSON body：
 ```json
 {
   "event_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89016",
+  "source_event_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "auction_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89017",
   "bid_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89018",
   "imp_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89019",
@@ -314,7 +315,7 @@ Membership 导入只接收已由受信身份 tokenization adapter 转换的 `{su
 | `GET /admin/v1/snapshots` | 快照管理/审计 | snapshot ID、状态、行数、校验和、发布时间 |
 | `GET /healthz` / `GET /readyz` | 运维探针 | API 存活、ClickHouse 可用和当前发布快照版本 |
 
-DMP 管理变更写入不可变版本；不把 ClickHouse 当作任意行级事务数据库。删除/撤回要求通过新版本、失效标记及法规批准的清理流程执行。
+DMP 管理变更写入不可变版本；不把 ClickHouse 当作任意行级事务数据库。删除/撤回要求通过新版本、失效标记及受控清理流程执行。
 
 ### 4.3 契约工件
 

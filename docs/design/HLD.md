@@ -1,6 +1,6 @@
 # Open Ads 高层设计（HLD）
 
-状态：提交版设计，供架构评审、跨团队协作和开发实施使用。本文档与 [README.md](README.md) 和 [LLD.md](LLD.md) 保持统一术语、统一边界与统一验收门槛，采用同一套提交口径描述系统设计。
+状态：设计提案，待跨职能评审批准，尚未进入开发。本文档与 [README.md](README.md) 和 [LLD.md](LLD.md) 保持统一术语、统一边界与统一验收门槛，采用同一套口径描述系统设计。
 
 ## 1. 设计目标与范围
 
@@ -208,7 +208,7 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 - 账务通知先校验 auction/bid/imp 关联和币种/金额范围，再执行幂等落账；数据不匹配的 notice 隔离并告警，不计入 publisher payable 或 advertiser spend。
 - 日志采集与财务入账使用不同队列/限流池，防止高流量诊断事件挤占账务写入容量；ledger 写失败必须重试/告警，不可静默丢弃。
 - identity sync 必须有可审计的 consent purpose/version、partner allowlist、link TTL 与撤回/删除流程；原始 ID 使用 envelope encryption，仅用 keyed hash 做匹配索引。SSP 收到撤回先立即禁用本地 subject/link 并清缓存；DMP 先写共享 deny gate，再持久化撤回 tombstone，且两者确认后才返回完成。gate 不可用或状态不确定时，受众查询 fail closed；请求方在完成确认前不得重新发送该身份。
-- DMP 的快照/API 响应只返回最小 segment 标识；事件和身份 token 的保留期、删除流程以及 ClickHouse 分区 TTL 需按法规与合同确定。
+- DMP 的快照/API 响应只返回最小 segment 标识；本轮评审目标为 subject/身份映射与 membership snapshot 最长保留 3 个月、分析事件保留 12 个月、撤回/到期后 30 天内完成主存储物理删除且备份 90 天滚动到期。期限起算点和撤回 tombstone 规则见 [设计 README](README.md) §6；账务/诊断数据的技术保留策略仍需确认。本轮不评审适用法律。
 - 内部 API 实施每租户限流；错误响应不回显原始身份或完整请求体。
 
 ## 7. 可观测性和部署
@@ -219,6 +219,6 @@ OpenRTB `nurl` 只表示赢标，不能单独产生 advertiser spend；`burl` �
 
 ## 8. 容量参数与 SLA 输入项
 
-数值型 SLA、合规与保留策略需要业务输入后才能量化。设计验收门槛（SLA 输入项检查清单、是否允许进入实现的判定）统一见 [设计 README](README.md) §6，本节不重复列出。生产流量还须额外确定 ads.txt/app-ads.txt、sellers.json 和 schain 的接入责任与校验策略。
+本轮已确认 SSP 对外广告请求入口峰值目标为 3,000 QPS，DSP fan-out 与 DMP 查询按该入口负载派生；sandbox SSP 广告请求端到端延迟 P95/P99 均不超过 100 ms。其余数值型 SLA、合规与保留策略的验收门槛统一见 [设计 README](README.md) §6。生产流量还须额外确定 ads.txt/app-ads.txt、sellers.json 和 schain 的接入责任与校验策略。
 
 按服务划分的完整 API 路由、请求/响应见 [API 设计](API.md)。
