@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Open Ads · Sandbox Portal</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="Open Ads Sandbox Portal 首页">
+        <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+        <span>open<span class="brand-accent">ads</span></span>
+        <span class="brand-divider"></span>
+        <span class="brand-product">Sandbox Portal</span>
+      </a>
+      <div class="topbar-right">
+        <a class="prototype-link" href="./ssp.html">服务控制台 <span aria-hidden="true">↗</span></a>
+        <span class="environment"><span class="status-dot"></span>测试环境</span>
+        <span class="avatar" aria-label="开发者">S</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="page-heading">
+        <div>
+          <div class="eyebrow">开发者工具 <span>/</span> 广告请求测试</div>
+          <h1>测试广告投放</h1>
+          <p>发送 sandbox 请求，预览广告响应并检查脱敏诊断信息。</p>
+        </div>
+        <div class="heading-meta">
+          <span class="live-indicator"><span></span>系统模拟器就绪</span>
+          <span class="api-version">SSP Client API <b>v1</b></span>
+        </div>
+      </section>
+
+      <div class="workspace">
+        <aside class="panel request-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="step-label">REQUEST</span>
+              <h2>请求配置</h2>
+            </div>
+            <button class="text-button" id="reset-button" type="button">重置</button>
+          </div>
+
+          <form id="request-form">
+            <fieldset>
+              <legend>连接</legend>
+              <label class="field-label" for="mode">请求模式</label>
+              <div class="segmented" role="group" aria-label="请求模式">
+                <button type="button" class="segment selected" data-mode="simulate" aria-pressed="true">模拟响应</button>
+                <button type="button" class="segment" data-mode="live" aria-pressed="false">连接 API</button>
+              </div>
+              <div id="endpoint-field" class="field hidden">
+                <label class="field-label" for="endpoint">SSP Sandbox 地址</label>
+                <input id="endpoint" name="endpoint" type="url" inputmode="url" placeholder="https://ssp.test.example" autocomplete="url">
+                <span class="field-hint">请求将发送至 <code>/sdk/v1/ad-requests</code></span>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>广告位</legend>
+              <div class="field">
+                <label class="field-label" for="placement">Placement</label>
+                <select id="placement" name="placement">
+                  <option value="plc_demo_leaderboard" data-width="728" data-height="90" data-slot="leaderboard">Demo · Leaderboard</option>
+                  <option value="plc_demo_rectangle" data-width="300" data-height="250" data-slot="content-rectangle">Demo · Content Rectangle</option>
+                  <option value="plc_demo_mobile" data-width="320" data-height="50" data-slot="mobile-banner">Demo · Mobile Banner</option>
+                </select>
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label class="field-label" for="width">宽度</label>
+                  <div class="input-suffix"><input id="width" name="width" type="number" min="1" max="10000" value="728" required><span>px</span></div>
+                </div>
+                <div class="field">
+                  <label class="field-label" for="height">高度</label>
+                  <div class="input-suffix"><input id="height" name="height" type="number" min="1" max="10000" value="90" required><span>px</span></div>
+                </div>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>页面上下文</legend>
+              <div class="field">
+                <label class="field-label" for="origin">页面 Origin</label>
+                <input id="origin" name="origin" type="url" value="https://publisher.test" required>
+              </div>
+              <div class="field">
+                <label class="field-label" for="path">页面路径</label>
+                <input id="path" name="path" type="text" value="/demo" maxlength="1024" required>
+                <span class="field-hint">不会发送 query、fragment 或用户标识。</span>
+              </div>
+            </fieldset>
+
+            <fieldset class="scenario-fieldset">
+              <legend>模拟场景</legend>
+              <label class="field-label" for="scenario">响应类型</label>
+              <select id="scenario" name="scenario">
+                <option value="filled">有广告 · Filled</option>
+                <option value="no_fill">无广告 · No fill</option>
+                <option value="error">服务错误 · Error</option>
+              </select>
+              <span class="field-hint">此选项仅在模拟响应模式生效。</span>
+            </fieldset>
+
+            <button class="primary-button" id="send-button" type="submit">
+              <span class="send-icon" aria-hidden="true">↗</span>
+              <span>发送广告请求</span>
+              <span class="button-shortcut">⌘ ↵</span>
+            </button>
+            <p class="privacy-note"><span aria-hidden="true">◇</span> 沙箱请求不会包含用户身份信息</p>
+          </form>
+        </aside>
+
+        <section class="results-column" aria-label="请求结果">
+          <section class="panel preview-panel">
+            <div class="panel-heading preview-heading">
+              <div>
+                <span class="step-label">PREVIEW</span>
+                <h2>广告预览</h2>
+              </div>
+              <span class="result-badge idle" id="result-badge"><span></span>等待请求</span>
+            </div>
+            <div class="preview-stage" id="preview-stage" aria-live="polite">
+              <div class="empty-state" id="empty-state">
+                <div class="empty-illustration" aria-hidden="true">
+                  <div class="empty-window"><span></span><span></span><span></span><div class="empty-ad"><i></i><i></i><i></i></div></div>
+                  <span class="empty-spark spark-one">✳</span>
+                  <span class="empty-spark spark-two">✦</span>
+                </div>
+                <strong>准备好预览你的广告了吗？</strong>
+                <span>配置广告位后发送请求，结果会显示在这里。</span>
+              </div>
+              <div class="loading-state hidden" id="loading-state">
+                <span class="loader"></span>
+                <strong>正在请求广告…</strong>
+                <span>等待 SSP Sandbox 响应</span>
+              </div>
+              <div class="ad-preview hidden" id="ad-preview">
+                <div class="ad-frame" id="ad-frame">
+                  <div class="ad-demo-copy">
+                    <span class="ad-kicker">MAKE ROOM FOR</span>
+                    <strong>GOOD<br>IDEAS.</strong>
+                    <span class="ad-cta">探索新灵感 <span>↗</span></span>
+                  </div>
+                  <div class="ad-demo-shape shape-back"></div>
+                  <div class="ad-demo-shape shape-front"></div>
+                  <span class="ad-label">广告</span>
+                </div>
+                <div class="preview-caption"><span class="status-dot"></span><span id="preview-caption-text">Sandbox creative · 静态预览</span><button type="button" class="text-button" id="open-render-button">在隔离框架中打开</button></div>
+                <iframe class="render-frame hidden" id="render-frame" title="Sandbox 广告渲染预览" sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe>
+              </div>
+              <div class="no-fill-state hidden" id="no-fill-state">
+                <div class="no-fill-icon" aria-hidden="true">∅</div>
+                <strong>当前没有匹配的广告</strong>
+                <span>这是一次正常的 no-fill 响应，不是请求错误。</span>
+                <button type="button" class="secondary-button" id="retry-button">再次请求 <span>↗</span></button>
+              </div>
+              <div class="error-state hidden" id="error-state">
+                <div class="error-icon" aria-hidden="true">!</div>
+                <strong id="error-title">请求未能完成</strong>
+                <span id="error-message">请检查配置后重试。</span>
+                <button type="button" class="secondary-button" id="error-retry-button">重试 <span>↗</span></button>
+              </div>
+            </div>
+            <div class="preview-footer">
+              <span><span class="status-dot"></span>隔离预览</span>
+              <span id="size-label">728 × 90 px</span>
+            </div>
+          </section>
+
+          <section class="panel diagnostics-panel">
+            <div class="panel-heading diagnostics-heading">
+              <div>
+                <span class="step-label">DIAGNOSTICS</span>
+                <h2>请求诊断</h2>
+              </div>
+              <button class="text-button" id="copy-button" type="button" disabled>复制摘要 <span aria-hidden="true">▢</span></button>
+            </div>
+            <div class="diagnostics-empty" id="diagnostics-empty">
+              <span class="diagnostics-empty-icon" aria-hidden="true">⌁</span>
+              <span>请求完成后，这里会显示耗时与脱敏摘要。</span>
+            </div>
+            <div class="diagnostics-content hidden" id="diagnostics-content">
+              <div class="summary-grid">
+                <div class="summary-item"><span>请求 ID</span><code id="request-id">—</code><button class="copy-id" id="copy-id-button" type="button" aria-label="复制请求 ID">▢</button></div>
+                <div class="summary-item"><span>拍卖结果</span><strong id="outcome-value">—</strong></div>
+                <div class="summary-item"><span>总耗时</span><strong id="duration-value">—</strong></div>
+                <div class="summary-item"><span>HTTP 状态</span><strong id="http-value">—</strong></div>
+              </div>
+              <div class="timeline-title"><span>请求阶段</span><span>耗时</span></div>
+              <ol class="timeline" id="timeline"></ol>
+              <details class="response-details">
+                <summary>安全响应摘要 <span>不包含 token、身份或完整 OpenRTB</span></summary>
+                <pre id="response-summary"></pre>
+              </details>
+              <div class="diagnostic-footnote"><span aria-hidden="true">ⓘ</span>敏感 token、用户身份与完整竞价请求不会显示在此处。</div>
+            </div>
+          </section>
+        </section>
+      </div>
+      <footer class="page-footer"><span>Open Ads Sandbox</span><span>仅供测试 · 不代表生产投放或结算</span></footer>
+      <div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
+    </main>
+  </body>
+</html>
