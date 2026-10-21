@@ -1,0 +1,12 @@
+{
+  "request_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89015",
+  "status": "filled",
+  "ad": {
+    "creative_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89013",
+    "format": "image",
+    "render_url": "https://ssp.test.example/render/v1/018f7a3b2c9d7e1fa3b4c5d6e7f89030",
+    "click_url": "https://ssp.test.example/click/v1/018f7a3b2c9d7e1fa3b4c5d6e7f89031",
+    "event_token": "aead-token-018f7a3b2c9d7e1fa3b4c5d6e7f89032",
+    "expires_at": "2026-10-21T12:05:00Z"
+  }
+}

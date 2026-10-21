@@ -191,8 +191,9 @@ async function requestLive(payload) {
       } catch {
         throw Object.assign(new Error("Sandbox API 的广告响应缺少有效的 render_url。"), { result });
       }
-      if (renderURL.protocol !== "https:") {
-        throw Object.assign(new Error("广告 render_url 必须使用 HTTPS。"), { result });
+      if (renderURL.protocol !== "https:" || renderURL.origin !== endpoint.origin ||
+          renderURL.username || renderURL.password) {
+        throw Object.assign(new Error("广告 render_url 必须使用配置的 SSP 地址同源 HTTPS，且不能包含用户名或密码。"), { result });
       }
     }
     return result;

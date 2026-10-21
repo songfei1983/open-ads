@@ -1,0 +1,5 @@
+{
+  "code": "invalid_request",
+  "message": "The request body failed validation: placement_id is required.",
+  "request_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89070"
+}

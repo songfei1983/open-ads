@@ -1,0 +1,15 @@
+{
+  "request_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89060",
+  "tenant_id": "tenant-default",
+  "provider_id": "dmp-provider-01",
+  "namespace": "publisher-account-v1",
+  "subject_token": "hmac-token-v1-018f7a3b2c9d7e1fa3b4c5d6e7f89061",
+  "consent_context": {
+    "purpose": "personalized_ads",
+    "receipt_id": "cmp-receipt-018f7a3b"
+  },
+  "purposes": [
+    "personalized_ads"
+  ],
+  "max_segments": 10
+}

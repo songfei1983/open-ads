@@ -1,0 +1,11 @@
+{
+  "event_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89016",
+  "source_event_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "auction_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89017",
+  "bid_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89018",
+  "imp_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89019",
+  "reservation_ref": "opaque-aead-reservation-reference",
+  "amount_micros": 2500,
+  "currency": "USD",
+  "occurred_at": "2026-10-21T12:00:00Z"
+}

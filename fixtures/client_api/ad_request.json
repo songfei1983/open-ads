@@ -1,0 +1,17 @@
+{
+  "request_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89015",
+  "placement_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89012",
+  "slot": {
+    "id": "leaderboard",
+    "width": 728,
+    "height": 90
+  },
+  "page": {
+    "origin": "https://publisher.test",
+    "path": "/demo"
+  },
+  "consent": {
+    "source": "test-fixture",
+    "value": null
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "request_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89060",
+  "snapshot_id": "snap-20261021-001",
+  "provider_id": "dmp-provider-01",
+  "segments": [
+    {
+      "id": "seg-tech-enthusiasts"
+    },
+    {
+      "id": "seg-sports-fans"
+    }
+  ],
+  "resolved_at": "2026-10-21T12:00:00Z"
+}

@@ -1,0 +1,29 @@
+{
+  "id": "018f7a3b2c9d7e1fa3b4c5d6e7f89010",
+  "seatbid": [
+    {
+      "bid": [
+        {
+          "id": "bid-018f7a3b2c9d7e1fa3b4c5d6e7f89020",
+          "impid": "1",
+          "price": 2.50,
+          "adid": "ad-018f7a3b2c9d",
+          "nurl": "https://dsp.test.example/rtb/v1/win/018f7a3b2c9d7e1fa3b4c5d6e7f89020?price=${AUCTION_PRICE}",
+          "burl": "https://dsp.test.example/rtb/v1/billable/018f7a3b2c9d7e1fa3b4c5d6e7f89020",
+          "lurl": "https://dsp.test.example/rtb/v1/loss/018f7a3b2c9d7e1fa3b4c5d6e7f89020?reason=${AUCTION_LOSS}",
+          "adm": "<iframe src=\"https://render.test.example/render/v1/018f7a3b2c9d7e1fa3b4c5d6e7f89030\" width=\"728\" height=\"90\" frameborder=\"0\" scrolling=\"no\" sandbox=\"allow-scripts\"></iframe>",
+          "cid": "camp-018f7a3b2c9d",
+          "crid": "cr-018f7a3b2c9d",
+          "w": 728,
+          "h": 90,
+          "ext": {
+            "reservation_id": "res-018f7a3b2c9d7e1fa3b4c5d6e7f89040"
+          }
+        }
+      ],
+      "seat": "dsp-seat-acme"
+    }
+  ],
+  "bidid": "bidid-018f7a3b2c9d",
+  "cur": "USD"
+}

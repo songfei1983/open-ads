@@ -1,0 +1,68 @@
+{
+  "id": "018f7a3b2c9d7e1fa3b4c5d6e7f89010",
+  "imp": [
+    {
+      "id": "1",
+      "banner": {
+        "w": 728,
+        "h": 90,
+        "pos": 1,
+        "format": [
+          {
+            "w": 728,
+            "h": 90
+          }
+        ]
+      },
+      "tagid": "leaderboard-main",
+      "bidfloor": 1.20,
+      "bidfloorcur": "USD",
+      "secure": 1
+    }
+  ],
+  "site": {
+    "id": "site-018f7a3b2c9d",
+    "name": "Publisher Test Site",
+    "domain": "publisher.test",
+    "page": "https://publisher.test/demo",
+    "publisher": {
+      "id": "pub-018f7a3b2c9d",
+      "name": "Acme Media Group"
+    }
+  },
+  "device": {
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "ip": "198.51.100.1",
+    "devicetype": 2,
+    "make": "Apple",
+    "model": "Macintosh",
+    "os": "macOS",
+    "w": 1920,
+    "h": 1080
+  },
+  "user": {
+    "id": "ssp-subject-018f7a3b2c9d",
+    "buyeruid": "dsp-buyer-018f7a3b2c9d",
+    "data": [
+      {
+        "id": "dmp-provider-01",
+        "name": "open-ads-dmp",
+        "segment": [
+          {
+            "id": "seg-tech-enthusiasts",
+            "name": "Tech Enthusiasts"
+          }
+        ]
+      }
+    ]
+  },
+  "at": 1,
+  "tmax": 80,
+  "cur": [
+    "USD"
+  ],
+  "bcat": [
+    "IAB25",
+    "IAB26"
+  ]
+}
