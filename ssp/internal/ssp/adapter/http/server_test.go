@@ -91,6 +91,50 @@ func TestAdRequestsOrchestratesDMPAndDSP(t *testing.T) {
 	}
 }
 
+func TestOpenRTBAuctionForwardsRequestIDToDSP(t *testing.T) {
+	dsp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			ID string `json:"id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode DSP request: %v", err)
+		}
+		if request.ID != "rtb-request-1" || r.Header.Get("X-Request-ID") != request.ID {
+			t.Fatalf("request ID was not propagated: body=%q header=%q", request.ID, r.Header.Get("X-Request-ID"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"rtb-request-1","nbr":2}`))
+	}))
+	defer dsp.Close()
+
+	cfg := &config.Config{ServiceName: "test-ssp", Port: 8080, DSPURL: dsp.URL, DSPTimeout: 50 * time.Millisecond}
+	srv := adapterHTTP.NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv.SetReady(true)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/openrtb2/auction", strings.NewReader(`{"id":"rtb-request-1","imp":[{"id":"1","banner":{"w":728,"h":90}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["id"] != "rtb-request-1" || body["nbr"] != float64(2) {
+		t.Fatalf("unexpected no-bid response: %#v", body)
+	}
+}
+
 func TestHealthz(t *testing.T) {
 	srv := newTestServer()
 	ts := httptest.NewServer(srv.Handler())

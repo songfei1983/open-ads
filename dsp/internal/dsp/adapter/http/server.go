@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -95,11 +96,23 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleOpenRTBBid(w http.ResponseWriter, r *http.Request) {
 	reqID := observability.RequestIDFromContext(r.Context())
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	var req struct {
+		ID  string            `json:"id"`
+		Imp []json.RawMessage `json:"imp"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 256<<10)
+	if err := json.NewDecoder(io.LimitReader(r.Body, 256<<10)).Decode(&req); err != nil || req.ID == "" || len(req.Imp) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"code":       "invalid_request",
+			"message":    "invalid OpenRTB request",
+			"request_id": reqID,
+		})
+		return
+	}
 
 	// Standard no-bid response (nbr: 2 = technical/no candidate)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":  reqID,
+		"id":  req.ID,
 		"nbr": 2,
 	})
 }
