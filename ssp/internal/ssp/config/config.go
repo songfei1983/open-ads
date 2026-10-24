@@ -22,7 +22,9 @@ type Config struct {
 	DBName     string
 
 	// Valkey configuration
-	ValkeyAddr string
+	ValkeyAddr     string
+	ValkeyUser     string
+	ValkeyPassword string
 
 	// Timeouts
 	AuctionTimeout time.Duration
@@ -65,6 +67,8 @@ func Load() (*Config, error) {
 		DBPassword:     getEnv("SSP_DB_PASSWORD", "ssp_pass"),
 		DBName:         getEnv("SSP_DB_NAME", "ssp_db"),
 		ValkeyAddr:     getEnv("VALKEY_ADDR", "127.0.0.1:6379"),
+		ValkeyUser:     getEnv("SSP_VALKEY_USER", "ssp"),
+		ValkeyPassword: getEnv("SSP_VALKEY_PASSWORD", "ssp_valkey_password"),
 		AuctionTimeout: time.Duration(auctionTimeout) * time.Millisecond,
 		DMPTimeout:     time.Duration(dmpTimeout) * time.Millisecond,
 		DSPTimeout:     time.Duration(dspTimeout) * time.Millisecond,

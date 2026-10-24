@@ -19,7 +19,9 @@ func newTestServer() *adapterHTTP.Server {
 		Port:        8081,
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return adapterHTTP.NewServer(cfg, logger)
+	srv := adapterHTTP.NewServer(cfg, logger)
+	srv.SetReady(true)
+	return srv
 }
 
 func TestHealthz(t *testing.T) {

@@ -20,20 +20,22 @@ type Server struct {
 	server  *http.Server
 	logger  *slog.Logger
 	cfg     *config.Config
+	metrics *observability.Metrics
 	isReady atomic.Bool
 }
 
 // NewServer initializes the HTTP server with router, middlewares, and probes.
 func NewServer(cfg *config.Config, logger *slog.Logger) *Server {
 	s := &Server{
-		logger: logger,
-		cfg:    cfg,
+		logger:  logger,
+		cfg:     cfg,
+		metrics: &observability.Metrics{},
 	}
 
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
 
-	handler := s.requestIDMiddleware(s.loggingMiddleware(s.recoveryMiddleware(mux)))
+	handler := s.requestIDMiddleware(s.requestDeadlineMiddleware(s.loggingMiddleware(s.recoveryMiddleware(mux))))
 
 	s.server = &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
@@ -44,7 +46,7 @@ func NewServer(cfg *config.Config, logger *slog.Logger) *Server {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	s.isReady.Store(true)
+	s.isReady.Store(false)
 
 	return s
 }
@@ -62,6 +64,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
+	mux.HandleFunc("GET /metrics", s.metrics.Handler)
 	mux.HandleFunc("POST /internal/v1/audiences:resolve", s.handleAudienceResolve)
 	mux.HandleFunc("POST /internal/v1/identity:revoke", s.handleIdentityRevoke)
 }
@@ -113,6 +116,7 @@ func (s *Server) handleIdentityRevoke(w http.ResponseWriter, r *http.Request) {
 
 // Start runs the HTTP server.
 func (s *Server) Start() error {
+	s.isReady.Store(true)
 	s.logger.Info("starting DMP HTTP server", slog.String("addr", s.server.Addr))
 	if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("listen and serve: %w", err)
@@ -145,6 +149,14 @@ func (s *Server) requestIDMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func (s *Server) requestDeadlineMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout)
+		defer cancel()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -162,6 +174,7 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 			slog.Int64("duration_ms", duration.Milliseconds()),
 			slog.String("request_id", reqID),
 		)
+		s.metrics.Observe(rw.statusCode, duration)
 	})
 }
 

@@ -25,3 +25,24 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test -race ./...
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ssp/go.mod
+      - name: Start infrastructure
+        run: docker compose -f deployments/docker-compose.yml up -d --wait
+      - name: Validate migrations and isolation
+        run: make migration-check
+      - name: Verify MariaDB schemas
+        run: |
+          test "$(docker compose -f deployments/docker-compose.yml exec -T mariadb mariadb -uroot -proot_password -Nse 'SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = "ssp_db";')" -gt 0
+          test "$(docker compose -f deployments/docker-compose.yml exec -T mariadb mariadb -uroot -proot_password -Nse 'SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = "dsp_db";')" -gt 0
+      - name: Verify ClickHouse schema
+        run: test "$(docker compose -f deployments/docker-compose.yml exec -T clickhouse clickhouse-client --query 'SHOW TABLES FROM dmp' | wc -l)" -eq 6
+      - name: Stop infrastructure
+        if: always()
+        run: docker compose -f deployments/docker-compose.yml down -v

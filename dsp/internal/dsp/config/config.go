@@ -22,7 +22,9 @@ type Config struct {
 	DBName     string
 
 	// Valkey configuration
-	ValkeyAddr string
+	ValkeyAddr     string
+	ValkeyUser     string
+	ValkeyPassword string
 
 	// Bidder timeouts
 	BidTimeout time.Duration
@@ -46,17 +48,19 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	cfg := &Config{
-		ServiceName: getEnv("SERVICE_NAME", "open-ads-dsp"),
-		Environment: getEnv("ENVIRONMENT", "development"),
-		Port:        port,
-		DBHost:      getEnv("DSP_DB_HOST", "127.0.0.1"),
-		DBPort:      dbPort,
-		DBUser:      getEnv("DSP_DB_USER", "dsp_user"),
-		DBPassword:  getEnv("DSP_DB_PASSWORD", "dsp_pass"),
-		DBName:      getEnv("DSP_DB_NAME", "dsp_db"),
-		ValkeyAddr:  getEnv("VALKEY_ADDR", "127.0.0.1:6379"),
-		BidTimeout:  time.Duration(bidTimeout) * time.Millisecond,
-		LogLevel:    getEnv("LOG_LEVEL", "INFO"),
+		ServiceName:    getEnv("SERVICE_NAME", "open-ads-dsp"),
+		Environment:    getEnv("ENVIRONMENT", "development"),
+		Port:           port,
+		DBHost:         getEnv("DSP_DB_HOST", "127.0.0.1"),
+		DBPort:         dbPort,
+		DBUser:         getEnv("DSP_DB_USER", "dsp_user"),
+		DBPassword:     getEnv("DSP_DB_PASSWORD", "dsp_pass"),
+		DBName:         getEnv("DSP_DB_NAME", "dsp_db"),
+		ValkeyAddr:     getEnv("VALKEY_ADDR", "127.0.0.1:6379"),
+		ValkeyUser:     getEnv("DSP_VALKEY_USER", "dsp"),
+		ValkeyPassword: getEnv("DSP_VALKEY_PASSWORD", "dsp_valkey_password"),
+		BidTimeout:     time.Duration(bidTimeout) * time.Millisecond,
+		LogLevel:       getEnv("LOG_LEVEL", "INFO"),
 	}
 	if !validLogLevel(cfg.LogLevel) {
 		return nil, fmt.Errorf("invalid log level: %q", cfg.LogLevel)

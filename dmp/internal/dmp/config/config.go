@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds runtime configuration for the DMP service.
@@ -18,9 +19,12 @@ type Config struct {
 	ClickHouseUser     string
 	ClickHousePassword string
 	ClickHouseDatabase string
+	RequestTimeout     time.Duration
 
 	// Valkey Deny Gate configuration
-	ValkeyAddr string
+	ValkeyAddr     string
+	ValkeyUser     string
+	ValkeyPassword string
 
 	// Observability
 	LogLevel string
@@ -32,15 +36,22 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	requestTimeout, err := getEnvInt("DMP_REQUEST_TIMEOUT_MS", 15)
+	if err != nil {
+		return nil, err
+	}
 	cfg := &Config{
 		ServiceName:        getEnv("SERVICE_NAME", "open-ads-dmp"),
 		Environment:        getEnv("ENVIRONMENT", "development"),
 		Port:               port,
 		ClickHouseAddr:     getEnv("CLICKHOUSE_ADDR", "127.0.0.1:9000"),
-		ClickHouseUser:     getEnv("CLICKHOUSE_USER", "default"),
-		ClickHousePassword: getEnv("CLICKHOUSE_PASSWORD", ""),
+		ClickHouseUser:     getEnv("CLICKHOUSE_USER", "dmp_user"),
+		ClickHousePassword: getEnv("CLICKHOUSE_PASSWORD", "dmp_clickhouse_password"),
 		ClickHouseDatabase: getEnv("CLICKHOUSE_DATABASE", "dmp"),
 		ValkeyAddr:         getEnv("VALKEY_ADDR", "127.0.0.1:6379"),
+		ValkeyUser:         getEnv("DMP_VALKEY_USER", "dmp"),
+		ValkeyPassword:     getEnv("DMP_VALKEY_PASSWORD", "dmp_valkey_password"),
+		RequestTimeout:     time.Duration(requestTimeout) * time.Millisecond,
 		LogLevel:           getEnv("LOG_LEVEL", "INFO"),
 	}
 	if !validLogLevel(cfg.LogLevel) {
@@ -49,6 +60,9 @@ func Load() (*Config, error) {
 
 	if cfg.Port <= 0 || cfg.Port > 65535 {
 		return nil, fmt.Errorf("invalid port: %d", cfg.Port)
+	}
+	if cfg.RequestTimeout <= 0 {
+		return nil, fmt.Errorf("request timeout must be positive")
 	}
 
 	return cfg, nil
