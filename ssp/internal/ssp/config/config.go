@@ -26,6 +26,10 @@ type Config struct {
 	ValkeyUser     string
 	ValkeyPassword string
 
+	// Internal service endpoints.
+	DMPURL string
+	DSPURL string
+
 	// Timeouts
 	AuctionTimeout time.Duration
 	DMPTimeout     time.Duration
@@ -69,6 +73,8 @@ func Load() (*Config, error) {
 		ValkeyAddr:     getEnv("VALKEY_ADDR", "127.0.0.1:6379"),
 		ValkeyUser:     getEnv("SSP_VALKEY_USER", "ssp"),
 		ValkeyPassword: getEnv("SSP_VALKEY_PASSWORD", "ssp_valkey_password"),
+		DMPURL:         strings.TrimRight(getEnv("DMP_URL", ""), "/"),
+		DSPURL:         strings.TrimRight(getEnv("DSP_URL", ""), "/"),
 		AuctionTimeout: time.Duration(auctionTimeout) * time.Millisecond,
 		DMPTimeout:     time.Duration(dmpTimeout) * time.Millisecond,
 		DSPTimeout:     time.Duration(dspTimeout) * time.Millisecond,
