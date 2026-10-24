@@ -23,3 +23,10 @@ func TestLoadDefaults(t *testing.T) {
 		t.Errorf("expected BidTimeout 50ms, got %v", cfg.BidTimeout)
 	}
 }
+
+func TestLoadRejectsInvalidBidTimeout(t *testing.T) {
+	t.Setenv("DSP_BID_TIMEOUT_MS", "not-a-number")
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected invalid timeout error")
+	}
+}

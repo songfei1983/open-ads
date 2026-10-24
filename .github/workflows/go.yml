@@ -1,0 +1,27 @@
+name: Go
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    strategy:
+      matrix:
+        service: [ssp, dsp, dmp]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.service }}/go.mod
+          cache: true
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...

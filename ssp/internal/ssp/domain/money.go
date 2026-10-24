@@ -56,7 +56,15 @@ func CalculateBillableFromCPM(cpmMicros Micros, quantity int64) (Micros, error) 
 		return 0, nil
 	}
 
-	val := float64(cpmMicros) * float64(quantity) / 1000.0
-	rounded := RoundHalfEven(val)
-	return Micros(rounded), nil
+	quantityMicros := Micros(quantity)
+	if cpmMicros > Micros(^uint64(0)>>1)/quantityMicros {
+		return 0, errors.New("billable amount overflows micros")
+	}
+
+	total := cpmMicros * quantityMicros
+	quotient, remainder := total/1000, total%1000
+	if remainder > 500 || remainder == 500 && quotient%2 != 0 {
+		quotient++
+	}
+	return quotient, nil
 }

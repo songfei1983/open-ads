@@ -45,3 +45,10 @@ func TestLoadCustomEnv(t *testing.T) {
 		t.Errorf("expected DBName custom_ssp, got %s", cfg.DBName)
 	}
 }
+
+func TestLoadRejectsInvalidTimeout(t *testing.T) {
+	t.Setenv("AUCTION_TIMEOUT_MS", "not-a-number")
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected invalid timeout error")
+	}
+}

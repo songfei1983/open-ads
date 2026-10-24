@@ -1,0 +1,4 @@
+user default off
+user ssp on >ssp_valkey_password ~ssp:* +@all
+user dsp on >dsp_valkey_password ~dsp:* +@all
+user dmp on >dmp_valkey_password ~dmp:* +@all

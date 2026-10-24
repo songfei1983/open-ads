@@ -81,7 +81,7 @@ func TestAudienceResolveEndpoint(t *testing.T) {
 	body := strings.NewReader(`{"namespace":"publisher-account-v1","subject_token":"tok-123"}`)
 	req, _ := http.NewRequest("POST", ts.URL+"/internal/v1/audiences:resolve", body)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Request-ID", "req-resolve-1")
+	req.Header.Set("X-Request-ID", "018f7a3b2c9d7e1fa3b4c5d6e7f89070")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -97,8 +97,8 @@ func TestAudienceResolveEndpoint(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		t.Fatalf("failed to decode json: %v", err)
 	}
-	if res["request_id"] != "req-resolve-1" {
-		t.Errorf("expected request_id req-resolve-1, got %v", res["request_id"])
+	if res["request_id"] != "018f7a3b2c9d7e1fa3b4c5d6e7f89070" {
+		t.Errorf("expected request_id to be echoed, got %v", res["request_id"])
 	}
 }
 
@@ -110,7 +110,7 @@ func TestIdentityRevokeEndpoint(t *testing.T) {
 	body := strings.NewReader(`{"namespace":"publisher-account-v1"}`)
 	req, _ := http.NewRequest("POST", ts.URL+"/internal/v1/identity:revoke", body)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Request-ID", "rev-123")
+	req.Header.Set("X-Request-ID", "018f7a3b2c9d7e1fa3b4c5d6e7f89071")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -118,7 +118,7 @@ func TestIdentityRevokeEndpoint(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusAccepted {
-		t.Errorf("expected 202 Accepted, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Errorf("expected 501 Not Implemented, got %d", resp.StatusCode)
 	}
 }

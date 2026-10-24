@@ -84,7 +84,7 @@ func TestAdRequestsEndpoint(t *testing.T) {
 	body := strings.NewReader(`{"placement_id":"test-placement"}`)
 	req, _ := http.NewRequest("POST", ts.URL+"/sdk/v1/ad-requests", body)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Request-ID", "req-test-123")
+	req.Header.Set("X-Request-ID", "018f7a3b2c9d7e1fa3b4c5d6e7f89070")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -96,7 +96,7 @@ func TestAdRequestsEndpoint(t *testing.T) {
 		t.Errorf("expected 200 OK, got %d", resp.StatusCode)
 	}
 
-	if resp.Header.Get("X-Request-ID") != "req-test-123" {
+	if resp.Header.Get("X-Request-ID") != "018f7a3b2c9d7e1fa3b4c5d6e7f89070" {
 		t.Errorf("expected X-Request-ID echo, got %s", resp.Header.Get("X-Request-ID"))
 	}
 }

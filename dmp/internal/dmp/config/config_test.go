@@ -19,3 +19,10 @@ func TestLoadDefaults(t *testing.T) {
 		t.Errorf("expected database dmp, got %s", cfg.ClickHouseDatabase)
 	}
 }
+
+func TestLoadRejectsInvalidPort(t *testing.T) {
+	t.Setenv("DMP_PORT", "not-a-number")
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected invalid port error")
+	}
+}

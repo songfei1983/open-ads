@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -32,25 +33,55 @@ type Config struct {
 
 // Load loads configuration from environment variables with sensible defaults.
 func Load() (*Config, error) {
+	port, err := getEnvInt("DSP_PORT", 8081)
+	if err != nil {
+		return nil, err
+	}
+	dbPort, err := getEnvInt("DSP_DB_PORT", 3306)
+	if err != nil {
+		return nil, err
+	}
+	bidTimeout, err := getEnvInt("DSP_BID_TIMEOUT_MS", 50)
+	if err != nil {
+		return nil, err
+	}
 	cfg := &Config{
 		ServiceName: getEnv("SERVICE_NAME", "open-ads-dsp"),
 		Environment: getEnv("ENVIRONMENT", "development"),
-		Port:        getEnvInt("DSP_PORT", 8081),
+		Port:        port,
 		DBHost:      getEnv("DSP_DB_HOST", "127.0.0.1"),
-		DBPort:      getEnvInt("DSP_DB_PORT", 3306),
+		DBPort:      dbPort,
 		DBUser:      getEnv("DSP_DB_USER", "dsp_user"),
 		DBPassword:  getEnv("DSP_DB_PASSWORD", "dsp_pass"),
 		DBName:      getEnv("DSP_DB_NAME", "dsp_db"),
 		ValkeyAddr:  getEnv("VALKEY_ADDR", "127.0.0.1:6379"),
-		BidTimeout:  time.Duration(getEnvInt("DSP_BID_TIMEOUT_MS", 50)) * time.Millisecond,
+		BidTimeout:  time.Duration(bidTimeout) * time.Millisecond,
 		LogLevel:    getEnv("LOG_LEVEL", "INFO"),
+	}
+	if !validLogLevel(cfg.LogLevel) {
+		return nil, fmt.Errorf("invalid log level: %q", cfg.LogLevel)
 	}
 
 	if cfg.Port <= 0 || cfg.Port > 65535 {
 		return nil, fmt.Errorf("invalid port: %d", cfg.Port)
 	}
+	if cfg.DBPort <= 0 || cfg.DBPort > 65535 {
+		return nil, fmt.Errorf("invalid database port: %d", cfg.DBPort)
+	}
+	if cfg.BidTimeout <= 0 {
+		return nil, fmt.Errorf("bid timeout must be positive")
+	}
 
 	return cfg, nil
+}
+
+func validLogLevel(level string) bool {
+	switch strings.ToUpper(level) {
+	case "DEBUG", "INFO", "WARN", "ERROR":
+		return true
+	default:
+		return false
+	}
 }
 
 func getEnv(key, defaultVal string) string {
@@ -60,11 +91,13 @@ func getEnv(key, defaultVal string) string {
 	return defaultVal
 }
 
-func getEnvInt(key string, defaultVal int) int {
+func getEnvInt(key string, defaultVal int) (int, error) {
 	if val := os.Getenv(key); val != "" {
-		if i, err := strconv.Atoi(val); err == nil {
-			return i
+		i, err := strconv.Atoi(val)
+		if err != nil {
+			return 0, fmt.Errorf("invalid integer environment variable %s: %w", key, err)
 		}
+		return i, nil
 	}
-	return defaultVal
+	return defaultVal, nil
 }

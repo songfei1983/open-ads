@@ -16,3 +16,9 @@ func TestCalculateSpendFromCPM(t *testing.T) {
 		t.Errorf("expected 2500 micros, got %d", got)
 	}
 }
+
+func TestCalculateSpendFromCPMRejectsOverflow(t *testing.T) {
+	if _, err := domain.CalculateSpendFromCPM(domain.Micros(1<<62), 2); err == nil {
+		t.Fatal("expected overflow error")
+	}
+}

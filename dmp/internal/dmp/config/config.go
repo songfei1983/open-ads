@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Config holds runtime configuration for the DMP service.
@@ -27,16 +28,23 @@ type Config struct {
 
 // Load loads configuration from environment variables with sensible defaults.
 func Load() (*Config, error) {
+	port, err := getEnvInt("DMP_PORT", 8082)
+	if err != nil {
+		return nil, err
+	}
 	cfg := &Config{
 		ServiceName:        getEnv("SERVICE_NAME", "open-ads-dmp"),
 		Environment:        getEnv("ENVIRONMENT", "development"),
-		Port:               getEnvInt("DMP_PORT", 8082),
+		Port:               port,
 		ClickHouseAddr:     getEnv("CLICKHOUSE_ADDR", "127.0.0.1:9000"),
 		ClickHouseUser:     getEnv("CLICKHOUSE_USER", "default"),
 		ClickHousePassword: getEnv("CLICKHOUSE_PASSWORD", ""),
 		ClickHouseDatabase: getEnv("CLICKHOUSE_DATABASE", "dmp"),
 		ValkeyAddr:         getEnv("VALKEY_ADDR", "127.0.0.1:6379"),
 		LogLevel:           getEnv("LOG_LEVEL", "INFO"),
+	}
+	if !validLogLevel(cfg.LogLevel) {
+		return nil, fmt.Errorf("invalid log level: %q", cfg.LogLevel)
 	}
 
 	if cfg.Port <= 0 || cfg.Port > 65535 {
@@ -46,6 +54,15 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
+func validLogLevel(level string) bool {
+	switch strings.ToUpper(level) {
+	case "DEBUG", "INFO", "WARN", "ERROR":
+		return true
+	default:
+		return false
+	}
+}
+
 func getEnv(key, defaultVal string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
@@ -53,11 +70,13 @@ func getEnv(key, defaultVal string) string {
 	return defaultVal
 }
 
-func getEnvInt(key string, defaultVal int) int {
+func getEnvInt(key string, defaultVal int) (int, error) {
 	if val := os.Getenv(key); val != "" {
-		if i, err := strconv.Atoi(val); err == nil {
-			return i
+		i, err := strconv.Atoi(val)
+		if err != nil {
+			return 0, fmt.Errorf("invalid integer environment variable %s: %w", key, err)
 		}
+		return i, nil
 	}
-	return defaultVal
+	return defaultVal, nil
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -34,27 +35,65 @@ type Config struct {
 
 // Load loads configuration from environment variables with sensible defaults.
 func Load() (*Config, error) {
+	port, err := getEnvInt("SSP_PORT", 8080)
+	if err != nil {
+		return nil, err
+	}
+	dbPort, err := getEnvInt("SSP_DB_PORT", 3306)
+	if err != nil {
+		return nil, err
+	}
+	auctionTimeout, err := getEnvInt("AUCTION_TIMEOUT_MS", 80)
+	if err != nil {
+		return nil, err
+	}
+	dmpTimeout, err := getEnvInt("DMP_TIMEOUT_MS", 15)
+	if err != nil {
+		return nil, err
+	}
+	dspTimeout, err := getEnvInt("DSP_TIMEOUT_MS", 50)
+	if err != nil {
+		return nil, err
+	}
 	cfg := &Config{
 		ServiceName:    getEnv("SERVICE_NAME", "open-ads-ssp"),
 		Environment:    getEnv("ENVIRONMENT", "development"),
-		Port:           getEnvInt("SSP_PORT", 8080),
+		Port:           port,
 		DBHost:         getEnv("SSP_DB_HOST", "127.0.0.1"),
-		DBPort:         getEnvInt("SSP_DB_PORT", 3306),
+		DBPort:         dbPort,
 		DBUser:         getEnv("SSP_DB_USER", "ssp_user"),
 		DBPassword:     getEnv("SSP_DB_PASSWORD", "ssp_pass"),
 		DBName:         getEnv("SSP_DB_NAME", "ssp_db"),
 		ValkeyAddr:     getEnv("VALKEY_ADDR", "127.0.0.1:6379"),
-		AuctionTimeout: time.Duration(getEnvInt("AUCTION_TIMEOUT_MS", 80)) * time.Millisecond,
-		DMPTimeout:     time.Duration(getEnvInt("DMP_TIMEOUT_MS", 15)) * time.Millisecond,
-		DSPTimeout:     time.Duration(getEnvInt("DSP_TIMEOUT_MS", 50)) * time.Millisecond,
+		AuctionTimeout: time.Duration(auctionTimeout) * time.Millisecond,
+		DMPTimeout:     time.Duration(dmpTimeout) * time.Millisecond,
+		DSPTimeout:     time.Duration(dspTimeout) * time.Millisecond,
 		LogLevel:       getEnv("LOG_LEVEL", "INFO"),
+	}
+	if !validLogLevel(cfg.LogLevel) {
+		return nil, fmt.Errorf("invalid log level: %q", cfg.LogLevel)
 	}
 
 	if cfg.Port <= 0 || cfg.Port > 65535 {
 		return nil, fmt.Errorf("invalid port: %d", cfg.Port)
 	}
+	if cfg.DBPort <= 0 || cfg.DBPort > 65535 {
+		return nil, fmt.Errorf("invalid database port: %d", cfg.DBPort)
+	}
+	if cfg.AuctionTimeout <= 0 || cfg.DMPTimeout <= 0 || cfg.DSPTimeout <= 0 {
+		return nil, fmt.Errorf("timeouts must be positive")
+	}
 
 	return cfg, nil
+}
+
+func validLogLevel(level string) bool {
+	switch strings.ToUpper(level) {
+	case "DEBUG", "INFO", "WARN", "ERROR":
+		return true
+	default:
+		return false
+	}
 }
 
 func getEnv(key, defaultVal string) string {
@@ -64,11 +103,13 @@ func getEnv(key, defaultVal string) string {
 	return defaultVal
 }
 
-func getEnvInt(key string, defaultVal int) int {
+func getEnvInt(key string, defaultVal int) (int, error) {
 	if val := os.Getenv(key); val != "" {
-		if i, err := strconv.Atoi(val); err == nil {
-			return i
+		i, err := strconv.Atoi(val)
+		if err != nil {
+			return 0, fmt.Errorf("invalid integer environment variable %s: %w", key, err)
 		}
+		return i, nil
 	}
-	return defaultVal
+	return defaultVal, nil
 }

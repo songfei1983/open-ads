@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -32,7 +33,7 @@ func NewServer(cfg *config.Config, logger *slog.Logger) *Server {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
 
-	handler := s.recoveryMiddleware(s.requestIDMiddleware(s.loggingMiddleware(mux)))
+	handler := s.requestIDMiddleware(s.loggingMiddleware(s.recoveryMiddleware(mux)))
 
 	s.server = &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
@@ -102,11 +103,11 @@ func (s *Server) handleAudienceResolve(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleIdentityRevoke(w http.ResponseWriter, r *http.Request) {
 	reqID := observability.RequestIDFromContext(r.Context())
 
-	// Revocation response: 202 Accepted pending drain
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"revocation_id": reqID,
-		"status":        "completed",
-		"effective_at":  time.Now().UTC().Format(time.RFC3339),
+	// Never report completion until the persistent tombstone and deny gate exist.
+	writeJSON(w, http.StatusNotImplemented, map[string]any{
+		"code":       "not_implemented",
+		"message":    "identity revocation is not available",
+		"request_id": reqID,
 	})
 }
 
@@ -128,12 +129,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 func (s *Server) requestIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqID := r.Header.Get("X-Request-ID")
-		if reqID == "" {
+		reqID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
+		if domain.ValidateUUID32(reqID) != nil {
 			var err error
 			reqID, err = domain.NewUUIDv7()
 			if err != nil {
-				reqID = fmt.Sprintf("fallback-%d", time.Now().UnixNano())
+				http.Error(w, "unable to generate request ID", http.StatusInternalServerError)
+				return
 			}
 		}
 
@@ -185,12 +187,24 @@ func (s *Server) recoveryMiddleware(next http.Handler) http.Handler {
 
 type responseWriter struct {
 	http.ResponseWriter
-	statusCode int
+	statusCode    int
+	headerWritten bool
 }
 
 func (rw *responseWriter) WriteHeader(code int) {
+	if rw.headerWritten {
+		return
+	}
+	rw.headerWritten = true
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+func (rw *responseWriter) Write(body []byte) (int, error) {
+	if !rw.headerWritten {
+		rw.WriteHeader(http.StatusOK)
+	}
+	return rw.ResponseWriter.Write(body)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {

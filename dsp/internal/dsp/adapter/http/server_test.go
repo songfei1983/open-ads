@@ -81,7 +81,7 @@ func TestOpenRTBBidEndpoint(t *testing.T) {
 	body := strings.NewReader(`{"id":"req-018f7a3b"}`)
 	req, _ := http.NewRequest("POST", ts.URL+"/openrtb2/bid", body)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Request-ID", "req-018f7a3b")
+	req.Header.Set("X-Request-ID", "018f7a3b2c9d7e1fa3b4c5d6e7f89070")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -97,8 +97,8 @@ func TestOpenRTBBidEndpoint(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		t.Fatalf("failed to decode json: %v", err)
 	}
-	if res["id"] != "req-018f7a3b" {
-		t.Errorf("expected id req-018f7a3b, got %v", res["id"])
+	if res["id"] != "018f7a3b2c9d7e1fa3b4c5d6e7f89070" {
+		t.Errorf("expected valid request id, got %v", res["id"])
 	}
 }
 

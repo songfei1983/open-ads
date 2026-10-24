@@ -1,6 +1,8 @@
 -- Migration: 000001_init_dmp_schema.up.sql
 -- Description: Initialize DMP ClickHouse schema and MergeTree tables
 
+USE dmp;
+
 CREATE TABLE IF NOT EXISTS dmp_membership_snapshot
 (
   tenant_id UUID,

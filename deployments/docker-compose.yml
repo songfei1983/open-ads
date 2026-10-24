@@ -12,6 +12,8 @@ services:
     volumes:
       - mariadb_data:/var/lib/mysql
       - ./mariadb-init:/docker-entrypoint-initdb.d:ro
+      - ../ssp/migrations:/migrations/ssp:ro
+      - ../dsp/migrations:/migrations/dsp:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot_password"]
       interval: 5s
@@ -21,10 +23,13 @@ services:
   valkey:
     image: valkey/valkey:7.2-alpine
     container_name: open-ads-valkey
+    command: ["valkey-server", "--aclfile", "/etc/valkey/users.acl"]
     ports:
       - "127.0.0.1:6379:6379"
+    volumes:
+      - ./valkey/users.acl:/etc/valkey/users.acl:ro
     healthcheck:
-      test: ["CMD", "valkey-cli", "ping"]
+      test: ["CMD", "valkey-cli", "--user", "ssp", "--pass", "ssp_valkey_password", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -39,8 +44,9 @@ services:
       - "127.0.0.1:8123:8123"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
+      - ../dmp/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "localhost:8123/ping"]
+      test: ["CMD", "wget", "--spider", "-q", "127.0.0.1:8123/ping"]
       interval: 5s
       timeout: 3s
       retries: 5
