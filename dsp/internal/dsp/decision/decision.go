@@ -1,0 +1,31 @@
+// Package decision defines the DSP hot-path decision boundary.
+package decision
+
+import "context"
+
+// Request is the minimal validated input needed by a bidder decisioner.
+// Protocol-specific OpenRTB DTOs stay in the HTTP adapter.
+type Request struct {
+	ID              string
+	ImpressionCount int
+}
+
+// Response is the minimal decision result returned to the HTTP adapter.
+type Response struct {
+	RequestID   string
+	NoBid       bool
+	NoBidReason int
+}
+
+// Decisioner makes a bid decision without coupling the transport to storage.
+type Decisioner interface {
+	Decide(context.Context, Request) (Response, error)
+}
+
+// NoBidDecisioner is the safe default until a published campaign snapshot is available.
+type NoBidDecisioner struct{}
+
+// Decide returns a standard technical/no-candidate decision.
+func (NoBidDecisioner) Decide(_ context.Context, req Request) (Response, error) {
+	return Response{RequestID: req.ID, NoBid: true, NoBidReason: 2}, nil
+}

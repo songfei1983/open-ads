@@ -12,25 +12,28 @@ import (
 	"time"
 
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/config"
+	"github.com/songfei1983/open-ads/dsp/internal/dsp/decision"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/domain"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/observability"
 )
 
 // Server wraps the standard library http.Server for DSP.
 type Server struct {
-	server  *http.Server
-	logger  *slog.Logger
-	cfg     *config.Config
-	metrics *observability.Metrics
-	isReady atomic.Bool
+	server     *http.Server
+	logger     *slog.Logger
+	cfg        *config.Config
+	metrics    *observability.Metrics
+	decisioner decision.Decisioner
+	isReady    atomic.Bool
 }
 
 // NewServer initializes the HTTP server with router, middlewares, and probes.
 func NewServer(cfg *config.Config, logger *slog.Logger) *Server {
 	s := &Server{
-		logger:  logger,
-		cfg:     cfg,
-		metrics: &observability.Metrics{},
+		logger:     logger,
+		cfg:        cfg,
+		metrics:    &observability.Metrics{},
+		decisioner: decision.NoBidDecisioner{},
 	}
 
 	mux := http.NewServeMux()
@@ -110,10 +113,15 @@ func (s *Server) handleOpenRTBBid(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Standard no-bid response (nbr: 2 = technical/no candidate)
+	result, err := s.decisioner.Decide(r.Context(), decision.Request{ID: req.ID, ImpressionCount: len(req.Imp)})
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"id": req.ID, "nbr": 2})
+		return
+	}
+	// Standard no-bid response (nbr: 2 = technical/no candidate).
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":  req.ID,
-		"nbr": 2,
+		"id":  result.RequestID,
+		"nbr": result.NoBidReason,
 	})
 }
 
