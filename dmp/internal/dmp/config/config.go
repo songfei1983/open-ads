@@ -10,9 +10,10 @@ import (
 
 // Config holds runtime configuration for the DMP service.
 type Config struct {
-	ServiceName string
-	Environment string
-	Port        int
+	ServiceName   string
+	Environment   string
+	ConfigVersion string
+	Port          int
 
 	// ClickHouse configuration
 	ClickHouseAddr     string
@@ -43,6 +44,7 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		ServiceName:        getEnv("SERVICE_NAME", "open-ads-dmp"),
 		Environment:        getEnv("ENVIRONMENT", "development"),
+		ConfigVersion:      getEnv("CONFIG_VERSION", "dev"),
 		Port:               port,
 		ClickHouseAddr:     getEnv("CLICKHOUSE_ADDR", "127.0.0.1:9000"),
 		ClickHouseUser:     getEnv("CLICKHOUSE_USER", "dmp_user"),

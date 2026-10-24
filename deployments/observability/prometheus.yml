@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: open-ads-ssp
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+  - job_name: open-ads-dsp
+    static_configs:
+      - targets: ["host.docker.internal:8081"]
+  - job_name: open-ads-dmp
+    static_configs:
+      - targets: ["host.docker.internal:8082"]

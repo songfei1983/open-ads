@@ -1,0 +1,21 @@
+groups:
+  - name: open-ads-service
+    rules:
+      - alert: OpenAdsServiceNotReady
+        expr: up{job=~"open-ads-(ssp|dsp|dmp)"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Open Ads service is unavailable"
+          description: "The service has not been scrapeable for more than two minutes."
+      - alert: OpenAdsHTTPErrorRateHigh
+        expr: |
+          sum by (job) (rate(open_ads_http_errors_total[5m]))
+            / clamp_min(sum by (job) (rate(open_ads_http_requests_total[5m])), 1) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Open Ads HTTP error rate is high"
+          description: "More than five percent of requests have returned errors."

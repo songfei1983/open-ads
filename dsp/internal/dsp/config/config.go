@@ -10,9 +10,10 @@ import (
 
 // Config holds runtime configuration for the DSP service.
 type Config struct {
-	ServiceName string
-	Environment string
-	Port        int
+	ServiceName   string
+	Environment   string
+	ConfigVersion string
+	Port          int
 
 	// Database configuration (MariaDB dsp_db)
 	DBHost     string
@@ -50,6 +51,7 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		ServiceName:    getEnv("SERVICE_NAME", "open-ads-dsp"),
 		Environment:    getEnv("ENVIRONMENT", "development"),
+		ConfigVersion:  getEnv("CONFIG_VERSION", "dev"),
 		Port:           port,
 		DBHost:         getEnv("DSP_DB_HOST", "127.0.0.1"),
 		DBPort:         dbPort,

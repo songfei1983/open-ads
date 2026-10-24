@@ -91,8 +91,9 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
-		"status":  "ready",
-		"service": s.cfg.ServiceName,
+		"status":         "ready",
+		"service":        s.cfg.ServiceName,
+		"config_version": s.cfg.ConfigVersion,
 	})
 }
 
