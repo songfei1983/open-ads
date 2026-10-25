@@ -8,8 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -97,33 +95,10 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /rtb/v1/loss/{bid_id}", s.handleLossNotice)
 	mux.HandleFunc("POST /rtb/v1/billable/{bid_id}", s.handleBillableNotice)
 	mux.HandleFunc("GET /render/v1/{creative_id}", s.handleRender)
-	// UI prototype routes – serve static files from the prototype directory.
-	// Use StripPrefix so the request path after "/ui/" maps directly to the file.
-	// The underlying directory is determined inside uiHandler (which now merely
-	// resolves the base path). We keep the helper for path resolution but let
-	// the mux handle stripping.
-	baseUIPath := func() string {
-		// Reuse the same logic as uiHandler to locate the prototype directory.
-		if _, err := os.Stat("/src/docs/prototype"); err == nil {
-			return "/src/docs/prototype"
-		}
-		rel, _ := filepath.Abs(filepath.Join("..", "..", "..", "..", "..", "docs", "prototype"))
-		return rel
-	}()
-	// Serve UI assets. When the request is exactly "/ui/" we serve index.html
-	// directly to avoid the default FileServer directory redirect that leads to
-	// a loop (Location: ./). For all other paths we serve the corresponding
-	// file from the prototype directory.
-	mux.Handle("/ui/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Path after the "/ui/" prefix.
-		rel := strings.TrimPrefix(r.URL.Path, "/ui/")
-		if rel == "" {
-			rel = "index.html"
-		}
-		// Construct absolute file path and serve it.
-		filePath := filepath.Join(baseUIPath, rel)
-		http.ServeFile(w, r, filePath)
-	}))
+	// UI prototype routes – the handler resolves the prototype directory
+	// itself, injects the live-reload watcher into index.html and exposes
+	// the /ui/revision fingerprint endpoint the watcher polls.
+	mux.Handle("/ui/", UIHandler())
 	// Redirect the root path to the UI landing page for easier local testing.
 	// Simple root redirect – only triggers on an exact "/" request.
 	// Using a method‑agnostic pattern avoids conflicts with the admin API routes.
