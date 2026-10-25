@@ -207,6 +207,41 @@ func (s *FileStore) Verify(ctx context.Context, tenantID, assetRef, expectedSHA2
 	return s.verifyExisting(ctx, objectPath(tenantID, sha256Hex), sha256Hex, -1)
 }
 
+// Open returns a reader over the stored immutable asset object together with
+// its byte size. The stored object is re-verified against the digest before
+// any bytes are exposed to the caller; altered objects fail closed.
+func (s *FileStore) Open(ctx context.Context, tenantID, sha256Hex string) (io.ReadCloser, int64, error) {
+	if s == nil || s.root == nil {
+		return nil, 0, errors.New("asset store is required")
+	}
+	if domain.ValidateUUID32(tenantID) != nil || tenantID != strings.ToLower(tenantID) || validateSHA256(sha256Hex) != nil {
+		return nil, 0, ErrInvalidAssetRef
+	}
+	select {
+	case s.decodeSlots <- struct{}{}:
+		defer func() { <-s.decodeSlots }()
+	case <-ctx.Done():
+		return nil, 0, ctx.Err()
+	}
+	path := objectPath(tenantID, sha256Hex)
+	if err := s.verifyExisting(ctx, path, sha256Hex, -1); err != nil {
+		return nil, 0, err
+	}
+	file, err := s.root.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, 0, ErrAssetNotFound
+		}
+		return nil, 0, fmt.Errorf("open stored asset: %w", err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, 0, fmt.Errorf("stat stored asset: %w", err)
+	}
+	return file, info.Size(), nil
+}
+
 // ParseAssetRef validates the canonical tenant-scoped asset reference.
 func ParseAssetRef(assetRef string) (tenantID, sha256Hex string, err error) {
 	if len(assetRef) != 100 || !strings.HasPrefix(assetRef, "as:") || assetRef[35] != ':' {

@@ -8,10 +8,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/songfei1983/open-ads/dsp/internal/dsp/assets"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/config"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/decision"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/domain"
@@ -35,6 +38,7 @@ type Server struct {
 	adminHandler    http.Handler
 	reserver        lease.Reserver
 	tokenCodec      *lease.TokenCodec
+	assetStore      *assets.FileStore
 	settlementStore SettlementStore
 	isReady         atomic.Bool
 }
@@ -92,10 +96,42 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /rtb/v1/loss/{bid_id}", s.handleLossNotice)
 	mux.HandleFunc("POST /rtb/v1/loss/{bid_id}", s.handleLossNotice)
 	mux.HandleFunc("POST /rtb/v1/billable/{bid_id}", s.handleBillableNotice)
-	// UI prototype routes – serve static files for the sandbox UI.
-	mux.Handle("GET /ui/", uiHandler())
+	mux.HandleFunc("GET /render/v1/{creative_id}", s.handleRender)
+	// UI prototype routes – serve static files from the prototype directory.
+	// Use StripPrefix so the request path after "/ui/" maps directly to the file.
+	// The underlying directory is determined inside uiHandler (which now merely
+	// resolves the base path). We keep the helper for path resolution but let
+	// the mux handle stripping.
+	baseUIPath := func() string {
+		// Reuse the same logic as uiHandler to locate the prototype directory.
+		if _, err := os.Stat("/src/docs/prototype"); err == nil {
+			return "/src/docs/prototype"
+		}
+		rel, _ := filepath.Abs(filepath.Join("..", "..", "..", "..", "..", "docs", "prototype"))
+		return rel
+	}()
+	// Serve UI assets. When the request is exactly "/ui/" we serve index.html
+	// directly to avoid the default FileServer directory redirect that leads to
+	// a loop (Location: ./). For all other paths we serve the corresponding
+	// file from the prototype directory.
+	mux.Handle("/ui/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Path after the "/ui/" prefix.
+		rel := strings.TrimPrefix(r.URL.Path, "/ui/")
+		if rel == "" {
+			rel = "index.html"
+		}
+		// Construct absolute file path and serve it.
+		filePath := filepath.Join(baseUIPath, rel)
+		http.ServeFile(w, r, filePath)
+	}))
 	// Redirect the root path to the UI landing page for easier local testing.
-	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+	// Simple root redirect – only triggers on an exact "/" request.
+	// Using a method‑agnostic pattern avoids conflicts with the admin API routes.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			// Defer to other handlers for any non‑root path.
+			return
+		}
 		http.Redirect(w, r, "/ui/", http.StatusTemporaryRedirect)
 	})
 	// Simple unauthenticated demo endpoint for UI prototypes to fetch a list of campaigns.
@@ -136,6 +172,11 @@ func (s *Server) SetReserver(reserver lease.Reserver) {
 // SetTokenCodec configures the AEAD codec used to seal/open reservation references.
 func (s *Server) SetTokenCodec(codec *lease.TokenCodec) {
 	s.tokenCodec = codec
+}
+
+// SetAssetStore attaches the immutable asset store used to serve creative renders.
+func (s *Server) SetAssetStore(store *assets.FileStore) {
+	s.assetStore = store
 }
 
 // SetSettlementStore configures the persistent settlement repository.
@@ -287,6 +328,60 @@ func (s *Server) handleOpenRTBBid(w http.ResponseWriter, r *http.Request) {
 		"cur":   currency,
 	}
 	writeJSON(w, http.StatusOK, bidResponse)
+}
+
+// handleRender serves the underlying asset of an active published creative.
+// The identity check always goes through the in-process snapshot and the
+// content-addressed store, never through request-controlled claims.
+func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) {
+	creativeID := r.PathValue("creative_id")
+	if domain.ValidateUUID32(creativeID) != nil || creativeID != strings.ToLower(creativeID) {
+		http.NotFound(w, r)
+		return
+	}
+	manifest, _, err := snapshot.LoadCurrent()
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	creative, ok := manifest.Creatives[creativeID]
+	if !ok || !creative.Active {
+		http.NotFound(w, r)
+		return
+	}
+	asset := creative.AssetMeta
+	if asset.Hash == "" || !strings.Contains(asset.MIMEType, "image/") {
+		http.NotFound(w, r)
+		return
+	}
+	if s.assetStore == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"code": "asset_store_unavailable", "message": "creative rendering is not configured",
+		})
+		return
+	}
+	tenant := strings.ToLower(strings.ReplaceAll(s.cfg.AdminTenantID, "-", ""))
+	if tenant == "" {
+		http.NotFound(w, r)
+		return
+	}
+	reader, size, err := s.assetStore.Open(r.Context(), tenant, strings.ToLower(asset.Hash))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer reader.Close()
+	w.Header().Set("Content-Type", strings.ToLower(asset.MIMEType))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// Content-addressed objects are immutable; allow aggressive caching.
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	if size >= 0 {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
+	}
+	if _, err := io.Copy(w, reader); err != nil {
+		// Headers are already committed; the truncated body signals failure.
+		s.logger.Warn("failed to stream rendered asset", slog.String("creative", creativeID), slog.Any("error", err))
+	}
 }
 
 func (s *Server) handleWinNotice(w http.ResponseWriter, r *http.Request) {
