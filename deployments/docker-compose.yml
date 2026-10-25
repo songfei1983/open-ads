@@ -53,6 +53,92 @@ services:
       timeout: 3s
       retries: 5
 
+  # DSP service – built from the local Dockerfile.
+  dsp:
+    build:
+      context: ../dsp
+      dockerfile: Dockerfile
+      # dev target runs air for hot reload; drop it for production-style builds.
+      target: dev
+    image: open-ads-dsp:dev
+    container_name: open-ads-dsp
+    depends_on:
+      - mariadb
+      - valkey
+    environment:
+      DSP_PORT: "8081"
+      DSP_DB_HOST: "mariadb"
+      DSP_DB_PORT: "3306"
+      DSP_DB_USER: "dsp_user"
+      DSP_DB_PASSWORD: "dsp_pass"
+      DSP_DB_NAME: "dsp_db"
+      DSP_VALKEY_ADDR: "valkey:6379"
+      # Creative serving whitelist: landing host=MIME pairs.
+      DSP_CREATIVE_WHITELIST: "example.com=image/png"
+      DSP_LEASE_TOKEN_KEY: "0f5e1b20a3c94d57b8e6f2a1d7c35e9b4a8d6c2e7f1b9d3a5c8e0f2b4d6a8c1e"
+      # Enable the admin management API and a publishing endpoint.
+      DSP_ADMIN_TENANT_ID: "00000000-0000-0000-0000-000000000001"
+      DSP_ADMIN_TOKEN: "supersecrettoken1234567890abcdEF"
+      DSP_CONFIG_PUBLISHER: "true"
+    ports:
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - ../dsp:/src
+      - ../dsp/.air.toml:/src/.air.toml
+      - ../docs/prototype:/src/docs/prototype
+      # Uploaded creatives must survive container recreation.
+      - dsp_assets:/var/openads
+    command: ["-c", ".air.toml"]
+
+  # SSP service – built from the local Dockerfile.
+  ssp:
+    build:
+      context: ../ssp
+      dockerfile: Dockerfile
+      # dev target runs air for hot reload; drop it for production-style builds.
+      target: dev
+    image: open-ads-ssp:dev
+    container_name: open-ads-ssp
+    depends_on:
+      - mariadb
+      - valkey
+      - dsp
+      - dmp
+    environment:
+      # Use defaults from config loader; override if needed.
+      SSP_PORT: "8080"
+      # Route client auctions to the DSP bidder and consent checks to the DMP.
+      DSP_URL: "http://dsp:8081"
+      DMP_URL: "http://dmp:8082"
+      VALKEY_ADDR: "valkey:6379"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ../ssp:/src
+      - ../ssp/.air.toml:/src/.air.toml
+    command: ["-c", ".air.toml"]
+
+  # DMP service – built from the local Dockerfile.
+  dmp:
+    build:
+      context: ../dmp
+      dockerfile: Dockerfile
+      # dev target runs air for hot reload; drop it for production-style builds.
+      target: dev
+    image: open-ads-dmp:dev
+    container_name: open-ads-dmp
+    depends_on:
+      - clickhouse
+    environment:
+      DMP_PORT: "8082"
+    ports:
+      - "127.0.0.1:8082:8082"
+    volumes:
+      - ../dmp:/src
+      - ../dmp/.air.toml:/src/.air.toml
+    command: ["-c", ".air.toml"]
+
 volumes:
   mariadb_data:
   clickhouse_data:
+  dsp_assets:

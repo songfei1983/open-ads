@@ -15,7 +15,11 @@ help:
 		'Override defaults with PORT=<port> or IMAGE=<image>.'
 
 run:
-	python3 -m http.server "$(PORT)" --bind 127.0.0.1 --directory .
+	@if command -v air > /dev/null; then \
+		air -c .air.toml; \
+	else \
+		python3 -m http.server "$(PORT)" --bind 127.0.0.1 --directory .; \
+	fi
 
 python: run
 

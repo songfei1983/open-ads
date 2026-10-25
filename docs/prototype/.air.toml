@@ -1,0 +1,8 @@
+# Air configuration for prototype static server (Python http.server)
+root = "."
+tmp_dir = "tmp"
+include_ext = ["html", "css", "js"]
+exclude_dir = ["tmp", "node_modules", ".git"]
+log_color = true
+log_time = true
+cmd = "python3 -m http.server $(PORT) --bind 127.0.0.1 --directory ."

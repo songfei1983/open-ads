@@ -18,3 +18,6 @@ bin/
 .idea/
 .vscode/
 *.swp
+
+# Air live-reload build artifacts
+tmp/

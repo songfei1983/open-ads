@@ -142,7 +142,13 @@ function validateEndpoint(value) {
   if (endpoint.username || endpoint.password) {
     throw new Error("API 地址不能包含用户名或密码。");
   }
-  endpoint.pathname = `${endpoint.pathname.replace(/\/+$/, "")}/sdk/v1/ad-requests`;
+  // Ensure the endpoint ends with a single '/sdk/v1/ad-requests' segment.
+  const basePath = endpoint.pathname.replace(/\/+$/, "");
+  if (!basePath.endsWith('/sdk/v1/ad-requests')) {
+    endpoint.pathname = `${basePath}/sdk/v1/ad-requests`;
+  } else {
+    endpoint.pathname = basePath;
+  }
   endpoint.search = "";
   endpoint.hash = "";
   return endpoint;
