@@ -20,13 +20,10 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dsp ./cmd/dsp/main.go
 # Runtime stage
 FROM alpine:3.18
 
-# Install necessary ca-certificates and bash (optional for Air)
+# Install ca-certificates (mysql driver requires a CA pool)
 RUN apk add --no-cache ca-certificates && update-ca-certificates
 
-# Ensure the mount point for prototype UI exists (Docker will mount here).
-RUN mkdir -p /src/docs
-
-# Copy the built binary (optional)
+# Copy the built binary
 COPY --from=builder /dsp /dsp
 
 # Copy Air binary

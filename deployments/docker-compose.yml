@@ -85,10 +85,23 @@ services:
     volumes:
       - ../dsp:/src
       - ../dsp/.air.toml:/src/.air.toml
-      - ../docs/prototype:/src/docs/prototype
       # Uploaded creatives must survive container recreation.
       - dsp_assets:/var/openads
     command: ["-c", ".air.toml"]
+
+  # Console service – the standalone sandbox operations UI.
+  console:
+    build:
+      context: ../console
+      dockerfile: Dockerfile
+    image: open-ads-console:dev
+    container_name: open-ads-console
+    ports:
+      - "127.0.0.1:8083:8083"
+    volumes:
+      # Mounted read-only so UI edits show up in the browser without a
+      # rebuild; the injected revision watcher picks them up in ~1.5s.
+      - ../console/web:/app/web:ro
 
   # SSP service – built from the local Dockerfile.
   ssp:

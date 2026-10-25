@@ -95,27 +95,6 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /rtb/v1/loss/{bid_id}", s.handleLossNotice)
 	mux.HandleFunc("POST /rtb/v1/billable/{bid_id}", s.handleBillableNotice)
 	mux.HandleFunc("GET /render/v1/{creative_id}", s.handleRender)
-	// UI prototype routes – the handler resolves the prototype directory
-	// itself, injects the live-reload watcher into index.html and exposes
-	// the /ui/revision fingerprint endpoint the watcher polls.
-	mux.Handle("/ui/", UIHandler())
-	// Redirect the root path to the UI landing page for easier local testing.
-	// Simple root redirect – only triggers on an exact "/" request.
-	// Using a method‑agnostic pattern avoids conflicts with the admin API routes.
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			// Defer to other handlers for any non‑root path.
-			return
-		}
-		http.Redirect(w, r, "/ui/", http.StatusTemporaryRedirect)
-	})
-	// Simple unauthenticated demo endpoint for UI prototypes to fetch a list of campaigns.
-	// Returns a static JSON payload sufficient for UI rendering during sandbox demos.
-	mux.HandleFunc("GET /ui/api/campaigns", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`[{"id":"cmp_demo","name":"Demo Campaign","advertiser":"Acme","period":"2026-10-01/2026-12-31","status":"active"}]`))
-	})
 	mux.Handle("/admin/v1/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.adminHandler == nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{

@@ -142,25 +142,6 @@ func TestBillableNoticeEndpoint(t *testing.T) {
 	}
 }
 
-func TestUIRoute(t *testing.T) {
-	srv := newTestServer()
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-
-	resp, err := http.Get(ts.URL + "/ui/dsp.html")
-	if err != nil {
-		t.Fatalf("GET /ui/dsp.html error: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 OK for UI route, got %d", resp.StatusCode)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "<title>DSP 控制台") {
-		t.Fatalf("UI page does not contain expected title")
-	}
-}
-
 func TestWinNoticeEndpoint(t *testing.T) {
 	srv := newTestServer()
 	ts := httptest.NewServer(srv.Handler())
