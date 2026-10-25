@@ -25,6 +25,7 @@ import (
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/control"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/decision"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/domain"
+	"github.com/songfei1983/open-ads/dsp/internal/dsp/lease"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/observability"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/snapshot"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/valkey"
@@ -44,7 +45,7 @@ func main() {
 	)
 
 	server := adapterHTTP.NewServer(cfg, logger)
-	server.SetDecisioner(decision.FixtureDecisioner{Whitelist: cfg.CreativeWhitelist})
+	server.SetDecisioner(decision.NoBidDecisioner{})
 	var stopConfigWorker context.CancelFunc
 	tenantID := strings.ToLower(strings.ReplaceAll(cfg.AdminTenantID, "-", ""))
 	var store *control.SQLStore
@@ -68,6 +69,7 @@ func main() {
 			}
 			defer assetStore.Close()
 			store.SetAssetStore(assetStore)
+			server.SetAssetStore(assetStore)
 			server.SetAdminHandler(control.NewHandler(store, cfg.AdminToken))
 		}
 	}
@@ -81,9 +83,48 @@ func main() {
 			os.Exit(1)
 		}
 		valkeyClient := &valkey.Client{Address: cfg.ValkeyAddr, Username: cfg.ValkeyUser, Password: cfg.ValkeyPassword, TLS: cfg.ValkeyTLS, Timeout: 2 * time.Second}
+		valkeyAllocator, err := lease.NewValkeyBudgetAllocator(valkeyClient, tenantID, instanceID)
+		if err != nil {
+			logger.Error("failed to create DSP Valkey budget allocator", slog.Any("error", err))
+			os.Exit(1)
+		}
+		// Cross-instance budget coordination: leases live 30s and renew every
+		// 5s; reservations stay settleable for 11 minutes after a bid.
+		reserver, err := lease.NewValkeyReserver(valkeyAllocator, 30*time.Second, 11*time.Minute, 25*time.Millisecond)
+		if err != nil {
+			logger.Error("failed to create DSP budget reserver", slog.Any("error", err))
+			os.Exit(1)
+		}
+		var codec *lease.TokenCodec
+		if cfg.LeaseTokenKey != "" {
+			key, err := hex.DecodeString(cfg.LeaseTokenKey)
+			if err != nil {
+				logger.Error("failed to decode DSP lease token key", slog.Any("error", err))
+				os.Exit(1)
+			}
+			codec, err = lease.NewTokenCodec(cfg.LeaseKeyVersion, key)
+			if err != nil {
+				logger.Error("failed to create DSP reservation token codec", slog.Any("error", err))
+				os.Exit(1)
+			}
+			server.SetTokenCodec(codec)
+		} else {
+			logger.Warn("DSP reservation tokens are disabled; configure DSP_LEASE_TOKEN_KEY")
+		}
+		server.SetReserver(reserver)
+		server.SetDecisioner(decision.FixtureDecisioner{
+			Whitelist:     cfg.CreativeWhitelist,
+			Reserver:      reserver,
+			TokenCodec:    codec,
+			BaseNoticeURL: cfg.BaseNoticeURL,
+			TenantID:      tenantID,
+		})
 		workerCtx, cancel := context.WithCancel(context.Background())
 		stopConfigWorker = cancel
 		go refreshPublishedConfig(workerCtx, server, store, valkeyClient, tenantID, instanceID, cfg.ConfigPublisher || cfg.AdminToken != "", logger)
+		if store != nil {
+			go superviseBudgetLeases(workerCtx, store, reserver, logger)
+		}
 	} else {
 		logger.Warn("DSP config refresh is disabled; configure DSP_ADMIN_TENANT_ID")
 	}
@@ -246,6 +287,63 @@ func refreshPublishedConfig(workerCtx context.Context, server *adapterHTTP.Serve
 	}
 }
 
+// superviseBudgetLeases installs and renews cross-instance Valkey budget
+// leases for published line items so the bidder decisioner can reserve budget
+// risk before bidding. Amounts come straight from the budget_account
+// projection; renewal only extends expiry so in-flight holds are preserved.
+// Stage-two work: mirror Valkey settlements back into budget_account.
+func superviseBudgetLeases(ctx context.Context, store *control.SQLStore, reserver *lease.ValkeyReserver, logger *slog.Logger) {
+	const leaseTTL = 30 * time.Second
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		budgets, err := store.ListBudgets(queryCtx)
+		cancel()
+		if err != nil {
+			logger.Warn("failed to list DSP budgets for leases", slog.Any("error", err))
+			continue
+		}
+		type budgetRow struct {
+			summary control.BudgetSummary
+			period  string
+		}
+		// Daily rows accumulate per UTC day; only the latest period of each
+		// scope is lease-worthy for the current request clock.
+		latest := make(map[string]budgetRow, len(budgets))
+		for _, summary := range budgets {
+			if summary.BudgetScope != "daily" && summary.BudgetScope != "lifetime" {
+				continue
+			}
+			key := summary.LineItemID + ":" + summary.BudgetScope
+			if prev, ok := latest[key]; !ok || summary.PeriodStart > prev.period {
+				latest[key] = budgetRow{summary: summary, period: summary.PeriodStart}
+			}
+		}
+		now := time.Now().UTC()
+		for key, row := range latest {
+			grant := lease.LeaseGrant{
+				ScopeID:   key,
+				LeaseID:   "lease-" + key,
+				Available: domain.Micros(row.summary.AvailableMicros),
+				Held:      0,
+				ExpiresAt: now.Add(leaseTTL),
+			}
+			grantCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			err := reserver.InstallLease(grantCtx, grant)
+			cancel()
+			if err != nil {
+				logger.Warn("failed to install DSP budget lease", slog.String("scope", key), slog.Any("error", err))
+			}
+		}
+	}
+}
+
 func openDatabase(cfg *config.Config) (*sql.DB, error) {
 	dbConfig := mysql.Config{
 		User:      cfg.DBUser,
@@ -255,6 +353,8 @@ func openDatabase(cfg *config.Config) (*sql.DB, error) {
 		DBName:    cfg.DBName,
 		ParseTime: true,
 		Loc:       time.UTC,
+		// MariaDB uses the native password plugin; ensure the driver uses it.
+		AllowNativePasswords: true,
 	}
 	dsn := dbConfig.FormatDSN()
 	db, err := sql.Open("mysql", dsn)

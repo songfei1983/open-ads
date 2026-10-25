@@ -3,6 +3,7 @@ package decision
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"sort"
 	"strings"
@@ -108,7 +109,8 @@ func (f FixtureDecisioner) Decide(ctx context.Context, req Request) (Response, e
 		resID := "res-" + resUUID
 		res, err := f.Reserver.Reserve(resID, demands, now)
 		if err != nil {
-			// Safe fail-closed no-bid when budget is insufficient or unavailable
+			// Safe fail-closed no-bid when budget is insufficient or unavailable.
+			slog.Warn("DSP budget reservation failed", slog.String("line_item", best.ID), slog.Any("error", err))
 			return Response{
 				RequestID:             req.ID,
 				NoBid:                 true,

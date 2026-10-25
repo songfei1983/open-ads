@@ -241,3 +241,60 @@ func reservationFingerprint(demands []Demand, leaseIDs map[string]string) [32]by
 	}
 	return sha256.Sum256([]byte(fmt.Sprint(parts)))
 }
+
+// RenewLease refreshes an owned lease: both the authoritative expires_ms
+// field (checked by the reserve script) and the key TTL must advance, so a
+// renewed lease does not silently fail budget checks 30s after install.
+func (a *ValkeyBudgetAllocator) RenewLease(ctx context.Context, scopeID, leaseID string, expiresAt time.Time) error {
+	key := a.leaseKey(scopeID, leaseID)
+	if _, err := a.client.Do(ctx, "HSET", key, "expires_ms", strconv.FormatInt(expiresAt.UnixMilli(), 10)); err != nil {
+		return fmt.Errorf("refresh Valkey budget lease field: %w", err)
+	}
+	if _, err := a.client.Do(ctx, "PEXPIREAT", key, strconv.FormatInt(expiresAt.UnixMilli(), 10)); err != nil {
+		return fmt.Errorf("renew Valkey budget lease: %w", err)
+	}
+	return nil
+}
+
+// ScopeAvailable reports the remaining spendable micros of one owned lease.
+// Unknown or expired leases report zero (fail-closed).
+func (a *ValkeyBudgetAllocator) ScopeAvailable(ctx context.Context, scopeID, leaseID string) (domain.Micros, error) {
+	key := a.leaseKey(scopeID, leaseID)
+	result, err := a.client.Do(ctx, "HGET", key, "available_micros")
+	if err != nil {
+		return 0, nil // Treat transport problems as no capacity; callers fail closed.
+	}
+	value, ok := result.(string)
+	if !ok || value == "" {
+		return 0, nil
+	}
+	available, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("decode Valkey lease available micros: %w", err)
+	}
+	return domain.Micros(available), nil
+}
+
+// LoadReservation reads a stored reservation for later settlement.
+func (a *ValkeyBudgetAllocator) LoadReservation(ctx context.Context, id string) (Reservation, error) {
+	key := a.reservationKey(id)
+	result, err := a.client.Do(ctx, "GET", key)
+	if err != nil || result == nil {
+		if result == nil {
+			return Reservation{}, ErrInvalidSettlement
+		}
+		return Reservation{}, fmt.Errorf("read Valkey reservation: %w", err)
+	}
+	serialized, ok := result.(string)
+	if !ok {
+		return Reservation{}, fmt.Errorf("unexpected Valkey reservation response %T", result)
+	}
+	var stored struct {
+		Fingerprint string      `json:"fingerprint"`
+		Reservation Reservation `json:"reservation"`
+	}
+	if err := json.Unmarshal([]byte(serialized), &stored); err != nil {
+		return Reservation{}, fmt.Errorf("decode Valkey reservation: %w", err)
+	}
+	return stored.Reservation, nil
+}

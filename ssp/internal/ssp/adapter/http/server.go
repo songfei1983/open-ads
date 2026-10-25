@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -40,7 +41,8 @@ func NewServer(cfg *config.Config, logger *slog.Logger) *Server {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
 
-	handler := s.requestIDMiddleware(s.requestDeadlineMiddleware(s.loggingMiddleware(s.recoveryMiddleware(mux))))
+	// Insert CORS middleware before other middlewares so OPTIONS requests are handled early.
+	handler := s.requestIDMiddleware(s.requestDeadlineMiddleware(s.corsMiddleware(s.loggingMiddleware(s.recoveryMiddleware(mux)))))
 
 	s.server = &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
@@ -71,8 +73,20 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.HandleFunc("GET /metrics", s.metrics.Handler)
-	mux.HandleFunc("POST /sdk/v1/ad-requests", s.handleAdRequests)
-	mux.HandleFunc("POST /openrtb2/auction", s.handleOpenRTBAuction)
+	// Register the ad-requests endpoint. The handler internally
+	// distinguishes POST and OPTIONS (CORS pre‑flight) based on the
+	// request method, so we register a single plain‑path handler.
+	mux.HandleFunc("/sdk/v1/ad-requests", s.handleAdRequests)
+	// Register the OpenRTB auction endpoint.
+	mux.HandleFunc("/openrtb2/auction", s.handleOpenRTBAuction)
+}
+
+// handleOptions responds to CORS preflight requests.
+func (s *Server) handleOptions(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-ID")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -98,8 +112,19 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAdRequests(w http.ResponseWriter, r *http.Request) {
+	// Pre‑flight handling for CORS
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-ID")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	reqID := observability.RequestIDFromContext(r.Context())
 	w.Header().Set("Cache-Control", "no-store")
+	// Allow CORS for ad request responses (actual POST)
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	var req adRequest
 	if err := decodeJSON(w, r, &req); err != nil {
@@ -142,6 +167,21 @@ func (s *Server) handleAdRequests(w http.ResponseWriter, r *http.Request) {
 			"event_token": resp.EventToken,
 			"expires_at":  time.Now().UTC().Add(time.Minute).Format(time.RFC3339),
 		},
+	})
+}
+
+// corsMiddleware adds generic CORS headers and handles pre‑flight OPTIONS requests.
+func (s *Server) corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Allow any origin (sandbox);
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-ID")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -191,7 +231,8 @@ type bidImp struct {
 	} `json:"banner"`
 }
 type bidSite struct {
-	Page string `json:"page"`
+	Domain string `json:"domain,omitempty"`
+	Page   string `json:"page"`
 }
 type bidUser struct {
 	ID string `json:"id"`
@@ -205,6 +246,10 @@ type bidResponse struct {
 			AdID  string  `json:"adid"`
 			Adm   string  `json:"adm"`
 			CID   string  `json:"cid"`
+			Crid  string  `json:"crid"`
+			Ext   struct {
+				ReservationRef string `json:"reservation_ref"`
+			} `json:"ext"`
 		} `json:"bid"`
 	} `json:"seatbid"`
 }
@@ -216,7 +261,13 @@ func (s *Server) resolveAudience(ctx context.Context, reqID string, req adReques
 }
 
 func (s *Server) requestBid(ctx context.Context, reqID string, req adRequest) (*selectedBid, error) {
-	payload := bidRequest{ID: reqID, AT: 1, TMax: int(s.cfg.AuctionTimeout / time.Millisecond), Cur: []string{"USD"}, Site: bidSite{Page: req.Page.Origin + req.Page.Path}, Imp: []bidImp{{ID: "1", TagID: req.PlacementID}}}
+	page := req.Page.Origin + req.Page.Path
+	// OpenRTB site.domain carries the publisher host for contextual targeting.
+	var domain string
+	if parsed, err := url.Parse(req.Page.Origin); err == nil && parsed.Hostname() != "" {
+		domain = strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	}
+	payload := bidRequest{ID: reqID, AT: 1, TMax: int(s.cfg.AuctionTimeout / time.Millisecond), Cur: []string{"USD"}, Site: bidSite{Domain: domain, Page: page}, Imp: []bidImp{{ID: "1", TagID: req.PlacementID}}}
 	payload.Imp[0].Banner.W, payload.Imp[0].Banner.H = req.Slot.Width, req.Slot.Height
 	if req.Consent.Value != "" {
 		payload.User = &bidUser{ID: req.Consent.Value}
@@ -231,7 +282,18 @@ func (s *Server) requestBid(ctx context.Context, reqID string, req adRequest) (*
 	for _, seat := range response.SeatBid {
 		for _, bid := range seat.Bid {
 			if bid.ImpID == "1" && bid.Price > 0 && bid.Adm != "" {
-				return &selectedBid{CreativeID: bid.CID, RenderURL: extractIframeURL(bid.Adm), EventToken: bid.AdID}, nil
+				creative := bid.Crid
+				if creative == "" {
+					// Fall back for bidders predating the crid field.
+					creative = bid.CID
+				}
+				// LLD 630: the event token must be the AEAD-sealed reservation
+				// reference, never a plaintext resource identifier.
+				eventToken := bid.Ext.ReservationRef
+				if eventToken == "" {
+					eventToken = bid.AdID
+				}
+				return &selectedBid{CreativeID: creative, RenderURL: extractIframeURL(bid.Adm), EventToken: eventToken}, nil
 			}
 		}
 	}
