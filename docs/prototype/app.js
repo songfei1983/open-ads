@@ -197,9 +197,11 @@ async function requestLive(payload) {
       } catch {
         throw Object.assign(new Error("Sandbox API 的广告响应缺少有效的 render_url。"), { result });
       }
-      if (renderURL.protocol !== "https:" || renderURL.origin !== endpoint.origin ||
+      const isLoopback = (url) =>
+        (url.hostname === "127.0.0.1" || url.hostname === "localhost") && url.protocol === "http:";
+      if (!(renderURL.protocol === "https:" || isLoopback(renderURL)) || renderURL.origin !== endpoint.origin ||
           renderURL.username || renderURL.password) {
-        throw Object.assign(new Error("广告 render_url 必须使用配置的 SSP 地址同源 HTTPS，且不能包含用户名或密码。"), { result });
+        throw Object.assign(new Error("广告 render_url 必须使用配置的 SSP 地址同源 HTTPS（localhost 可 HTTP），且不能包含用户名或密码。"), { result });
       }
     }
     return result;

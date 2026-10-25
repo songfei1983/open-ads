@@ -38,13 +38,20 @@ func TestAdRequestsOrchestratesDMPAndDSP(t *testing.T) {
 	defer dmp.Close()
 
 	dspCalled := false
+	dspAssetServed := ""
 	dsp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		dspCalled = true
-		if r.URL.Path != "/openrtb2/bid" {
-			t.Fatalf("unexpected DSP path: %s", r.URL.Path)
+		switch r.URL.Path {
+		case "/openrtb2/bid":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"018f7a3b2c9d7e1fa3b4c5d6e7f89070","seatbid":[{"bid":[{"impid":"1","price":2.5,"adid":"ad-1","cid":"creative-1","adm":"<iframe src=\"https://render.test/asset\"></iframe>"}]}]}`))
+		case "/render/v1/creative-1":
+			dspAssetServed = "creative-1-asset"
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write([]byte(dspAssetServed))
+		default:
+			t.Errorf("unexpected DSP path: %s", r.URL.Path)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"018f7a3b2c9d7e1fa3b4c5d6e7f89070","seatbid":[{"bid":[{"impid":"1","price":2.5,"adid":"ad-1","cid":"creative-1","adm":"<iframe src=\"https://render.test/asset\"></iframe>"}]}]}`))
 	}))
 	defer dsp.Close()
 
@@ -86,8 +93,27 @@ func TestAdRequestsOrchestratesDMPAndDSP(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if !dmpCalled || !dspCalled || body.Status != "filled" || body.Ad.CreativeID != "creative-1" || body.Ad.RenderURL != "https://render.test/asset" {
+	if !dmpCalled || !dspCalled || body.Status != "filled" || body.Ad.CreativeID != "creative-1" {
 		t.Fatalf("unexpected orchestration result: dmp=%v dsp=%v body=%+v", dmpCalled, dspCalled, body)
+	}
+	// The render URL must be same-origin with the SSP test server; the DSP
+	// URL is never exposed to pages.
+	if !strings.HasPrefix(body.Ad.RenderURL, ts.URL+"/sdk/v1/render/creative-1") {
+		t.Fatalf("render_url not same-origin: %s", body.Ad.RenderURL)
+	}
+
+	// The proxy must stream the underlying asset from the DSP.
+	renderResp, err := http.Get(body.Ad.RenderURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer renderResp.Body.Close()
+	if renderResp.StatusCode != http.StatusOK {
+		t.Fatalf("render proxy: expected 200, got %d", renderResp.StatusCode)
+	}
+	wroteDSPAsset := strings.Contains(dspAssetServed, "creative-1-asset")
+	if !wroteDSPAsset {
+		t.Fatalf("render proxy did not reach the DSP asset")
 	}
 }
 

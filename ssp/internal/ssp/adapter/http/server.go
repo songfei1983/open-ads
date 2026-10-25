@@ -77,8 +77,50 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// distinguishes POST and OPTIONS (CORS pre‑flight) based on the
 	// request method, so we register a single plain‑path handler.
 	mux.HandleFunc("/sdk/v1/ad-requests", s.handleAdRequests)
+	// Same-origin creative render proxy: the page must never reference a
+	// cross-origin DSP host for impressions; the SSP streams the bytes.
+	mux.HandleFunc("GET /sdk/v1/render/{creative_id}", s.handleRenderProxy)
 	// Register the OpenRTB auction endpoint.
 	mux.HandleFunc("/openrtb2/auction", s.handleOpenRTBAuction)
+}
+
+// handleRenderProxy streams the DSP-rendered creative through the SSP origin
+// so that pages only reference same-origin render URLs. The DSP response
+// headers (content type, caching) are carried over; failures fail closed.
+func (s *Server) handleRenderProxy(w http.ResponseWriter, r *http.Request) {
+	creativeID := r.PathValue("creative_id")
+	if creativeID == "" || s.cfg.DSPURL == "" {
+		http.NotFound(w, r)
+		return
+	}
+	req, err := http.NewRequestWithContext(r.Context(), "GET", s.cfg.DSPURL+"/render/v1/"+creativeID, nil)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		w.WriteHeader(resp.StatusCode)
+		return
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		w.Header().Set("Content-Length", cl)
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "" {
+		w.Header().Set("Cache-Control", cc)
+	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		s.logger.Warn("render proxy stream failed", slog.String("creative_id", creativeID), slog.Any("error", err))
+	}
 }
 
 // handleOptions responds to CORS preflight requests.
@@ -156,13 +198,21 @@ func (s *Server) handleAdRequests(w http.ResponseWriter, r *http.Request) {
 		writeNoFill(w, reqID)
 		return
 	}
+	// The render URL must be same-origin with the SSP endpoint: pages may
+	// only reference the SSP host for impressions (the prototype enforces
+	// this), so the creative is streamed through the render proxy below.
+	renderOrigin := requestOrigin(r)
+	if renderOrigin == "" {
+		renderOrigin = strings.TrimSuffix(s.cfg.DSPURL, "/")
+	}
+	renderURL := renderOrigin + "/sdk/v1/render/" + resp.CreativeID
 	writeJSON(w, http.StatusOK, map[string]any{
 		"request_id": reqID,
 		"status":     "filled",
 		"ad": map[string]any{
 			"creative_id": resp.CreativeID,
 			"format":      "image",
-			"render_url":  resp.RenderURL,
+			"render_url":  renderURL,
 			"click_url":   resp.ClickURL,
 			"event_token": resp.EventToken,
 			"expires_at":  time.Now().UTC().Add(time.Minute).Format(time.RFC3339),
@@ -345,6 +395,20 @@ func extractIframeURL(adm string) string {
 
 func writeNoFill(w http.ResponseWriter, reqID string) {
 	writeJSON(w, http.StatusOK, map[string]any{"request_id": reqID, "status": "no_fill"})
+}
+
+// requestOrigin derives the externally visible origin of the incoming request
+// so the served render URL is same-origin with the caller. TLS termination in
+// front of the SSP must set X-Forwarded-Proto for HTTPS to be preserved.
+func requestOrigin(r *http.Request) string {
+	if r.Host == "" {
+		return ""
+	}
+	scheme := "http"
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	}
+	return scheme + "://" + r.Host
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
