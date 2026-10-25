@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
@@ -37,6 +38,11 @@ type Config struct {
 	ValkeyTLS         bool
 	CreativeWhitelist []domain.WhiteListEntry
 
+	// Budget reservation notice and token configuration.
+	BaseNoticeURL   string
+	LeaseKeyVersion string
+	LeaseTokenKey   string
+
 	// Bidder timeouts
 	BidTimeout time.Duration
 
@@ -70,6 +76,18 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	// DSP_VALKEY_ADDR is the canonical key; VALKEY_ADDR is a legacy fallback.
+	valkeyAddr := os.Getenv("DSP_VALKEY_ADDR")
+	if strings.TrimSpace(valkeyAddr) == "" {
+		valkeyAddr = getEnv("VALKEY_ADDR", "127.0.0.1:6379")
+	}
+	leaseKeyVersion := getEnv("DSP_LEASE_KEY_VERSION", "v1")
+	leaseTokenKey := strings.ToLower(strings.TrimSpace(os.Getenv("DSP_LEASE_TOKEN_KEY")))
+	if leaseTokenKey != "" {
+		if _, err := hex.DecodeString(leaseTokenKey); err != nil || len(leaseTokenKey) != 64 {
+			return nil, fmt.Errorf("DSP_LEASE_TOKEN_KEY must be 64 hex characters (32 bytes)")
+		}
+	}
 	cfg := &Config{
 		ServiceName:       getEnv("SERVICE_NAME", "open-ads-dsp"),
 		Environment:       getEnv("ENVIRONMENT", "development"),
@@ -84,11 +102,14 @@ func Load() (*Config, error) {
 		AdminToken:        getEnv("DSP_ADMIN_TOKEN", ""),
 		ConfigPublisher:   configPublisher,
 		AssetStoreRoot:    getEnv("OPENADS_ASSET_STORE_ROOT", "/var/openads/assets/dsp-write"),
-		ValkeyAddr:        getEnv("VALKEY_ADDR", "127.0.0.1:6379"),
+		ValkeyAddr:        valkeyAddr,
 		ValkeyUser:        getEnv("DSP_VALKEY_USER", "dsp"),
 		ValkeyPassword:    getEnv("DSP_VALKEY_PASSWORD", "dsp_valkey_password"),
 		ValkeyTLS:         valkeyTLS,
 		CreativeWhitelist: creativeWhitelist,
+		BaseNoticeURL:     strings.TrimRight(getEnv("DSP_BASE_NOTICE_URL", fmt.Sprintf("http://127.0.0.1:%d", port)), "/"),
+		LeaseKeyVersion:   leaseKeyVersion,
+		LeaseTokenKey:     leaseTokenKey,
 		BidTimeout:        time.Duration(bidTimeout) * time.Millisecond,
 		LogLevel:          getEnv("LOG_LEVEL", "INFO"),
 	}

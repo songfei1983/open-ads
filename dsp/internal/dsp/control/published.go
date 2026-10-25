@@ -20,6 +20,10 @@ type queryContext interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
+// ErrNoPublishedConfig reports that the tenant projection is empty, meaning
+// no resource has been published yet and there is no manifest to build.
+var ErrNoPublishedConfig = errors.New("no published DSP configuration")
+
 // LoadPublishedManifest reads the single current projection and never reads draft tables.
 func (s *SQLStore) LoadPublishedManifest(ctx context.Context) (*snapshot.Manifest, error) {
 	return s.loadPublishedManifest(ctx, s.db)

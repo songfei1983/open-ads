@@ -26,19 +26,23 @@ func NewHandler(store *SQLStore, bearerSecret string) http.Handler {
 	mux.HandleFunc("GET /admin/v1/campaigns", h.listCampaigns)
 	mux.HandleFunc("POST /admin/v1/campaigns", h.createCampaign)
 	mux.HandleFunc("PUT /admin/v1/campaigns/{id}", h.updateCampaign)
-	mux.HandleFunc("POST /admin/v1/campaigns/{id}:publish", h.publishCampaign)
+	// Publish a campaign – use a valid URL pattern.
+	mux.HandleFunc("POST /admin/v1/campaigns/{id}/publish", h.publishCampaign)
 	mux.HandleFunc("GET /admin/v1/line-items", h.listLineItems)
 	mux.HandleFunc("POST /admin/v1/line-items", h.createLineItem)
 	mux.HandleFunc("PUT /admin/v1/line-items/{id}", h.updateLineItem)
-	mux.HandleFunc("POST /admin/v1/line-items/{id}:publish", h.publishLineItem)
+	// Publish a line‑item.
+	mux.HandleFunc("POST /admin/v1/line-items/{id}/publish", h.publishLineItem)
 	mux.HandleFunc("GET /admin/v1/creatives", h.listCreatives)
 	mux.HandleFunc("POST /admin/v1/creatives", h.createCreative)
 	mux.HandleFunc("PUT /admin/v1/creatives/{id}", h.updateCreative)
-	mux.HandleFunc("POST /admin/v1/creatives/{id}:publish", h.publishCreative)
+	// Publish a creative.
+	mux.HandleFunc("POST /admin/v1/creatives/{id}/publish", h.publishCreative)
 	mux.HandleFunc("POST /admin/v1/creative-assets", h.uploadAsset)
 	mux.HandleFunc("GET /admin/v1/budgets", h.listBudgets)
 	mux.HandleFunc("GET /admin/v1/quarantine", h.listQuarantine)
-	mux.HandleFunc("POST /admin/v1/quarantine/{id}:resolve", h.resolveQuarantine)
+	// Resolve a quarantine entry – use a valid URL pattern.
+	mux.HandleFunc("POST /admin/v1/quarantine/{id}/resolve", h.resolveQuarantine)
 	mux.HandleFunc("GET /admin/v1/status", h.getStatus)
 	return h.authenticate(mux)
 }

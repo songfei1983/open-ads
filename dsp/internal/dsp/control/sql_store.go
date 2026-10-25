@@ -754,25 +754,22 @@ func validatePublish(ctx context.Context, tx *sql.Tx, tenantID []byte, resourceT
 		if err != nil {
 			return fmt.Errorf("read line item creatives: %w", err)
 		}
-		count := 0
+		// Drain the creative rows before issuing further queries on the same
+		// transaction: MariaDB connections cannot serve a new result set while
+		// an open one is being iterated ("driver: bad connection").
+		type linkedCreative struct {
+			id      []byte
+			status  string
+			version uint64
+		}
+		var linked []linkedCreative
 		for rows.Next() {
-			var creativeID []byte
-			var status string
-			var version uint64
-			if err := rows.Scan(&creativeID, &status, &version); err != nil {
+			var creative linkedCreative
+			if err := rows.Scan(&creative.id, &creative.status, &creative.version); err != nil {
 				rows.Close()
 				return fmt.Errorf("scan line item creative: %w", err)
 			}
-			published, err := isPublished(ctx, tx, tenantID, "creative", creativeID, version)
-			if err != nil {
-				rows.Close()
-				return err
-			}
-			if item.Status == "active" && (status != "active" || !published) {
-				rows.Close()
-				return invalid("creative_ids", "active line items must reference active published creatives")
-			}
-			count++
+			linked = append(linked, creative)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
@@ -781,7 +778,16 @@ func validatePublish(ctx context.Context, tx *sql.Tx, tenantID []byte, resourceT
 		if err := rows.Close(); err != nil {
 			return fmt.Errorf("close line item creatives: %w", err)
 		}
-		if count == 0 {
+		for _, creative := range linked {
+			published, err := isPublished(ctx, tx, tenantID, "creative", creative.id, creative.version)
+			if err != nil {
+				return err
+			}
+			if item.Status == "active" && (creative.status != "active" || !published) {
+				return invalid("creative_ids", "active line items must reference active published creatives")
+			}
+		}
+		if len(linked) == 0 {
 			return invalid("creative_ids", "at least one creative is required")
 		}
 		todayMidnight := time.Now().UTC().Truncate(24 * time.Hour)
