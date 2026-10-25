@@ -285,3 +285,35 @@ func validateID(field, value string) error {
 func invalid(field, reason string) error {
 	return fmt.Errorf("%w: %s %s", ErrInvalidConfiguration, field, reason)
 }
+
+// BudgetSummary represents a summarized budget account record.
+type BudgetSummary struct {
+	LineItemID        string `json:"line_item_id"`
+	BudgetScope       string `json:"budget_scope"`
+	PeriodStart       string `json:"period_start"`
+	Currency          string `json:"currency"`
+	BudgetLimitMicros int64  `json:"budget_limit_micros"`
+	SpentMicros       int64  `json:"spent_micros"`
+	LeasedMicros      int64  `json:"leased_micros"`
+	AvailableMicros   int64  `json:"available_micros"`
+	Status            string `json:"status"`
+}
+
+// QuarantineRecord represents an isolated notice record.
+type QuarantineRecord struct {
+	QuarantineID   string `json:"quarantine_id"`
+	ReservationID  string `json:"reservation_id"`
+	SourceEventKey string `json:"source_event_key"`
+	Outcome        string `json:"outcome"`
+	ReasonCode     string `json:"reason_code"`
+	Status         string `json:"status"`
+	ReceivedAt     string `json:"received_at"`
+}
+
+// ConfigStatus represents the current publication status and manifest version.
+type ConfigStatus struct {
+	TenantID           string `json:"tenant_id"`
+	ManifestVersion    uint64 `json:"manifest_version"`
+	OutboxPendingCount int    `json:"outbox_pending_count"`
+	LoadedSnapshot     string `json:"loaded_snapshot_version"`
+}

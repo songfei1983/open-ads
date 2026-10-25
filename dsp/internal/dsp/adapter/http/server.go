@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,19 +15,28 @@ import (
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/config"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/decision"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/domain"
+	"github.com/songfei1983/open-ads/dsp/internal/dsp/lease"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/observability"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/snapshot"
 )
 
+// SettlementStore abstracts the persistent settlement repository.
+type SettlementStore interface {
+	SettleReservation(ctx context.Context, params lease.SettlementParams) error
+}
+
 // Server wraps the standard library http.Server for DSP.
 type Server struct {
-	server       *http.Server
-	logger       *slog.Logger
-	cfg          *config.Config
-	metrics      *observability.Metrics
-	decisioner   decision.Decisioner
-	adminHandler http.Handler
-	isReady      atomic.Bool
+	server          *http.Server
+	logger          *slog.Logger
+	cfg             *config.Config
+	metrics         *observability.Metrics
+	decisioner      decision.Decisioner
+	adminHandler    http.Handler
+	reserver        lease.Reserver
+	tokenCodec      *lease.TokenCodec
+	settlementStore SettlementStore
+	isReady         atomic.Bool
 }
 
 // NewServer initializes the HTTP server with router, middlewares, and probes.
@@ -67,14 +77,34 @@ func (s *Server) Handler() http.Handler {
 	return s.server.Handler
 }
 
+// Metrics returns the observability metrics instance.
+func (s *Server) Metrics() *observability.Metrics {
+	return s.metrics
+}
+
 func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.HandleFunc("GET /metrics", s.metrics.Handler)
 	mux.HandleFunc("POST /openrtb2/bid", s.handleOpenRTBBid)
+	mux.HandleFunc("GET /rtb/v1/win/{bid_id}", s.handleWinNotice)
 	mux.HandleFunc("POST /rtb/v1/win/{bid_id}", s.handleWinNotice)
+	mux.HandleFunc("GET /rtb/v1/loss/{bid_id}", s.handleLossNotice)
 	mux.HandleFunc("POST /rtb/v1/loss/{bid_id}", s.handleLossNotice)
 	mux.HandleFunc("POST /rtb/v1/billable/{bid_id}", s.handleBillableNotice)
+	// UI prototype routes – serve static files for the sandbox UI.
+	mux.Handle("GET /ui/", uiHandler())
+	// Redirect the root path to the UI landing page for easier local testing.
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/ui/", http.StatusTemporaryRedirect)
+	})
+	// Simple unauthenticated demo endpoint for UI prototypes to fetch a list of campaigns.
+	// Returns a static JSON payload sufficient for UI rendering during sandbox demos.
+	mux.HandleFunc("GET /ui/api/campaigns", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`[{"id":"cmp_demo","name":"Demo Campaign","advertiser":"Acme","period":"2026-10-01/2026-12-31","status":"active"}]`))
+	})
 	mux.Handle("/admin/v1/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.adminHandler == nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
@@ -96,6 +126,21 @@ func (s *Server) SetDecisioner(decisioner decision.Decisioner) {
 	if decisioner != nil {
 		s.decisioner = decisioner
 	}
+}
+
+// SetReserver configures the budget reserver used to settle reservations.
+func (s *Server) SetReserver(reserver lease.Reserver) {
+	s.reserver = reserver
+}
+
+// SetTokenCodec configures the AEAD codec used to seal/open reservation references.
+func (s *Server) SetTokenCodec(codec *lease.TokenCodec) {
+	s.tokenCodec = codec
+}
+
+// SetSettlementStore configures the persistent settlement repository.
+func (s *Server) SetSettlementStore(store SettlementStore) {
+	s.settlementStore = store
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -180,27 +225,260 @@ func (s *Server) handleOpenRTBBid(w http.ResponseWriter, r *http.Request) {
 		decisionErr = context.DeadlineExceeded
 	}
 	s.metrics.ObserveDecision(result.Candidate, err != nil || result.NoBid, decisionErr, time.Since(decisionStarted))
-	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"id": req.ID, "nbr": 2})
+	if err != nil || result.NoBid {
+		nbr := result.NoBidReason
+		if nbr == 0 {
+			nbr = 2
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":  req.ID,
+			"nbr": nbr,
+		})
 		return
 	}
-	// Standard no-bid response (nbr: 2 = technical/no candidate).
-	writeJSON(w, http.StatusOK, map[string]any{
-		"id":  result.RequestID,
-		"nbr": result.NoBidReason,
-	})
+
+	impID := "1"
+	if len(req.Imp) > 0 {
+		var impHeader struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(req.Imp[0], &impHeader); err == nil && impHeader.ID != "" {
+			impID = impHeader.ID
+		}
+	} else if result.ImpressionID != "" {
+		impID = result.ImpressionID
+	}
+	currency := result.Currency
+	if currency == "" {
+		currency = "USD"
+	}
+	ext := map[string]any{
+		"reservation_id": result.ReservationID,
+	}
+	if result.ReservationToken != "" {
+		ext["reservation_ref"] = result.ReservationToken
+	}
+
+	bidResponse := map[string]any{
+		"id": req.ID,
+		"seatbid": []map[string]any{
+			{
+				"bid": []map[string]any{
+					{
+						"id":    result.BidID,
+						"impid": impID,
+						"price": result.Price,
+						"adid":  result.CandidateLineItemID,
+						"nurl":  result.WinNoticeURL,
+						"burl":  result.BillableNoticeURL,
+						"lurl":  result.LossNoticeURL,
+						"adm":   result.AdMarkup,
+						"cid":   result.CampaignID,
+						"crid":  result.CreativeID,
+						"w":     result.Width,
+						"h":     result.Height,
+						"ext":   ext,
+					},
+				},
+				"seat": "dsp-seat-acme",
+			},
+		},
+		"bidid": result.BidID,
+		"cur":   currency,
+	}
+	writeJSON(w, http.StatusOK, bidResponse)
 }
 
 func (s *Server) handleWinNotice(w http.ResponseWriter, r *http.Request) {
+	// Win notice (nurl) records win status without altering held budget or spend
 	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) handleLossNotice(w http.ResponseWriter, r *http.Request) {
+	bidID := r.PathValue("bid_id")
+	refToken := r.URL.Query().Get("ref")
+	if r.Body != nil {
+		var reqBody struct {
+			AuctionID      string `json:"auction_id"`
+			BidID          string `json:"bid_id"`
+			LossReason     int    `json:"loss_reason"`
+			LossReasonText string `json:"loss_reason_text"`
+			ReservationRef string `json:"reservation_ref"`
+		}
+		_ = json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&reqBody)
+		if reqBody.ReservationRef != "" {
+			refToken = reqBody.ReservationRef
+		}
+		if reqBody.BidID != "" {
+			bidID = reqBody.BidID
+		}
+	}
+
+	var claims lease.ReservationClaims
+	var err error
+	if s.tokenCodec != nil && refToken != "" {
+		claims, err = s.tokenCodec.Open(refToken, time.Now().UTC())
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"code": "invalid_token", "message": "invalid or expired reservation token",
+			})
+			return
+		}
+	}
+
+	resID := claims.ReservationID
+	if resID == "" {
+		resID = bidID
+	}
+
+	if s.settlementStore != nil && claims.ReservationID != "" {
+		params := lease.SettlementParams{
+			TenantID:       claims.TenantID,
+			ReservationID:  claims.ReservationID,
+			Outcome:        lease.OutcomeLoss,
+			ActualAmount:   0,
+			Currency:       claims.Currency,
+			SourceEventKey: "loss:" + bidID,
+			Demands:        claims.Demands,
+			LeaseIDs:       claims.LeaseIDs,
+			BidID:          bidID,
+			AuctionID:      claims.AuctionID,
+			ImpID:          claims.ImpressionID,
+		}
+		if err := s.settlementStore.SettleReservation(r.Context(), params); err != nil {
+			if errors.Is(err, lease.ErrReservationConflict) {
+				writeJSON(w, http.StatusConflict, map[string]string{
+					"code": "reservation_conflict", "message": err.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"code": "settlement_failed", "message": err.Error(),
+			})
+			return
+		}
+	}
+	if s.reserver != nil && resID != "" {
+		_, _ = s.reserver.Settle(resID, lease.OutcomeLoss, 0, time.Now().UTC())
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) handleBillableNotice(w http.ResponseWriter, r *http.Request) {
-	// Billable notice returns 204 No Content upon successful ledger transaction
+	var req struct {
+		EventID        string `json:"event_id"`
+		SourceEventKey string `json:"source_event_key"`
+		AuctionID      string `json:"auction_id"`
+		BidID          string `json:"bid_id"`
+		ImpID          string `json:"imp_id"`
+		ReservationRef string `json:"reservation_ref"`
+		AmountMicros   int64  `json:"amount_micros"`
+		Currency       string `json:"currency"`
+		OccurredAt     string `json:"occurred_at"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.EventID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"code": "invalid_request", "message": "invalid billable notice body or missing event_id",
+		})
+		return
+	}
+	bidID := r.PathValue("bid_id")
+	if bidID == "" {
+		bidID = req.BidID
+	}
+
+	var claims lease.ReservationClaims
+	if s.tokenCodec != nil && req.ReservationRef != "" {
+		var err error
+		claims, err = s.tokenCodec.Open(req.ReservationRef, time.Now().UTC())
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"code": "invalid_token", "message": "invalid or expired reservation token",
+			})
+			return
+		}
+		if claims.BidID != "" && bidID != "" && claims.BidID != bidID {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"code": "invalid_request", "message": "bid_id does not match reservation token",
+			})
+			return
+		}
+		if req.AmountMicros > claims.ReservedMicros {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"code": "invalid_amount", "message": "billable amount exceeds reserved maximum risk",
+			})
+			return
+		}
+		if req.Currency != "" && claims.Currency != "" && req.Currency != claims.Currency {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"code": "currency_mismatch", "message": "currency does not match reservation",
+			})
+			return
+		}
+	}
+
+	resID := claims.ReservationID
+	if resID == "" {
+		resID = req.ReservationRef
+		if resID == "" {
+			resID = bidID
+		}
+	}
+
+	occurredAt := time.Now().UTC()
+	if req.OccurredAt != "" {
+		if parsed, err := time.Parse(time.RFC3339Nano, req.OccurredAt); err == nil {
+			occurredAt = parsed
+		} else if parsed, err := time.Parse(time.RFC3339, req.OccurredAt); err == nil {
+			occurredAt = parsed
+		}
+	}
+	sourceKey := req.SourceEventKey
+	if sourceKey == "" {
+		sourceKey = req.EventID
+	}
+
+	if s.settlementStore != nil && claims.ReservationID != "" {
+		params := lease.SettlementParams{
+			TenantID:       claims.TenantID,
+			ReservationID:  claims.ReservationID,
+			Outcome:        lease.OutcomeBillable,
+			ActualAmount:   domain.Micros(req.AmountMicros),
+			Currency:       req.Currency,
+			SourceEventKey: sourceKey,
+			Demands:        claims.Demands,
+			LeaseIDs:       claims.LeaseIDs,
+			EventID:        req.EventID,
+			AuctionID:      req.AuctionID,
+			BidID:          bidID,
+			ImpID:          req.ImpID,
+			OccurredAt:     occurredAt,
+		}
+		if err := s.settlementStore.SettleReservation(r.Context(), params); err != nil {
+			if errors.Is(err, lease.ErrReservationConflict) {
+				writeJSON(w, http.StatusConflict, map[string]string{
+					"code": "reservation_conflict", "message": err.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"code": "settlement_failed", "message": err.Error(),
+			})
+			return
+		}
+	}
+
+	if s.reserver != nil && resID != "" {
+		_, err := s.reserver.Settle(resID, lease.OutcomeBillable, domain.Micros(req.AmountMicros), time.Now().UTC())
+		if err != nil && errors.Is(err, lease.ErrReservationConflict) {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"code": "reservation_conflict", "message": err.Error(),
+			})
+			return
+		}
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -12,6 +12,7 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/assets"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/domain"
+	"github.com/songfei1983/open-ads/dsp/internal/dsp/snapshot"
 )
 
 // NewHandler creates the tenant-scoped management API. Requests require the
@@ -35,6 +36,10 @@ func NewHandler(store *SQLStore, bearerSecret string) http.Handler {
 	mux.HandleFunc("PUT /admin/v1/creatives/{id}", h.updateCreative)
 	mux.HandleFunc("POST /admin/v1/creatives/{id}:publish", h.publishCreative)
 	mux.HandleFunc("POST /admin/v1/creative-assets", h.uploadAsset)
+	mux.HandleFunc("GET /admin/v1/budgets", h.listBudgets)
+	mux.HandleFunc("GET /admin/v1/quarantine", h.listQuarantine)
+	mux.HandleFunc("POST /admin/v1/quarantine/{id}:resolve", h.resolveQuarantine)
+	mux.HandleFunc("GET /admin/v1/status", h.getStatus)
 	return h.authenticate(mux)
 }
 
@@ -45,6 +50,13 @@ type handler struct {
 
 func (h *handler) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-ID")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if h.bearerSecret == "" {
 			writeAPIError(w, http.StatusServiceUnavailable, "dependency_unavailable", "management API is not configured")
 			return
@@ -236,6 +248,33 @@ func (h *handler) publish(w http.ResponseWriter, r *http.Request, resourceType s
 		"publish_status": "pending",
 		"config_version": version,
 	})
+}
+
+func (h *handler) listBudgets(w http.ResponseWriter, r *http.Request) {
+	items, err := h.store.ListBudgets(r.Context())
+	h.respond(w, items, err)
+}
+
+func (h *handler) listQuarantine(w http.ResponseWriter, r *http.Request) {
+	items, err := h.store.ListQuarantine(r.Context())
+	h.respond(w, items, err)
+}
+
+func (h *handler) resolveQuarantine(w http.ResponseWriter, r *http.Request) {
+	err := h.store.ResolveQuarantine(r.Context(), r.PathValue("id"))
+	if err != nil {
+		h.writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"quarantine_id": r.PathValue("id"),
+		"status":        "resolved",
+	})
+}
+
+func (h *handler) getStatus(w http.ResponseWriter, r *http.Request) {
+	status, err := h.store.GetStatus(r.Context(), snapshot.CurrentVersion())
+	h.respond(w, status, err)
 }
 
 func (h *handler) respond(w http.ResponseWriter, value any, err error) {

@@ -15,7 +15,7 @@ type Request struct {
 	Currencies      []string
 }
 
-// Response is the minimal decision result returned to the HTTP adapter.
+// Response is the decision result returned to the HTTP adapter.
 type Response struct {
 	RequestID             string
 	NoBid                 bool
@@ -23,6 +23,22 @@ type Response struct {
 	Candidate             bool
 	CandidateLineItemID   string
 	CandidateBidCPMMicros int64
+
+	// Valid bid response fields
+	BidID             string
+	ImpressionID      string
+	Price             float64
+	AdMarkup          string
+	CreativeID        string
+	CampaignID        string
+	Currency          string
+	Width             int
+	Height            int
+	ReservationID     string
+	ReservationToken  string
+	WinNoticeURL      string
+	BillableNoticeURL string
+	LossNoticeURL     string
 }
 
 // Decisioner makes a bid decision without coupling the transport to storage.

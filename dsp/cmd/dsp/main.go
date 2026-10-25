@@ -136,6 +136,8 @@ func refreshPublishedConfig(workerCtx context.Context, server *adapterHTTP.Serve
 		}
 		tenantHex := strings.ToLower(strings.ReplaceAll(tenantID, "-", ""))
 		manifestKey := "dsp:manifest:{" + tenantHex + "}"
+		// Measure the time spent loading the snapshot from Valkey and activating it.
+		loadStart := time.Now()
 		value, readErr := client.Do(ctx, "GET", manifestKey)
 		observedVersion := ""
 		var envelope struct {
@@ -215,9 +217,25 @@ func refreshPublishedConfig(workerCtx context.Context, server *adapterHTTP.Serve
 		cancel()
 		if synced && publishErr == nil && readErr == nil {
 			lastSuccess = time.Now()
+			staleness := time.Since(envelope.GeneratedAt)
+			if staleness < 0 {
+				staleness = 0
+			}
+			// Record snapshot load duration and staleness metrics.
+			loadDuration := time.Since(loadStart)
+			server.Metrics().ObserveSnapshotLoadDuration(loadDuration)
+			server.Metrics().ObserveSnapshotLoad(true, staleness)
 			server.SetReady(true)
-		} else if lastSuccess.IsZero() || time.Since(lastSuccess) > 10*time.Second {
-			server.SetReady(false)
+		} else {
+			if readErr != nil {
+				server.Metrics().ObserveSnapshotLoad(false, 0)
+			}
+			if !lastSuccess.IsZero() {
+				server.Metrics().SetSnapshotStaleness(time.Since(lastSuccess))
+			}
+			if lastSuccess.IsZero() || time.Since(lastSuccess) > 10*time.Second {
+				server.SetReady(false)
+			}
 		}
 		if publishErr != nil {
 			logger.Error("failed to publish DSP config outbox", slog.Any("error", publishErr))

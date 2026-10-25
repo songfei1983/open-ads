@@ -784,6 +784,24 @@ func validatePublish(ctx context.Context, tx *sql.Tx, tenantID []byte, resourceT
 		if count == 0 {
 			return invalid("creative_ids", "at least one creative is required")
 		}
+		todayMidnight := time.Now().UTC().Truncate(24 * time.Hour)
+		epochStart := time.Unix(0, 0).UTC()
+		_, err = tx.ExecContext(ctx, `INSERT INTO budget_account
+			(tenant_id, line_item_id, budget_scope, period_start, currency, budget_limit_micros, spent_micros, leased_micros, version, updated_at)
+			VALUES (?, ?, 'daily', ?, ?, ?, 0, 0, 1, NOW(6))
+			ON DUPLICATE KEY UPDATE budget_limit_micros = VALUES(budget_limit_micros), updated_at = NOW(6)`,
+			tenantID, id, todayMidnight, item.Currency, item.DailyBudgetMicros)
+		if err != nil {
+			return fmt.Errorf("upsert daily budget account: %w", err)
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO budget_account
+			(tenant_id, line_item_id, budget_scope, period_start, currency, budget_limit_micros, spent_micros, leased_micros, version, updated_at)
+			VALUES (?, ?, 'lifetime', ?, ?, ?, 0, 0, 1, NOW(6))
+			ON DUPLICATE KEY UPDATE budget_limit_micros = VALUES(budget_limit_micros), updated_at = NOW(6)`,
+			tenantID, id, epochStart, item.Currency, item.LifetimeBudgetMicros)
+		if err != nil {
+			return fmt.Errorf("upsert lifetime budget account: %w", err)
+		}
 	case "creative":
 		var item Creative
 		var digest, registeredDigest []byte
@@ -880,4 +898,109 @@ func encodeTargeting(value Targeting) ([]byte, error) {
 		return nil, fmt.Errorf("encode targeting: %w", err)
 	}
 	return encoded, nil
+}
+
+func (s *SQLStore) ListBudgets(ctx context.Context) ([]BudgetSummary, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT line_item_id, budget_scope, period_start, currency,
+		budget_limit_micros, spent_micros, leased_micros
+		FROM budget_account WHERE tenant_id = ? ORDER BY line_item_id, budget_scope`, s.tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list budgets: %w", err)
+	}
+	defer rows.Close()
+
+	items := []BudgetSummary{}
+	for rows.Next() {
+		var liBytes []byte
+		var scope, currency string
+		var period time.Time
+		var limit, spent, leased int64
+		if err := rows.Scan(&liBytes, &scope, &period, &currency, &limit, &spent, &leased); err != nil {
+			return nil, fmt.Errorf("scan budget: %w", err)
+		}
+		avail := limit - (spent + leased)
+		if avail < 0 {
+			avail = 0
+		}
+		status := "healthy"
+		if avail == 0 {
+			status = "depleted"
+		}
+		items = append(items, BudgetSummary{
+			LineItemID:        hex.EncodeToString(liBytes),
+			BudgetScope:       scope,
+			PeriodStart:       period.Format(time.RFC3339),
+			Currency:          currency,
+			BudgetLimitMicros: limit,
+			SpentMicros:       spent,
+			LeasedMicros:      leased,
+			AvailableMicros:   avail,
+			Status:            status,
+		})
+	}
+	return items, nil
+}
+
+func (s *SQLStore) ListQuarantine(ctx context.Context) ([]QuarantineRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT quarantine_id, reservation_id, source_event_key, outcome,
+		reason_code, status, received_at
+		FROM dsp_notice_quarantine WHERE tenant_id = ? ORDER BY received_at DESC LIMIT 100`, s.tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list quarantine: %w", err)
+	}
+	defer rows.Close()
+
+	items := []QuarantineRecord{}
+	for rows.Next() {
+		var qBytes, resBytes, srcBytes []byte
+		var outcome, reason, status string
+		var receivedAt time.Time
+		if err := rows.Scan(&qBytes, &resBytes, &srcBytes, &outcome, &reason, &status, &receivedAt); err != nil {
+			return nil, fmt.Errorf("scan quarantine: %w", err)
+		}
+		items = append(items, QuarantineRecord{
+			QuarantineID:   hex.EncodeToString(qBytes),
+			ReservationID:  hex.EncodeToString(resBytes),
+			SourceEventKey: hex.EncodeToString(srcBytes),
+			Outcome:        outcome,
+			ReasonCode:     reason,
+			Status:         status,
+			ReceivedAt:     receivedAt.Format(time.RFC3339),
+		})
+	}
+	return items, nil
+}
+
+func (s *SQLStore) ResolveQuarantine(ctx context.Context, id string) error {
+	qBytes, err := uuidBytes(id)
+	if err != nil {
+		return invalid("quarantine_id", "must be a valid 32-hex UUID")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE dsp_notice_quarantine SET status = 'resolved' WHERE tenant_id = ? AND quarantine_id = ?`,
+		s.tenantID, qBytes)
+	if err != nil {
+		return fmt.Errorf("resolve quarantine: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *SQLStore) GetStatus(ctx context.Context, loadedSnapshot string) (ConfigStatus, error) {
+	var manifestVersion uint64
+	_ = s.db.QueryRowContext(ctx, `SELECT manifest_version FROM dsp_config_manifest_clock WHERE tenant_id = ?`,
+		s.tenantID).Scan(&manifestVersion)
+
+	var pendingCount int
+	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM dsp_config_outbox WHERE tenant_id = ? AND published_at IS NULL`,
+		s.tenantID).Scan(&pendingCount)
+
+	return ConfigStatus{
+		TenantID:           hex.EncodeToString(s.tenantID),
+		ManifestVersion:    manifestVersion,
+		OutboxPendingCount: pendingCount,
+		LoadedSnapshot:     loadedSnapshot,
+	}, nil
 }

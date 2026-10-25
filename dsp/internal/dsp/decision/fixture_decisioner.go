@@ -2,21 +2,27 @@ package decision
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/domain"
+	"github.com/songfei1983/open-ads/dsp/internal/dsp/lease"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/snapshot"
 )
 
 // FixtureDecisioner evaluates the published in-process manifest. It identifies
-// eligible candidates but still returns no-bid until a budget reservation is
-// integrated into the decision path.
+// eligible candidates and, when configured with a budget Reserver, atomically
+// acquires a budget reservation and returns a valid bid response.
 type FixtureDecisioner struct {
 	ManifestVersion string
 	Whitelist       []domain.WhiteListEntry
+	Reserver        lease.Reserver
+	TokenCodec      *lease.TokenCodec
+	BaseNoticeURL   string
+	TenantID        string
 }
 
 func (f FixtureDecisioner) Decide(ctx context.Context, req Request) (Response, error) {
@@ -66,9 +72,118 @@ func (f FixtureDecisioner) Decide(ctx context.Context, req Request) (Response, e
 		}
 	}
 	if best.ID != "" {
-		// A valid bid remains forbidden until the budget reservation succeeds.
-		return Response{RequestID: req.ID, NoBid: true, NoBidReason: 2, Candidate: true,
-			CandidateLineItemID: best.ID, CandidateBidCPMMicros: best.BidCPMMicros}, nil
+		if f.Reserver == nil {
+			// A valid bid remains forbidden until the budget reservation succeeds.
+			return Response{RequestID: req.ID, NoBid: true, NoBidReason: 2, Candidate: true,
+				CandidateLineItemID: best.ID, CandidateBidCPMMicros: best.BidCPMMicros}, nil
+		}
+
+		spendRisk, _ := domain.CalculateSpendFromCPM(domain.Micros(best.BidCPMMicros), 1)
+		if spendRisk <= 0 {
+			spendRisk = 1
+		}
+
+		var demands []lease.Demand
+		dailyScope := best.ID + ":daily"
+		if f.Reserver.Available(dailyScope, now) > 0 {
+			demands = append(demands, lease.Demand{ScopeID: dailyScope, AmountMicros: spendRisk})
+		} else if f.Reserver.Available("daily", now) > 0 {
+			demands = append(demands, lease.Demand{ScopeID: "daily", AmountMicros: spendRisk})
+		}
+		lifetimeScope := best.ID + ":lifetime"
+		if f.Reserver.Available(lifetimeScope, now) > 0 {
+			demands = append(demands, lease.Demand{ScopeID: lifetimeScope, AmountMicros: spendRisk})
+		} else if f.Reserver.Available("lifetime", now) > 0 {
+			demands = append(demands, lease.Demand{ScopeID: "lifetime", AmountMicros: spendRisk})
+		}
+		if len(demands) == 0 {
+			if f.Reserver.Available(best.ID, now) > 0 {
+				demands = append(demands, lease.Demand{ScopeID: best.ID, AmountMicros: spendRisk})
+			} else {
+				demands = append(demands, lease.Demand{ScopeID: "daily", AmountMicros: spendRisk})
+			}
+		}
+
+		resUUID, _ := domain.NewUUIDv7()
+		resID := "res-" + resUUID
+		res, err := f.Reserver.Reserve(resID, demands, now)
+		if err != nil {
+			// Safe fail-closed no-bid when budget is insufficient or unavailable
+			return Response{
+				RequestID:             req.ID,
+				NoBid:                 true,
+				NoBidReason:           2,
+				Candidate:             true,
+				CandidateLineItemID:   best.ID,
+				CandidateBidCPMMicros: best.BidCPMMicros,
+			}, nil
+		}
+
+		bidUUID, _ := domain.NewUUIDv7()
+		bidID := "bid-" + bidUUID
+		impID := "1"
+		price := float64(best.BidCPMMicros) / 1_000_000.0
+		crid := ""
+		if len(best.CreativeIDs) > 0 {
+			crid = best.CreativeIDs[0]
+		}
+		tenantID := f.TenantID
+		if tenantID == "" {
+			tenantID = "00000000000000000000000000000001"
+		}
+		var token string
+		if f.TokenCodec != nil {
+			claims := lease.ReservationClaims{
+				TenantID:       tenantID,
+				ReservationID:  res.ID,
+				AuctionID:      req.ID,
+				BidID:          bidID,
+				ImpressionID:   impID,
+				Currency:       best.Currency,
+				ReservedMicros: int64(spendRisk),
+				ExpiresAt:      now.Add(10 * time.Minute),
+				Demands:        res.Demands,
+				LeaseIDs:       res.LeaseIDs,
+			}
+			token, _ = f.TokenCodec.Seal(claims)
+		}
+		baseURL := f.BaseNoticeURL
+		if baseURL == "" {
+			baseURL = "http://127.0.0.1:8081"
+		}
+		nurl := baseURL + "/rtb/v1/win/" + bidID + "?price=${AUCTION_PRICE}"
+		burl := baseURL + "/rtb/v1/billable/" + bidID
+		lurl := baseURL + "/rtb/v1/loss/" + bidID + "?reason=${AUCTION_LOSS}"
+		if token != "" {
+			lurl += "&ref=" + token
+		}
+		width, height := req.BannerWidth, req.BannerHeight
+		if width <= 0 && len(best.BannerSizes) > 0 {
+			width, height = best.BannerSizes[0].Width, best.BannerSizes[0].Height
+		}
+		adMarkup := fmt.Sprintf("<iframe src=\"%s/render/v1/%s\" width=\"%d\" height=\"%d\" frameborder=\"0\" scrolling=\"no\"></iframe>", baseURL, crid, width, height)
+
+		return Response{
+			RequestID:             req.ID,
+			NoBid:                 false,
+			Candidate:             true,
+			CandidateLineItemID:   best.ID,
+			CandidateBidCPMMicros: best.BidCPMMicros,
+			BidID:                 bidID,
+			ImpressionID:          impID,
+			Price:                 price,
+			AdMarkup:              adMarkup,
+			CreativeID:            crid,
+			CampaignID:            best.CampaignID,
+			Currency:              best.Currency,
+			Width:                 width,
+			Height:                height,
+			ReservationID:         res.ID,
+			ReservationToken:      token,
+			WinNoticeURL:          nurl,
+			BillableNoticeURL:     burl,
+			LossNoticeURL:         lurl,
+		}, nil
 	}
 	return noBid(req.ID), nil
 }
