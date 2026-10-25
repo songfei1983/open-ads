@@ -11,6 +11,7 @@ import (
 
 	adapterHTTP "github.com/songfei1983/open-ads/dsp/internal/dsp/adapter/http"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/config"
+	"github.com/songfei1983/open-ads/dsp/internal/dsp/snapshot"
 )
 
 func newTestServer() *adapterHTTP.Server {
@@ -49,6 +50,9 @@ func TestHealthz(t *testing.T) {
 }
 
 func TestReadyz(t *testing.T) {
+	if err := snapshot.Register(&snapshot.Manifest{Version: "readyz-test-v1"}); err != nil {
+		t.Fatalf("register snapshot: %v", err)
+	}
 	srv := newTestServer()
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -61,6 +65,13 @@ func TestReadyz(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+	var readyBody map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&readyBody); err != nil {
+		t.Fatalf("decode ready response: %v", err)
+	}
+	if got := readyBody["snapshot_version"]; got != "readyz-test-v1" {
+		t.Errorf("expected active snapshot version, got %q", got)
 	}
 
 	srv.SetReady(false)

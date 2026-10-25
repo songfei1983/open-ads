@@ -8,6 +8,10 @@ import "context"
 type Request struct {
 	ID              string
 	ImpressionCount int
+	SiteDomain      string
+	SitePage        string
+	BannerWidth     int
+	BannerHeight    int
 }
 
 // Response is the minimal decision result returned to the HTTP adapter.
@@ -15,6 +19,7 @@ type Response struct {
 	RequestID   string
 	NoBid       bool
 	NoBidReason int
+	Candidate   bool
 }
 
 // Decisioner makes a bid decision without coupling the transport to storage.

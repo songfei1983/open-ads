@@ -15,6 +15,7 @@ import (
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/decision"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/domain"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/observability"
+	"github.com/songfei1983/open-ads/dsp/internal/dsp/snapshot"
 )
 
 // Server wraps the standard library http.Server for DSP.
@@ -83,25 +84,31 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
-	if !s.isReady.Load() {
+	version := snapshot.CurrentVersion()
+	if !s.isReady.Load() || version == "" {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-			"status":  "not_ready",
-			"service": s.cfg.ServiceName,
+			"status":           "not_ready",
+			"service":          s.cfg.ServiceName,
+			"snapshot_version": version,
 		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
-		"status":         "ready",
-		"service":        s.cfg.ServiceName,
-		"config_version": s.cfg.ConfigVersion,
+		"status":           "ready",
+		"service":          s.cfg.ServiceName,
+		"snapshot_version": version,
 	})
 }
 
 func (s *Server) handleOpenRTBBid(w http.ResponseWriter, r *http.Request) {
 	reqID := observability.RequestIDFromContext(r.Context())
 	var req struct {
-		ID  string            `json:"id"`
-		Imp []json.RawMessage `json:"imp"`
+		ID   string            `json:"id"`
+		Imp  []json.RawMessage `json:"imp"`
+		Site *struct {
+			Domain string `json:"domain"`
+			Page   string `json:"page"`
+		} `json:"site"`
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 256<<10)
 	if err := json.NewDecoder(io.LimitReader(r.Body, 256<<10)).Decode(&req); err != nil || req.ID == "" || len(req.Imp) == 0 {
@@ -113,7 +120,42 @@ func (s *Server) handleOpenRTBBid(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.decisioner.Decide(r.Context(), decision.Request{ID: req.ID, ImpressionCount: len(req.Imp)})
+	var banner struct {
+		Banner *struct {
+			Width  int `json:"w"`
+			Height int `json:"h"`
+		} `json:"banner"`
+	}
+	if err := json.Unmarshal(req.Imp[0], &banner); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"code":       "invalid_request",
+			"message":    "invalid OpenRTB impression",
+			"request_id": reqID,
+		})
+		return
+	}
+	var siteDomain, sitePage string
+	if req.Site != nil {
+		siteDomain, sitePage = req.Site.Domain, req.Site.Page
+	}
+	var bannerWidth, bannerHeight int
+	if banner.Banner != nil {
+		bannerWidth, bannerHeight = banner.Banner.Width, banner.Banner.Height
+	}
+	decisionStarted := time.Now()
+	result, err := s.decisioner.Decide(r.Context(), decision.Request{
+		ID:              req.ID,
+		ImpressionCount: len(req.Imp),
+		SiteDomain:      siteDomain,
+		SitePage:        sitePage,
+		BannerWidth:     bannerWidth,
+		BannerHeight:    bannerHeight,
+	})
+	decisionErr := err
+	if decisionErr == nil && r.Context().Err() == context.DeadlineExceeded {
+		decisionErr = context.DeadlineExceeded
+	}
+	s.metrics.ObserveDecision(result.Candidate, err != nil || result.NoBid, decisionErr, time.Since(decisionStarted))
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"id": req.ID, "nbr": 2})
 		return

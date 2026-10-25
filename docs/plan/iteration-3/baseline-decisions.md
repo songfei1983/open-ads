@@ -21,15 +21,15 @@ Iteration 3 聚焦 DSP 控制面与决策热路径：建立 Campaign、Line Item
 
 - DSP bidder 已有 `Decisioner` 接口和默认 `NoBidDecisioner`。
 - OpenRTB wire 校验仍位于 DSP HTTP adapter，决策包不依赖 OpenRTB DTO。
-- 已有进程内 manifest、fixture decisioner 和轻量 lease allocator 的占位实现；下一步补齐不可变发布快照与 readiness 版本、真实 targeting 和基于预算金额的 Valkey lease/reservation，并接入出价路径。
+- 已有进程内不可变 manifest、readiness 快照版本、domain/page/banner targeting 候选检查、固定类别决策指标和本地金额 reservation 原语；下一步补齐发布配置构建、Valkey 多实例原子 reservation 与结算，并接入完整出价路径。
 
 ## 4. 任务映射
 
 | 任务 | 完成 | 下一步交付物 | 验收重点 |
 |---|---|---|---|
 | I3-01 | 🟡 部分实现 | Campaign/Line Item/Creative 管理 DTO、版本校验和发布状态 | 当前只有基础领域结构和简单版本字符串校验；需实现控制 DTO、配置版本冲突校验及发布状态，未发布配置不得影响 bidder。 |
-| I3-02 | 🟡 部分实现 | 静态素材元数据和白名单校验 | 当前已有素材元数据与白名单结构；需补齐 MIME、尺寸、hash、landing host 校验，并确保不执行任意 HTML/JS。 |
-| I3-03 | 🟡 部分实现 | 不可变发布快照、刷新和 readiness 实际加载版本 | 当前 manifest 仅提供进程内按版本存取和空快照刷新；需保证版本不可变，cache miss 不回源 MariaDB，并能识别陈旧实例。 |
-| I3-04 | 🟡 部分实现 | Fixture decisioner 和基于配置快照的 banner targeting | 当前 fixture 仅以 request ID 模拟 host，并检查是否存在 Campaign；需实现 domain/page/banner 精确匹配，非法候选不得出价。 |
-| I3-05 | 🟡 部分实现 | 基于预算额度的 Reservation lease allocator 并接入 bidder | 当前 allocator 仅按 scope 做内存全有或全无占用及幂等释放；需完成多 scope 原子额度检查，额度不足不出价，reservation 释放幂等。 |
-| I3-06 | ✅ 部分实现 | 完整的 bidder 决策、超时和快照指标 | 已有 Decisioner 调用边界、默认 no-bid、请求超时中间件和基础 HTTP 指标；仍需区分 no-bid、候选、决策错误和超时，并补齐不含敏感标签的快照/决策指标。 |
+| I3-02 | 🟡 部分实现 | 发布阶段完整素材校验与内容 hash 校验 | 当前候选检查仅接受常见静态 image MIME，要求正数尺寸、非空 hash，并精确匹配 landing host/MIME 白名单；仍需在发布阶段统一校验、校验 hash 格式/内容并明确尺寸上限。 |
+| I3-03 | 🟡 部分实现 | 已发布配置构建/刷新流程和陈旧实例识别 | 当前进程内 manifest 已校验 campaign/line item/creative 引用、拒绝覆盖版本、隔离读写副本并原子切换当前版本；readiness 报告实际快照版本且无快照时 not-ready。仍需从持久化已发布配置构建快照、刷新/过期策略及陈旧实例识别。 |
+| I3-04 | 🟡 部分实现 | 发布配置的 targeting 编译、候选出价和协议响应 | 当前已从 OpenRTB adapter 映射 site/domain/page/banner 到 transport-neutral request，并基于 active campaign/line item/creative 做精确匹配；候选仍 no-bid，需待预算 reservation 接入后才允许有效出价。 |
+| I3-05 | 🟡 部分实现 | Valkey 原子脚本、后台 lease 分配/续租、notice 结算和 bidder 接入 | 新增本地金额 allocator：多 scope 全有或全无、reservation ID 幂等、终态冲突拒绝、过期 lease 不可消费；仍是单进程实现，尚未接 Valkey/MariaDB，也未接入有效 bid 路径。 |
+| I3-06 | 🟡 部分实现 | 快照加载/陈旧度指标及端到端超时覆盖 | 已有 Decisioner 调用边界、默认 no-bid、请求超时中间件和基础 HTTP 指标；新增固定类别的候选、no-bid、决策错误、超时计数及决策耗时，无请求标识标签。仍需补齐快照加载/陈旧度指标。 |
