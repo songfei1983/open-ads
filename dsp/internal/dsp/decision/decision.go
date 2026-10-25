@@ -12,14 +12,17 @@ type Request struct {
 	SitePage        string
 	BannerWidth     int
 	BannerHeight    int
+	Currencies      []string
 }
 
 // Response is the minimal decision result returned to the HTTP adapter.
 type Response struct {
-	RequestID   string
-	NoBid       bool
-	NoBidReason int
-	Candidate   bool
+	RequestID             string
+	NoBid                 bool
+	NoBidReason           int
+	Candidate             bool
+	CandidateLineItemID   string
+	CandidateBidCPMMicros int64
 }
 
 // Decisioner makes a bid decision without coupling the transport to storage.

@@ -28,18 +28,18 @@ const (
 
 // Demand is the maximum monetary risk to reserve from one budget scope.
 type Demand struct {
-	ScopeID      string
-	AmountMicros domain.Micros
+	ScopeID      string        `json:"scope_id"`
+	AmountMicros domain.Micros `json:"amount_micros"`
 }
 
 // Reservation is an immutable copy of a reservation's scopes and terminal state.
 type Reservation struct {
-	ID           string
-	Demands      []Demand
-	LeaseIDs     map[string]string
-	Outcome      Outcome
-	ActualMicros domain.Micros
-	SettledAt    time.Time
+	ID           string            `json:"id"`
+	Demands      []Demand          `json:"demands"`
+	LeaseIDs     map[string]string `json:"lease_ids"`
+	Outcome      Outcome           `json:"outcome,omitempty"`
+	ActualMicros domain.Micros     `json:"actual_micros"`
+	SettledAt    time.Time         `json:"settled_at,omitempty"`
 }
 
 type localLease struct {

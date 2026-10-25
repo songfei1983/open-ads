@@ -3,6 +3,7 @@ package domain
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Campaign represents a high‑level advertising campaign configuration.
@@ -12,20 +13,34 @@ type Campaign struct {
 	Name        string   // human‑readable name
 	LineItemIDs []string // identifiers of associated line items
 	Active      bool
+	StartsAt    time.Time
+	EndsAt      *time.Time
 	// Additional fields such as budget, targeting, etc. will be added later.
 }
 
 // LineItem represents a specific ad placement configuration under a campaign.
 type LineItem struct {
-	ID           string   // unique identifier
-	CampaignID   string   // parent campaign identifier
-	CreativeIDs  []string // creatives that can be served
-	Active       bool
-	SiteDomain   string
-	SitePage     string
-	BannerWidth  int
-	BannerHeight int
-	// Future fields: price, schedule, targeting filters, etc.
+	ID               string   // unique identifier
+	CampaignID       string   // parent campaign identifier
+	CreativeIDs      []string // creatives that can be served
+	Active           bool
+	SiteDomain       string
+	SitePage         string
+	BannerWidth      int
+	BannerHeight     int
+	SiteDomains      []string
+	PagePathPrefixes []string
+	BannerSizes      []BannerSize
+	BidCPMMicros     int64
+	Currency         string
+	StartsAt         *time.Time
+	EndsAt           *time.Time
+}
+
+// BannerSize is a supported contextual placement dimension.
+type BannerSize struct {
+	Width  int
+	Height int
 }
 
 // Creative holds static creative asset metadata.

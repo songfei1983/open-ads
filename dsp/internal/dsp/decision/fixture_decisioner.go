@@ -2,7 +2,10 @@ package decision
 
 import (
 	"context"
+	"net/url"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/domain"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/snapshot"
@@ -20,7 +23,13 @@ func (f FixtureDecisioner) Decide(ctx context.Context, req Request) (Response, e
 	if err := ctx.Err(); err != nil {
 		return Response{}, err
 	}
-	man, err := snapshot.Load(f.ManifestVersion)
+	var man *snapshot.Manifest
+	var err error
+	if f.ManifestVersion == "" {
+		man, _, err = snapshot.LoadCurrent()
+	} else {
+		man, err = snapshot.Load(f.ManifestVersion)
+	}
 	if err != nil {
 		return noBid(req.ID), nil
 	}
@@ -29,36 +38,105 @@ func (f FixtureDecisioner) Decide(ctx context.Context, req Request) (Response, e
 	}
 
 	domainName := normalizeDomain(req.SiteDomain)
-	for _, campaign := range man.Campaigns {
-		if !campaign.Active {
+	now := time.Now().UTC()
+	lineItemIDs := make([]string, 0, len(man.LineItems))
+	for id := range man.LineItems {
+		lineItemIDs = append(lineItemIDs, id)
+	}
+	sort.Strings(lineItemIDs)
+	var best domain.LineItem
+	for _, lineItemID := range lineItemIDs {
+		lineItem := man.LineItems[lineItemID]
+		campaign, ok := man.Campaigns[lineItem.CampaignID]
+		if !ok || !campaign.Active || !withinSchedule(now, campaign.StartsAt, campaign.EndsAt) {
 			continue
 		}
-		for _, lineItemID := range campaign.LineItemIDs {
-			lineItem, ok := man.LineItems[lineItemID]
-			if !ok || !lineItem.Active || lineItem.CampaignID != campaign.ID {
-				continue
-			}
-			if !matchesTargeting(lineItem, domainName, req.SitePage, req.BannerWidth, req.BannerHeight) {
-				continue
-			}
-			if hasValidCreative(man, lineItem, f.Whitelist) {
-				// Candidate detection is safe, but a valid bid requires an atomic
-				// reservation. Keep the response no-bid until that is available.
-				return Response{RequestID: req.ID, NoBid: true, NoBidReason: 2, Candidate: true}, nil
-			}
+		lineItemStartsAt := time.Time{}
+		if lineItem.StartsAt != nil {
+			lineItemStartsAt = *lineItem.StartsAt
 		}
+		if !lineItem.Active || !withinSchedule(now, lineItemStartsAt, lineItem.EndsAt) || !currencyMatches(lineItem.Currency, req.Currencies) {
+			continue
+		}
+		if !matchesTargeting(lineItem, domainName, req.SitePage, req.BannerWidth, req.BannerHeight) || !hasValidCreative(man, lineItem, f.Whitelist) {
+			continue
+		}
+		if best.ID == "" || lineItem.BidCPMMicros > best.BidCPMMicros || lineItem.BidCPMMicros == best.BidCPMMicros && lineItem.ID < best.ID {
+			best = lineItem
+		}
+	}
+	if best.ID != "" {
+		// A valid bid remains forbidden until the budget reservation succeeds.
+		return Response{RequestID: req.ID, NoBid: true, NoBidReason: 2, Candidate: true,
+			CandidateLineItemID: best.ID, CandidateBidCPMMicros: best.BidCPMMicros}, nil
 	}
 	return noBid(req.ID), nil
 }
 
+func currencyMatches(lineItemCurrency string, requestCurrencies []string) bool {
+	if lineItemCurrency == "" {
+		return true // In-memory fixtures predating currency-aware manifests.
+	}
+	for _, currency := range requestCurrencies {
+		if currency == lineItemCurrency {
+			return true
+		}
+	}
+	return false
+}
+
+func withinSchedule(now, startsAt time.Time, endsAt *time.Time) bool {
+	if !startsAt.IsZero() && now.Before(startsAt) {
+		return false
+	}
+	return endsAt == nil || now.Before(*endsAt)
+}
+
 func matchesTargeting(lineItem domain.LineItem, siteDomain, sitePage string, width, height int) bool {
-	if lineItem.SiteDomain != "" && normalizeDomain(lineItem.SiteDomain) != siteDomain {
+	if len(lineItem.SiteDomains) > 0 {
+		matched := false
+		for _, candidate := range lineItem.SiteDomains {
+			if normalizeDomain(candidate) == siteDomain {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	} else if lineItem.SiteDomain != "" && normalizeDomain(lineItem.SiteDomain) != siteDomain {
 		return false
 	}
-	if lineItem.SitePage != "" && lineItem.SitePage != sitePage {
+	if len(lineItem.PagePathPrefixes) > 0 {
+		pagePath := sitePage
+		if parsed, err := url.Parse(sitePage); err == nil && parsed.Scheme != "" {
+			pagePath = parsed.EscapedPath()
+		}
+		matched := false
+		for _, prefix := range lineItem.PagePathPrefixes {
+			if strings.HasPrefix(pagePath, prefix) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	} else if lineItem.SitePage != "" && lineItem.SitePage != sitePage {
 		return false
 	}
-	if lineItem.BannerWidth != width || lineItem.BannerHeight != height {
+	if len(lineItem.BannerSizes) > 0 {
+		matched := false
+		for _, size := range lineItem.BannerSizes {
+			if size.Width == width && size.Height == height {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	} else if (lineItem.BannerWidth > 0 || lineItem.BannerHeight > 0) && (lineItem.BannerWidth != width || lineItem.BannerHeight != height) {
 		return false
 	}
 	return true

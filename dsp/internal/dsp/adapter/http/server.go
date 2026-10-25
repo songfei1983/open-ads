@@ -20,12 +20,13 @@ import (
 
 // Server wraps the standard library http.Server for DSP.
 type Server struct {
-	server     *http.Server
-	logger     *slog.Logger
-	cfg        *config.Config
-	metrics    *observability.Metrics
-	decisioner decision.Decisioner
-	isReady    atomic.Bool
+	server       *http.Server
+	logger       *slog.Logger
+	cfg          *config.Config
+	metrics      *observability.Metrics
+	decisioner   decision.Decisioner
+	adminHandler http.Handler
+	isReady      atomic.Bool
 }
 
 // NewServer initializes the HTTP server with router, middlewares, and probes.
@@ -74,6 +75,27 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /rtb/v1/win/{bid_id}", s.handleWinNotice)
 	mux.HandleFunc("POST /rtb/v1/loss/{bid_id}", s.handleLossNotice)
 	mux.HandleFunc("POST /rtb/v1/billable/{bid_id}", s.handleBillableNotice)
+	mux.Handle("/admin/v1/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.adminHandler == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"code": "admin_unavailable", "message": "management API is not configured",
+			})
+			return
+		}
+		s.adminHandler.ServeHTTP(w, r)
+	}))
+}
+
+// SetAdminHandler installs a tenant-authenticated management API handler.
+func (s *Server) SetAdminHandler(handler http.Handler) {
+	s.adminHandler = handler
+}
+
+// SetDecisioner replaces the no-bid default before serving requests.
+func (s *Server) SetDecisioner(decisioner decision.Decisioner) {
+	if decisioner != nil {
+		s.decisioner = decisioner
+	}
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -105,6 +127,7 @@ func (s *Server) handleOpenRTBBid(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID   string            `json:"id"`
 		Imp  []json.RawMessage `json:"imp"`
+		Cur  []string          `json:"cur"`
 		Site *struct {
 			Domain string `json:"domain"`
 			Page   string `json:"page"`
@@ -150,6 +173,7 @@ func (s *Server) handleOpenRTBBid(w http.ResponseWriter, r *http.Request) {
 		SitePage:        sitePage,
 		BannerWidth:     bannerWidth,
 		BannerHeight:    bannerHeight,
+		Currencies:      req.Cur,
 	})
 	decisionErr := err
 	if decisionErr == nil && r.Context().Err() == context.DeadlineExceeded {
@@ -182,7 +206,6 @@ func (s *Server) handleBillableNotice(w http.ResponseWriter, r *http.Request) {
 
 // Start runs the HTTP server.
 func (s *Server) Start() error {
-	s.isReady.Store(true)
 	s.logger.Info("starting DSP HTTP server", slog.String("addr", s.server.Addr))
 	if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("listen and serve: %w", err)
@@ -217,6 +240,10 @@ func (s *Server) requestIDMiddleware(next http.Handler) http.Handler {
 
 func (s *Server) requestDeadlineMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/openrtb2/bid" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), s.cfg.BidTimeout)
 		defer cancel()
 		next.ServeHTTP(w, r.WithContext(ctx))

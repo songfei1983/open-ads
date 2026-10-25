@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/domain"
 )
@@ -12,6 +13,7 @@ import (
 var (
 	ErrVersionExists = errors.New("manifest version already exists")
 	ErrEmptyVersion  = errors.New("manifest version cannot be empty")
+	ErrStaleVersion  = errors.New("manifest version is older than the active version")
 )
 
 // Manifest is a versioned view of published ad configuration. Values returned
@@ -89,6 +91,52 @@ func Register(m *Manifest) error {
 	manifestStore.byVersion[m.Version] = immutable
 	manifestStore.current = m.Version
 	return nil
+}
+
+// Activate atomically replaces the process's current published projection.
+// Only the active manifest remains addressable, so refreshes do not retain a
+// history of previously published configurations in memory.
+func Activate(m *Manifest) error {
+	if m == nil {
+		return errors.New("manifest cannot be nil")
+	}
+	if m.Version == "" {
+		return ErrEmptyVersion
+	}
+	if err := Validate(m); err != nil {
+		return err
+	}
+	immutable := clone(m)
+	manifestStore.Lock()
+	defer manifestStore.Unlock()
+	if isSortableVersion(manifestStore.current) && isSortableVersion(m.Version) && m.Version < manifestStore.current {
+		return fmt.Errorf("%w: got %q, current %q", ErrStaleVersion, m.Version, manifestStore.current)
+	}
+	manifestStore.byVersion = map[string]*Manifest{m.Version: immutable}
+	manifestStore.current = m.Version
+	return nil
+}
+
+func isSortableVersion(version string) bool {
+	if len(version) == 20 {
+		for _, character := range version {
+			if character < '0' || character > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	if len(version) != 32 {
+		return false
+	}
+	for _, character := range version {
+		if character < '0' || character > '9' {
+			if character < 'a' || character > 'f' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // Validate checks that all published references resolve within the manifest.
@@ -189,14 +237,28 @@ func clone(m *Manifest) *Manifest {
 	}
 	for id, campaign := range m.Campaigns {
 		campaign.LineItemIDs = append([]string(nil), campaign.LineItemIDs...)
+		campaign.EndsAt = cloneTime(campaign.EndsAt)
 		copy.Campaigns[id] = campaign
 	}
 	for id, lineItem := range m.LineItems {
 		lineItem.CreativeIDs = append([]string(nil), lineItem.CreativeIDs...)
+		lineItem.SiteDomains = append([]string(nil), lineItem.SiteDomains...)
+		lineItem.PagePathPrefixes = append([]string(nil), lineItem.PagePathPrefixes...)
+		lineItem.BannerSizes = append([]domain.BannerSize(nil), lineItem.BannerSizes...)
+		lineItem.StartsAt = cloneTime(lineItem.StartsAt)
+		lineItem.EndsAt = cloneTime(lineItem.EndsAt)
 		copy.LineItems[id] = lineItem
 	}
 	for id, creative := range m.Creatives {
 		copy.Creatives[id] = creative
 	}
 	return copy
+}
+
+func cloneTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
