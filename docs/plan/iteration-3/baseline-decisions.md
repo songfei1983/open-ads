@@ -1,6 +1,6 @@
 # Iteration 3 基线决策与架构映射记录
 
-状态：I3-01~I3-06 完成；I3-07 未开始
+状态：I3-01~I3-07 完成（I3-07 已验收，2026-10-26）
 适用分支：已合并至 `main`（PR #40，2026-10-26）
 关联文档：[Iteration 2 基线决策](../iteration-2/baseline-decisions.md) | [首期开发计划](../implementation-plan.md) | [LLD](../../design/LLD.md)
 
@@ -35,4 +35,4 @@ Iteration 3 聚焦 DSP 控制面与决策热路径：建立 Campaign、Line Item
 | I3-04 | ✅ 完成 | — | 已将 OpenRTB site/domain/page/banner/currency 映射为 transport-neutral 请求；manifest 保留全部 domain/page-prefix/banner targeting、资源生效时间、币种和 bid CPM。决策器按时间窗、币种、targeting、creative 白名单过滤，并按 CPM 降序、ID 稳定打破平局选出候选；响应继续返回标准 no-bid，只有 I3-05 reservation 成功后才可出有效 bid。 |
 | I3-05 | ✅ 完成 | — | 已实现 Daily/lifetime BudgetAccount、MariaDB 租约分配与回收（SQLBudgetStore）、Valkey 与本地两阶段原子扣留预留；AEAD token (AES-256-GCM) 签发与解封校验；接入 OpenRTB 出价热路径（有租额出价、无租额安全 no-bid）；打通 win/loss/billable 通知处理、幂等确认、冲突隔离（dsp_notice_quarantine）及 spend ledger 记录。 |
 | I3-06 | ✅ 完成 | — | 已有 Decisioner 调用边界、默认 no-bid、请求超时中间件和基础 HTTP 指标；固定类别的候选、no-bid、决策错误、超时计数及决策耗时。快照加载/陈旧度指标已补齐并在线验证：`open_ads_dsp_snapshot_loads_total`、`snapshot_load_errors_total`、`snapshot_staleness_seconds`、`snapshot_load_duration_seconds` 直方图（记录于同步循环 `dsp/cmd/dsp/main.go`，经 `/metrics` 暴露）。 |
-| I3-07 | ✅ 完成（待验收） | — | console 服务新增 `/api/dsp/*` 反向代理（服务端注入管理 token、仅 GET/POST/PUT、非 admin 路径 404、未配置 token 503），成为浏览器与 DSP 管理 API 的唯一通道；dsp.html 换用 `dsp-live.js` 实装 Campaign/Line Item/Creative 管理与发布：真实列表、创建/编辑（Optimistic Lock）、素材上传（客户端 SHA-256 + 多部分校验）、发布确认弹窗（版本 + outbox→bidder 加载轮询）、409 `version_conflict` 自动刷新、预算/账务隔离真实视图。已端到端验证：Advertiser→Campaign→Creative(1×1 PNG 上传)→Line Item→三连 publish→manifest v8→bidder 加载→SSP 真实填充，并验证 `business_rule_violation`（未发布 campaign 直接发 line item）与 whitelist 过滤规则对 UI 的真实呈现。 |
+| I3-07 | ✅ 完成（已验收） | — | console 服务新增 `/api/dsp/*` 反向代理（服务端注入管理 token、仅 GET/POST/PUT、非 admin 路径 404、未配置 token 503），成为浏览器与 DSP 管理 API 的唯一通道；dsp.html 换用 `dsp-live.js` 实装 Campaign/Line Item/Creative 管理与发布：真实列表、创建/编辑（Optimistic Lock）、素材上传（客户端 SHA-256 + 多部分校验）、发布确认弹窗（版本 + outbox→bidder 加载轮询）、409 `version_conflict` 自动刷新、预算/账务隔离真实视图。验收记录（2026-10-26）：`console` 与 `dsp` 的 build/vet/test 全部通过，`node --check` 通过；实测代理 GET 列表 200、非 admin 路径 404、DELETE 405，单测覆盖未配置 token 503；经代理完成 Advertiser→Campaign→Creative（1×1 PNG 内容寻址复用）→Line Item 全链路，未发布引用返回 422 `business_rule_violation`、陈旧版本 PUT 返回 409 `version_conflict`，发布后 manifest v12→v18 且 bidder 加载版本一致，SSP 对 `/i3-07-acceptance` 页面命中 4.20 USD 有效 bid、300×250 返回 no-bid；UI 实测创建并发布 Campaign 在 2.76s 内提示“bidder 已加载 manifest v17”，409 后自动重取并刷新到 v4。验收修复两处 UI 缺陷：`refreshStatus` 未返回值导致发布结果轮询始终落到“仍在扇出”；409 处理仅重渲染缓存未真正重取数据，且重渲染会清掉提示 toast。 |

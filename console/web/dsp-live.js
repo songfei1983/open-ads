@@ -74,9 +74,11 @@ async function apiFetch(path, options = {}) {
 
 function handleApiError(error) {
   if (error?.code === "version_conflict") {
-    showToast("资源已被其他人修改（409 version_conflict），已刷新到最新版本");
-    // Conflicts self-heal: reload the fresh server state and re-render.
-    renderPage().catch(() => {});
+    // Conflicts self-heal: refetch the server state, then re-render. The toast
+    // is shown after the re-render because renderShell replaces the toast node.
+    loadAndRender(true)
+      .catch(() => {})
+      .then(() => showToast("资源已被其他人修改（409 version_conflict），已刷新到最新版本"));
     return true;
   }
   showToast(error?.message || "管理 API 调用失败");
@@ -203,6 +205,7 @@ function loadedManifestNumber() {
 
 async function refreshStatus() {
   state.status = await apiFetch("status");
+  return state.status;
 }
 
 async function refreshList(pageKey) {
@@ -909,13 +912,18 @@ async function pollPublishOutcome(configVersion) {
       const status = await refreshStatus();
       const chip = document.querySelector(".manifest-chip");
       if (chip) chip.replaceWith(buildManifestChip());
-      if (status.outbox_pending_count === 0 && status.manifest_version > 0) {
-        showToast("发布已确认：bidder 实例将在 ≤10 秒内加载新快照");
+      const loaded = Number(status.loaded_snapshot_version);
+      if (status.outbox_pending_count === 0 && status.manifest_version > 0 && loaded >= status.manifest_version) {
+        showToast(`发布已确认：bidder 已加载 manifest v${status.manifest_version}`);
         return;
       }
     } catch { /* keep polling; transient failures are expected */ }
   }
-  showToast(`config ${shortHash(configVersion)} 仍在扇出（outbox 重试中），可稍后刷新确认`);
+  if (state.status?.outbox_pending_count > 0) {
+    showToast(`config ${shortHash(configVersion)} 仍在扇出（outbox 重试中），可稍后刷新确认`);
+  } else {
+    showToast(`manifest v${state.status?.manifest_version ?? "?"} 已发布，bidder 实例尚未加载快照，可稍后刷新确认`);
+  }
 }
 
 // -- Advertiser / Campaign ------------------------------------------------
