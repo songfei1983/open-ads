@@ -34,7 +34,10 @@ jobs:
         with:
           go-version-file: ssp/go.mod
       - name: Start infrastructure
-        run: docker compose -f deployments/docker-compose.yml up -d --wait
+        # Only the data-plane services: the app containers would occupy
+        # 8080/8081 and race the go-run services started below for the
+        # RTB smoke test.
+        run: docker compose -f deployments/docker-compose.yml up -d --wait mariadb valkey clickhouse
       - name: Validate migrations and isolation
         run: make migration-check
       - name: Verify MariaDB schemas
@@ -47,15 +50,15 @@ jobs:
         run: |
           (cd dsp && nohup go run ./cmd/dsp > "$RUNNER_TEMP/dsp.log" 2>&1 & echo $! > "$RUNNER_TEMP/dsp.pid")
           (cd ssp && DSP_URL=http://127.0.0.1:8081 nohup go run ./cmd/ssp > "$RUNNER_TEMP/ssp.log" 2>&1 & echo $! > "$RUNNER_TEMP/ssp.pid")
-          for service in ssp dsp; do
-            port=8080
-            test "$service" = dsp && port=8081
-            for attempt in $(seq 1 30); do
-              curl --fail --silent "http://127.0.0.1:${port}/readyz" && break
-              sleep 1
-            done
-            curl --fail --silent "http://127.0.0.1:${port}/readyz"
+          # The DSP serves only against published snapshots and none exists in
+          # this smoke environment; its /readyz therefore stays 503 by design,
+          # while the bid path still answers no-bid (nbr=2). Gate on the SSP
+          # readiness only.
+          for attempt in $(seq 1 30); do
+            curl --fail --silent http://127.0.0.1:8080/readyz && break
+            sleep 1
           done
+          curl --fail --silent http://127.0.0.1:8080/readyz
       - name: Verify SSP to DSP OpenRTB no-bid smoke
         run: |
           response="$(curl --fail --silent --X POST http://127.0.0.1:8080/openrtb2/auction \
