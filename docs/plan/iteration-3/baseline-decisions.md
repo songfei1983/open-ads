@@ -1,7 +1,7 @@
 # Iteration 3 基线决策与架构映射记录
 
-状态：开发中
-适用分支：`feat/iteration-3`
+状态：I3-01~I3-06 完成；I3-07 未开始
+适用分支：已合并至 `main`（PR #40，2026-10-26）
 关联文档：[Iteration 2 基线决策](../iteration-2/baseline-decisions.md) | [首期开发计划](../implementation-plan.md) | [LLD](../../design/LLD.md)
 
 ## 1. 目标与范围
@@ -34,5 +34,5 @@ Iteration 3 聚焦 DSP 控制面与决策热路径：建立 Campaign、Line Item
 | I3-03 | ✅ 完成 | — | MariaDB 每资源仅保存一行当前已发布投影；发布事务同时更新投影、单调 tenant manifest 序号和 outbox。publisher 通过带版本防回退的 Lua 原子写入完整 Valkey manifest，持久成功后确认 outbox；失败记录脱敏原因并按指数退避重试，周期性重建可修复 Valkey 丢失。实例轮询并验证 schema/hash/version 后原子激活本地快照，按 TTL 上报 incarnation、已加载/观测版本和 readiness；超过 10 秒不同步后 readiness 失败，状态索引自动清理过期实例。 |
 | I3-04 | ✅ 完成 | — | 已将 OpenRTB site/domain/page/banner/currency 映射为 transport-neutral 请求；manifest 保留全部 domain/page-prefix/banner targeting、资源生效时间、币种和 bid CPM。决策器按时间窗、币种、targeting、creative 白名单过滤，并按 CPM 降序、ID 稳定打破平局选出候选；响应继续返回标准 no-bid，只有 I3-05 reservation 成功后才可出有效 bid。 |
 | I3-05 | ✅ 完成 | — | 已实现 Daily/lifetime BudgetAccount、MariaDB 租约分配与回收（SQLBudgetStore）、Valkey 与本地两阶段原子扣留预留；AEAD token (AES-256-GCM) 签发与解封校验；接入 OpenRTB 出价热路径（有租额出价、无租额安全 no-bid）；打通 win/loss/billable 通知处理、幂等确认、冲突隔离（dsp_notice_quarantine）及 spend ledger 记录。 |
-| I3-06 | 🟡 部分实现 | 快照加载/陈旧度指标及端到端超时覆盖 | 已有 Decisioner 调用边界、默认 no-bid、请求超时中间件和基础 HTTP 指标；新增固定类别的候选、no-bid、决策错误、超时计数及决策耗时，无请求标识标签。仍需补齐快照加载/陈旧度指标。 |
-| I3-07 | ⚪ 未开始 | DSP 原型管理页面与 Go API 联调 | 基于现存 prototype 原型打通 Campaign、Line Item、Creative 管理、发布操作和版本状态可视化；仅通过 DSP 管理 API 通信，包含错误提示与发布确认机制。 |
+| I3-06 | ✅ 完成 | — | 已有 Decisioner 调用边界、默认 no-bid、请求超时中间件和基础 HTTP 指标；固定类别的候选、no-bid、决策错误、超时计数及决策耗时。快照加载/陈旧度指标已补齐并在线验证：`open_ads_dsp_snapshot_loads_total`、`snapshot_load_errors_total`、`snapshot_staleness_seconds`、`snapshot_load_duration_seconds` 直方图（记录于同步循环 `dsp/cmd/dsp/main.go`，经 `/metrics` 暴露）。 |
+| I3-07 | ⚪ 未开始 | DSP 原型管理页面与 Go API 联调 | UI 原型已从 DSP 拆出为独立 `console/` 服务（:8083），但管理页仍为纯演示数据（`console/web/console.js` 本地模拟，不调用服务端）。剩：Campaign、Line Item、Creative 管理接通 DSP `/admin/v1`，展示真实发布结果、`409 version_conflict` 与发布确认机制。沙箱投放链路本身已通过 admin API + SSP 模拟器端到端验证（campaign→publish→快照→bid）。 |
