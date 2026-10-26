@@ -142,7 +142,13 @@ function validateEndpoint(value) {
   if (endpoint.username || endpoint.password) {
     throw new Error("API 地址不能包含用户名或密码。");
   }
-  endpoint.pathname = `${endpoint.pathname.replace(/\/+$/, "")}/sdk/v1/ad-requests`;
+  // Ensure the endpoint ends with a single '/sdk/v1/ad-requests' segment.
+  const basePath = endpoint.pathname.replace(/\/+$/, "");
+  if (!basePath.endsWith('/sdk/v1/ad-requests')) {
+    endpoint.pathname = `${basePath}/sdk/v1/ad-requests`;
+  } else {
+    endpoint.pathname = basePath;
+  }
   endpoint.search = "";
   endpoint.hash = "";
   return endpoint;
@@ -166,7 +172,7 @@ async function requestLive(payload) {
         placement_id: payload.placement_id,
         slot: payload.slot,
         page: payload.page,
-        consent: { source: "test-fixture", value: null }
+        consent: { source: "test-fixture", value: document.querySelector("#consent").checked ? "sandbox-consent-demo-01" : "" }
       })
     });
     const body = await response.json();
@@ -191,9 +197,11 @@ async function requestLive(payload) {
       } catch {
         throw Object.assign(new Error("Sandbox API 的广告响应缺少有效的 render_url。"), { result });
       }
-      if (renderURL.protocol !== "https:" || renderURL.origin !== endpoint.origin ||
+      const isLoopback = (url) =>
+        (url.hostname === "127.0.0.1" || url.hostname === "localhost") && url.protocol === "http:";
+      if (!(renderURL.protocol === "https:" || isLoopback(renderURL)) || renderURL.origin !== endpoint.origin ||
           renderURL.username || renderURL.password) {
-        throw Object.assign(new Error("广告 render_url 必须使用配置的 SSP 地址同源 HTTPS，且不能包含用户名或密码。"), { result });
+        throw Object.assign(new Error("广告 render_url 必须使用配置的 SSP 地址同源 HTTPS（localhost 可 HTTP），且不能包含用户名或密码。"), { result });
       }
     }
     return result;

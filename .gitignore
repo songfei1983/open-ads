@@ -18,3 +18,9 @@ bin/
 .idea/
 .vscode/
 *.swp
+
+# Air live-reload build artifacts
+tmp/
+
+# Scratch test images
+tiny*.png

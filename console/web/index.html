@@ -8,7 +8,7 @@
     <link rel="stylesheet" href="./styles.css">
     <script type="module" src="./app.js"></script>
   </head>
-  <body>
+  <body data-service="ssp">
     <header class="topbar">
       <a class="brand" href="#" aria-label="Open Ads Sandbox Portal 首页">
         <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
@@ -93,6 +93,17 @@
                 <label class="field-label" for="path">页面路径</label>
                 <input id="path" name="path" type="text" value="/demo" maxlength="1024" required>
                 <span class="field-hint">不会发送 query、fragment 或用户标识。</span>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>隐私与受众</legend>
+              <div class="field">
+                <label class="checkbox-field">
+                  <input id="consent" name="consent" type="checkbox">
+                  <span>附加 consent 演示令牌</span>
+                </label>
+                <span class="field-hint">开启后请求携带 consent 令牌，SSP 将调用 DMP 做受众解析并回填 segments；关闭则不调用 DMP（隐私 fail-closed）。</span>
               </div>
             </fieldset>
 

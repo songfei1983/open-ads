@@ -1,0 +1,15 @@
+# Air live-reload for the dmp service (go module subdir: ./cmd/dmp)
+root = "."
+tmp_dir = "tmp"
+
+[build]
+cmd = "go build -o ./tmp/dmp-bin ./cmd/dmp"
+bin = "tmp/dmp-bin"
+include_ext = ["go"]
+exclude_dir = ["tmp", "vendor", "node_modules", "migrations", "docs"]
+exclude_unchanged = true
+delay = 500
+stop_on_error = true
+
+[log]
+time = true

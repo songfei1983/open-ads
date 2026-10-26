@@ -1220,8 +1220,29 @@ CREATE TABLE dsp_config_outbox (
   failed_attempts SMALLINT UNSIGNED NOT NULL DEFAULT 0,
   last_failed_at DATETIME(6) NULL,
   last_error_sanitized VARCHAR(512) NULL,
+  next_attempt_at DATETIME(6) NULL,
   PRIMARY KEY (event_id),
-  KEY idx_dsp_outbox_pending (published_at, created_at)
+  KEY idx_dsp_outbox_pending (tenant_id, published_at, next_attempt_at, created_at)
+) ENGINE=InnoDB;
+
+-- One monotonic manifest clock and one current published projection per resource;
+-- these tables do not retain previous published versions.
+CREATE TABLE dsp_config_manifest_clock (
+  tenant_id BINARY(16) NOT NULL,
+  manifest_version BIGINT UNSIGNED NOT NULL,
+  PRIMARY KEY (tenant_id)
+) ENGINE=InnoDB;
+
+CREATE TABLE dsp_published_config (
+  tenant_id BINARY(16) NOT NULL,
+  aggregate_type VARCHAR(32) NOT NULL,
+  aggregate_id BINARY(16) NOT NULL,
+  aggregate_version BIGINT UNSIGNED NOT NULL,
+  config_version BIGINT UNSIGNED NOT NULL,
+  payload JSON NOT NULL,
+  updated_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (tenant_id, aggregate_type, aggregate_id),
+  KEY idx_dsp_published_config_version (tenant_id, config_version)
 ) ENGINE=InnoDB;
 
 CREATE TABLE advertiser (
@@ -1592,7 +1613,8 @@ DSP 的 spend 幂等键优先继承双方 profile 约定的稳定 billable event
 
 ### 3.5 DSP 热缓存与零 DB 读取热路径
 
-- DSP 配置事务同时写入 `dsp_config_outbox`；后台刷新器读取新版本，编译 campaign/line item/targeting 快照，写入 `dsp:cache:*` 并原子替换各实例的进程内快照。
+- DSP 发布事务同时更新 `dsp_published_config` 当前投影、递增 tenant manifest 序号并写入 `dsp_config_outbox`；后台 publisher 以 `READ COMMITTED` 和 `SKIP LOCKED` 领取事件，从当前投影构造带 schema/version/generation time/hash 的完整 manifest，通过 Lua 单 key 原子比较版本并写入 `dsp:manifest:{tenant}`。Valkey 成功后才确认 outbox；失败记录脱敏原因并按指数退避重试。周期性重建会修复丢失的 Valkey manifest。当前投影只保留每个资源的一行，不归档多份发布历史。
+- 每个实例以 1 秒轮询读取 manifest，验证 schema、payload hash 和版本后 copy-on-write 原子激活内存快照；运行心跳以 30 秒 TTL 保存在 `dsp:runtime:{tenant}:<incarnation>`，有序索引只保留活跃实例。实例加载版本超过当前 manifest 10 秒未追上时 readiness 失败；本地 bid 热路径不访问 MariaDB 或 Valkey。
 - `POST /openrtb2/bid` 不查询 `dsp_db`。不得在 cache miss 时退回 SQL；缓存/本地快照缺失或超过最大陈旧时间时，该实例不就绪或对对应 line item no-bid。
 - 预算租约在后台批量申请，事务预留 MariaDB 中每个适用预算范围的可用金额；RTB 只消费已预留的本地额度。Notice profile 必须携带可验证的预留引用。有效 Billing Notice 使用 MariaDB 事务幂等地从租额转为实际 spend；Win Notice 只记 win，不扣费。租约退出后仍需保留到 billable 延迟窗口结束，之后再回收余额并异步补足租约。
 - 发布配置时监控实例已加载版本；过期实例从流量池摘除或只禁用相关 line item，不能继续使用无限期旧快照。

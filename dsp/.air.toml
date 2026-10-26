@@ -1,0 +1,15 @@
+# Air live-reload for the dsp service (go module subdir: ./cmd/dsp)
+root = "."
+tmp_dir = "tmp"
+
+[build]
+cmd = "go build -o ./tmp/dsp-bin ./cmd/dsp"
+bin = "tmp/dsp-bin"
+include_ext = ["go"]
+exclude_dir = ["tmp", "vendor", "node_modules", "migrations", "docs"]
+exclude_unchanged = true
+delay = 500
+stop_on_error = true
+
+[log]
+time = true
