@@ -227,3 +227,22 @@ dialog::backdrop { background: #17221bb8; backdrop-filter: blur(2px); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+/* --- DSP live console (real admin-api data) ------------------------------- */
+.manifest-chip.manifest-pending { color: #957b38; background: #faf5e7; }
+.offline-callout { border-color: #e4c9c2; background: #fbefec; }
+.offline-callout .button { margin-top: 9px; }
+.mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.publish-cell { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.publish-cell .cell-sub { font-size: 9px; }
+.section-label { grid-column: 1 / -1; padding-top: 4px; color: #808683; font-size: 10px; font-weight: 700; letter-spacing: .04em; }
+.checkbox-list { display: flex; flex-direction: column; gap: 6px; max-height: 150px; overflow: auto; padding: 7px 8px; border: 1px solid #e3e8e1; border-radius: 5px; background: #fff; }
+.checkbox-item { display: flex; align-items: center; gap: 7px; font-size: 10px; color: #434a43; cursor: pointer; }
+.checkbox-item input { width: 13px; height: 13px; accent-color: #4f7c58; }
+.publish-summary { list-style: none; margin: 0 0 12px; padding: 0; display: grid; gap: 7px; }
+.publish-summary li { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; padding: 8px 10px; border: 1px solid #edf0eb; border-radius: 5px; background: #fafbf9; font-size: 10px; }
+.publish-summary li span::after { content: ""; }
+.publish-summary li span { color: #808683; }
+.publish-summary li strong { text-align: right; word-break: break-all; }
+.publish-hint { margin: 0 0 13px; color: #808683; font-size: 10px; }
+.form-error { margin: 11px 0 0; color: #a15c4c; font-size: 10px; }
