@@ -116,6 +116,8 @@ func (h *staticHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rel += "index.html"
 	}
 	if !strings.HasSuffix(rel, "index.html") {
+		// The console is a sandbox: never let browsers pin stale scripts.
+		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		http.ServeFile(w, r, filepath.Join(h.webDir, filepath.FromSlash(rel)))
 		return
