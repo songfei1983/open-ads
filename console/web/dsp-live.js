@@ -2,7 +2,9 @@
 // API. Every page reads and writes through /api/dsp/admin/v1/* — the console
 // service proxies these calls and injects the management token server side,
 // so no credential ever reaches the browser and the UI has no other backend
-// (no database, no Valkey, no side channel).
+// (no database, no Valkey, no side channel). Element parity with the SSP/DMP
+// prototype pages is kept: the same shell, toolbar, dashboard cards and
+// details dialog, but every value comes from the management API.
 const app = document.querySelector("#app");
 const API = "/api/dsp/admin/v1";
 const MICROS_PER_UNIT = 1_000_000;
@@ -27,11 +29,11 @@ const bannerSizes = [
 
 const pages = {
   dashboard: { title: "投放总览", eyebrow: "总览", icon: "⌂", label: "投放总览" },
-  campaigns: { title: "Campaign", eyebrow: "管理", icon: "▤", label: "Campaign", description: "广告主活动的投放时间窗草稿与发布状态；发布后由配置 manifest 扇出到 bidder。", apiPath: "campaigns" },
-  "line-items": { title: "Line Item", eyebrow: "管理", icon: "◫", label: "Line Item", description: "Bid、预算、targeting 与素材关联；预算以 micros 记账（1 微 = 百万分之一 USD）。", apiPath: "line-items" },
-  creatives: { title: "Creative 素材", eyebrow: "管理", icon: "▧", label: "Creative 素材", description: "上传静态图片素材（服务端校验格式/尺寸/hash），登记落地页并发布；仅 https 落地页可发布。", apiPath: "creatives" },
-  budgets: { title: "预算与租约", eyebrow: "账本", icon: "＄", label: "预算与租约", description: "来自 DSP 管理 API 的真实预算账户视图（daily / lifetime scope、spent 与租约占用）。", apiPath: "budgets" },
-  quarantine: { title: "账务隔离", eyebrow: "对账", icon: "⚑", label: "账务隔离", description: "迟到、冲突或校验失败的 notice 记录；处置经由 DSP 管理 API 幂等确认。", apiPath: "quarantine" },
+  campaigns: { title: "Campaign", eyebrow: "管理", icon: "▤", label: "Campaign", description: "广告主活动的投放时间窗草稿与发布状态；发布后由配置 manifest 扇出到 bidder。", apiPath: "campaigns", noun: "Campaign" },
+  "line-items": { title: "Line Item", eyebrow: "管理", icon: "◫", label: "Line Item", description: "Bid、预算、targeting 与素材关联；预算以 micros 记账（1 微 = 百万分之一 USD）。", apiPath: "line-items", noun: "Line Item" },
+  creatives: { title: "Creative 素材", eyebrow: "管理", icon: "▧", label: "Creative 素材", description: "上传静态图片素材（服务端校验格式/尺寸/hash），登记落地页并发布；仅 https 落地页可发布。", apiPath: "creatives", noun: "Creative" },
+  budgets: { title: "预算与租约", eyebrow: "账本", icon: "＄", label: "预算与租约", description: "来自 DSP 管理 API 的真实预算账户视图（daily / lifetime scope、spent 与租约占用）。", apiPath: "budgets", noun: "预算账户" },
+  quarantine: { title: "账务隔离", eyebrow: "对账", icon: "⚑", label: "账务隔离", description: "迟到、冲突或校验失败的 notice 记录；处置经由 DSP 管理 API 幂等确认。", apiPath: "quarantine", noun: "隔离记录" },
 };
 
 const navOrder = ["dashboard", "campaigns", "line-items", "creatives", "budgets", "quarantine"];
@@ -86,7 +88,7 @@ function handleApiError(error) {
 }
 
 // ---------------------------------------------------------------------------
-// Shell
+// Shell — same layout skeleton as the SSP/DMP prototype pages.
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -103,6 +105,13 @@ function makeButton(label, className, action, ariaLabel) {
   return button;
 }
 
+function serviceLink(key, label) {
+  const anchor = el("a", "", label);
+  anchor.href = `./${key}.html`;
+  if (key === "dsp") anchor.setAttribute("aria-current", "page");
+  return anchor;
+}
+
 function renderShell() {
   app.replaceChildren();
   const shell = el("div", "shell");
@@ -115,6 +124,11 @@ function renderShell() {
   brand.innerHTML = '<span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span><span>openads</span>';
   sidebar.append(brand);
 
+  const serviceSelect = el("div", "service-select");
+  serviceSelect.append(el("span", "service-glyph", "D"), el("span"), el("span", "chevron", "⌄"));
+  serviceSelect.lastElementChild.previousElementSibling.append(el("strong", "", "DSP 投放平台"), el("small", "", "Live workspace"));
+  sidebar.append(serviceSelect);
+
   sidebar.append(el("div", "sidebar-label", "WORKSPACE"));
   const nav = el("nav", "nav-list");
   nav.setAttribute("aria-label", "DSP 工作区");
@@ -126,9 +140,14 @@ function renderShell() {
     nav.append(anchor);
   }
   sidebar.append(nav, el("div", "sidebar-spacer"), el("div", "sidebar-separator"));
+  const switcher = el("div", "service-switch");
+  switcher.append(serviceLink("ssp", "SSP"), serviceLink("dsp", "DSP"), serviceLink("dmp", "DMP"));
+  sidebar.append(el("div", "sidebar-label", "SERVICE CONSOLES"), switcher, el("div", "sidebar-separator"));
   const meta = el("div", "side-meta");
-  meta.append(el("div", "", "数据来源 · DSP Admin API"));
-  meta.append(el("div", "", "通过 console 代理转发"));
+  const modeMeta = el("div");
+  modeMeta.append(document.createTextNode("运行模式 · "), el("b", "", "Live API"));
+  meta.append(modeMeta);
+  meta.append(el("div", "", "真实数据 · 仅经 DSP 管理 API"));
   sidebar.append(meta);
 
   const mainShell = el("div", "main-shell");
@@ -137,6 +156,11 @@ function renderShell() {
   crumbs.append(el("span", "", "Open Ads"), el("span", "", "/"), el("strong", "", "DSP"));
   const topActions = el("div", "topbar-actions");
   topActions.append(buildManifestChip());
+  const env = el("span", "env-chip");
+  env.append(el("i"), document.createTextNode("测试环境"));
+  const user = el("div", "user-chip");
+  user.append(el("span", "user-avatar", "S"), el("span", "", "Sandbox Operator"));
+  topActions.append(env, user);
   topbar.append(crumbs, topActions);
   const main = el("main");
   main.id = "main-content";
@@ -152,7 +176,7 @@ function renderShell() {
 }
 
 // Live configuration state chip: current manifest, what the bidder actually
-// loaded, and the outbox backlog. Refreshed with the page data.
+// loaded, and the outbox backlog. Refreshed together with the page data.
 function buildManifestChip() {
   const chip = el("span", "env-chip manifest-chip");
   if (!state.status) {
@@ -264,7 +288,7 @@ function targetingSummary(lineItem) {
 }
 
 // ---------------------------------------------------------------------------
-// Rendering
+// Page rendering
 
 function renderPage() {
   const main = document.querySelector("#main-content");
@@ -281,7 +305,7 @@ function renderPage() {
   if (currentPage === "campaigns") actions.append(makeButton("＋ 新建 Campaign", "button button-primary", () => openCampaignDialog()));
   if (currentPage === "line-items") actions.append(makeButton("＋ 新建 Line Item", "button button-primary", () => openLineItemDialog()));
   if (currentPage === "creatives") actions.append(makeButton("＋ 上传 Creative", "button button-primary", () => openCreativeDialog()));
-  if (currentPage !== "dashboard") actions.append(makeButton("↻ 刷新", "button", () => loadAndRender(true)));
+  actions.append(makeButton("↻ 刷新", "button", () => loadAndRender(true)));
   header.append(actions);
   main.append(header);
 
@@ -290,11 +314,8 @@ function renderPage() {
     renderFooterInto(main);
     return;
   }
-  const content = currentPage === "dashboard" ? renderDashboard() : renderResourcePage();
-  main.append(content);
+  main.append(currentPage === "dashboard" ? renderDashboard() : renderResourcePage());
   renderFooterInto(main);
-  const chip = document.querySelector(".manifest-chip");
-  if (chip) chip.replaceWith(buildManifestChip());
 }
 
 function offlineBanner() {
@@ -306,7 +327,7 @@ function offlineBanner() {
     try {
       await refreshAll();
       renderShell();
-      await renderPage();
+      renderPage();
     } catch (error) {
       handleApiError(error);
       renderPage();
@@ -322,16 +343,24 @@ function renderFooterInto(main) {
   main.append(footer);
 }
 
+// ---------------------------------------------------------------------------
+// Dashboard
+
 function renderDashboard() {
   const fragment = document.createDocumentFragment();
-  const status = state.status ?? { manifest_version: 0, loaded_snapshot_version: "", outbox_pending_count: 0 };
+  fragment.append(makeNote("实时环境", "本页所有数字来自 DSP 管理 API（/admin/v1）；创建、发布操作会直接作用于配置 manifest 并在 bidder 租约热路径生效。", "ⓘ"));
+
   const stats = el("section", "stats-grid");
   stats.setAttribute("aria-label", "DSP 运行指标");
+  const activeLineItems = state.lineItems.filter((row) => row.status === "active").length;
+  const publishedCampaigns = state.campaigns.filter((row) => row.publish_status === "published").length;
+  const healthyBudgets = state.budgets.filter((row) => row.status === "healthy").length;
+  const openQuarantine = state.quarantine.filter((row) => row.status === "open").length;
   const statDefs = [
-    ["Live Campaign", String(state.campaigns.filter((c) => c.publish_status === "published").length), "已发布并由 bidder 拥有", "▤"],
-    ["已发布素材", String(state.creatives.filter((c) => c.publish_status === "published").length), `${state.creatives.length} 个素材登记`, "▧"],
-    ["配置 manifest", `v${status.manifest_version}`, `bidder 已加载 v${loadedManifestNumber()}`, "↻"],
-    ["账务隔离待处置", String(state.quarantine.filter((q) => q.status === "open").length), "迟到/冲突 notice", "⚑"],
+    ["已发布 Campaign", String(publishedCampaigns), `${state.campaigns.length} 个草稿/已登记`, "▤"],
+    ["Active Line Item", String(activeLineItems), `${state.budgets.length} 个预算 scope`, "◫"],
+    ["配置 manifest", `v${state.status.manifest_version}`, `bidder 已加载 v${loadedManifestNumber()}`, "↻"],
+    ["账务隔离待处置", String(openQuarantine), `${healthyBudgets} 个预算 scope 健康`, "⚑"],
   ];
   for (const [label, value, foot, icon] of statDefs) {
     const card = el("article", "stat-card");
@@ -343,16 +372,25 @@ function renderDashboard() {
   fragment.append(stats);
 
   const content = el("section", "content-grid");
-  const recent = el("section", "card");
-  recent.append(cardHeader("最近发布的资源", "查看全部", () => { currentPage = "campaigns"; location.hash = "campaigns"; }));
+  content.append(renderRecentResource(), renderActivities());
+  fragment.append(content);
+  const lower = el("section", "bottom-grid");
+  lower.append(renderHealthCard(), renderReleaseCard());
+  fragment.append(lower);
+  return fragment;
+}
+
+function renderRecentResource() {
+  const card = el("section", "card");
+  card.append(cardHeader("最近发布的资源", "查看全部", () => { location.hash = "campaigns"; }, "最近发布的 DSP 资源"));
   const table = el("table");
   table.append(makeTableHead([["资源", "资源"], ["状态", "状态"], ["版本", "版本"]]));
   const body = el("tbody");
   const recentRows = [
-    ...state.campaigns.map((row) => ({ kind: "Campaign", name: campaignName(row.id), status: row.publish_status, version: row.version, page: "campaigns" })),
-    ...state.creatives.map((row) => ({ kind: "Creative", name: shortHash(row.asset_sha256), status: row.publish_status, version: row.version, page: "creatives" })),
-    ...state.lineItems.map((row) => ({ kind: "Line Item", name: row.targeting?.site_domains?.[0] ?? row.id, status: row.publish_status, version: row.version, page: "line-items" })),
-  ].slice(-6).reverse();
+    ...state.lineItems.map((row) => ({ kind: "Line Item", name: targetingSummary(row).slice(0, 40), status: row.publish_status, version: row.version })),
+    ...state.creatives.map((row) => ({ kind: "Creative", name: `${(row.format || "").split("/")[1]?.toUpperCase() || "IMG"} ${row.width_px}×${row.height_px}`, status: row.publish_status, version: row.version })),
+    ...state.campaigns.map((row) => ({ kind: "Campaign", name: campaignName(row.id), status: row.publish_status, version: row.version })),
+  ].sort((a, b) => (b.publish_status === "published") - (a.publish_status === "published")).slice(0, 5);
   if (!recentRows.length) {
     const tr = el("tr");
     const td = el("td", "empty-table", "还没有已发布的资源——先在 Campaign / Creative 页创建并发布。");
@@ -365,36 +403,112 @@ function renderDashboard() {
     const kindCell = el("td");
     kindCell.append(el("div", "cell-main", row.kind), el("div", "cell-sub", row.name));
     tr.append(kindCell);
-    tr.append(el("td", "", localizeStatus(row.status)));
+    const statusCell = el("td");
+    statusCell.append(el("span", `status-pill ${row.status || "draft"}`, localizeStatus(row.status || "draft")));
+    tr.append(statusCell);
     const versionCell = el("td");
-    versionCell.append(el("span", `status-pill ${row.status ?? "draft"}`, `v${row.version} · ${localizeStatus(row.status)}`));
+    versionCell.append(el("span", "cell-sub mono", `v${row.version}`));
     tr.append(versionCell);
     body.append(tr);
   }
   table.append(body);
   const wrap = el("div", "table-wrap");
   wrap.append(table);
-  recent.append(wrap);
-  content.append(recent);
+  card.append(wrap);
+  return card;
+}
 
-  const health = el("section", "card");
-  health.append(cardHeader("配置流水线", "刷新状态", () => loadAndRender(true)));
-  const list = el("div");
-  const rows = [
-    ["Tenant", state.status?.tenant_id ?? "—"],
-    ["Outbox 待确认", String(status.outbox_pending_count)],
-    ["Bidder 加载版本", `v${loadedManifestNumber()}`],
-    ["预算账户", `${state.budgets.length} 个 scope`],
+// Recent activity is derived from the management API state: pending publishes
+// first, then the newest published aggregates. No invented events.
+function renderActivities() {
+  const card = el("section", "card activity-card");
+  card.append(cardHeader("最近活动", "查看状态", () => { location.hash = "budgets"; }, "从管理 API 推导的最近动态"));
+  const list = el("div", "activity-list");
+  const events = [];
+  for (const row of state.campaigns) {
+    if (row.publish_status === "pending") events.push(["配置待确认", `Campaign · ${shortHash(row.config_version)}`, "刚刚"]);
+  }
+  for (const row of state.lineItems) {
+    if (row.publish_status === "pending") events.push(["发布待确认", `Line Item · ${row.targeting?.site_domains?.[0] ?? row.id}`, "刚刚"]);
+  }
+  for (const row of state.quarantine.filter((item) => item.status === "open").slice(0, 2)) {
+    events.push(["账务隔离待处置", `rsv ${shortHash(row.reservation_id || row.quarantine_id)}`, formatStamp(row.received_at)]);
+  }
+  const published = [
+    ...state.lineItems.filter((row) => row.publish_status === "published").map((row) => ["Line Item 已发布", row.targeting?.site_domains?.[0] ?? shortHash(row.id), "—"]),
+    ...state.creatives.filter((row) => row.publish_status === "published").map((row) => ["创意可投放", `${(row.format || "").split("/")[1]?.toUpperCase()} ${row.width_px}×${row.height_px}`, "—"]),
+    ...state.campaigns.filter((row) => row.publish_status === "published").map((row) => ["Campaign 已发布", campaignName(row.id), "—"]),
   ];
-  for (const [label, value] of rows) {
+  const merged = events.concat(published).slice(0, 5);
+  if (!merged.length) {
+    list.append(el("div", "activity-item", "暂无活动记录"));
+  }
+  for (const [title, detail, time] of merged) {
+    const item = el("div", "activity-item");
+    item.append(el("span", "activity-mark"), el("div", "activity-copy"));
+    item.lastChild.append(el("strong", "", title), document.createTextNode(` · ${detail}`), el("time", "", time));
+    list.append(item);
+  }
+  card.append(list);
+  return card;
+}
+
+function renderHealthCard() {
+  const card = el("section", "card");
+  card.append(cardHeader("服务健康", "刷新", () => loadAndRender(true), "DSP 服务健康摘要"));
+  const healthyBudgets = state.budgets.filter((row) => row.status === "healthy").length;
+  const openQuarantine = state.quarantine.filter((row) => row.status === "open").length;
+  const metrics = [
+    ["Bid 出价快照", `v${loadedManifestNumber()} / v${state.status.manifest_version}`],
+    ["Outbox 待确认", String(state.status.outbox_pending_count)],
+    ["预算 scope 健康", `${healthyBudgets} / ${state.budgets.length}`],
+    ["账务隔离 open", String(openQuarantine)],
+  ];
+  const list = el("div");
+  for (const [label, value] of metrics) {
     const row = el("div", "mini-metric");
     row.append(el("span", "", label), el("strong", "", value));
     list.append(row);
   }
-  health.append(list);
-  content.append(health);
-  fragment.append(content);
-  return fragment;
+  card.append(list);
+  return card;
+}
+
+// Release card mirrors the prototype's progress bar with real sync状态:
+// loaded manifest version vs current manifest version, plus outbox backlog.
+function renderReleaseCard() {
+  const card = el("section", "card");
+  card.append(cardHeader("配置与数据发布", "当前状态", () => { location.hash = "quarantine"; }, "热配置发布进度"));
+  const body = el("div");
+  body.style.padding = "13px";
+  const manifest = Number(state.status.manifest_version ?? 0);
+  const loaded = loadedManifestNumber();
+  const pending = Number(state.status.outbox_pending_count ?? 0);
+  const percent = manifest > 0 ? Math.min(100, Math.round((loaded / manifest) * 100)) : 0;
+  const release = el("div", "release-card");
+  const title = el("div", "release-title");
+  title.append(el("span", "", "热配置实例加载"), el("b", "", `v${loaded} / v${manifest}`));
+  const bar = el("div", "release-bar");
+  const fill = el("span");
+  fill.style.width = `${percent}%`;
+  bar.append(fill);
+  const foot = el("div", "release-foot");
+  foot.append(el("span", "", pending > 0 ? `${pending} 个发布等待确认` : manifest > 0 ? "所有实例已同步" : "尚无发布"), el("span", "", `${percent}%`));
+  release.append(title, bar, foot);
+  body.append(release);
+  card.append(body);
+  return card;
+}
+
+// ---------------------------------------------------------------------------
+// Shared table helpers
+
+function makeTableHead(columns) {
+  const thead = el("thead");
+  const row = el("tr");
+  for (const [, label] of columns) row.append(el("th", "", label));
+  thead.append(row);
+  return thead;
 }
 
 function cardHeader(title, linkText, linkAction, ariaLabel = title) {
@@ -409,51 +523,73 @@ function cardHeader(title, linkText, linkAction, ariaLabel = title) {
   return header;
 }
 
-function makeTableHead(columns) {
-  const thead = el("thead");
-  const row = el("tr");
-  for (const [, label] of columns) row.append(el("th", "", label));
-  thead.append(row);
-  return thead;
-}
-
 function renderResourcePage() {
   const section = el("section");
   if (currentPage === "line-items") section.append(makeNote("首期边界", "支持 site.domain、page 路径前缀、banner 尺寸和预算；频控、pacing 与 segment targeting 暂不支持。", "ⓘ"));
   if (currentPage === "creatives") section.append(makeNote("素材链路", "上传后文件内容寻址存储（sha256）；Creative 只引用已登记的 asset_ref，发布时再次复核完整性。决策期按部署侧白名单（landing host=MIME，沙箱为 example.com=image/png）过滤，落地页请使用白名单内的 host。", "◈"));
-  if (currentPage === "quarantine") section.append(renderQuarantineResource());
+  if (currentPage === "quarantine" && state.quarantine.some((item) => item.status === "open")) {
+    section.append(makeNote("对账提示", "隔离记录长期未处置会持续占用 dsp_notice_quarantine；确认业务侧无需重放后可标记 resolved。", "⚑"));
+  }
+
+  const resourceKey = { campaigns: "campaigns", "line-items": "lineItems", creatives: "creatives", budgets: "budgets", quarantine: "quarantine" }[currentPage];
+  const columns = currentColumns();
+
+  const toolbar = el("div", "toolbar");
+  const left = el("div", "toolbar-left");
+  const search = el("label", "search-box");
+  search.append(el("span", "", "⌕"));
+  const searchInput = el("input");
+  searchInput.type = "search";
+  searchInput.name = "resource-search";
+  searchInput.autocomplete = "off";
+  searchInput.placeholder = `搜索${pages[currentPage].noun}…`;
+  searchInput.setAttribute("aria-label", `搜索${pages[currentPage].noun}`);
+  searchInput.value = searchText;
+  searchInput.addEventListener("input", () => {
+    searchText = searchInput.value.trim().toLowerCase();
+    renderTableRows(tableBody, columns);
+  });
+  search.append(searchInput);
+  left.append(search);
+  const right = el("div", "toolbar-right");
+  right.append(el("span", "eyebrow", `${state[resourceKey].length} 条记录`));
+  const statuses = [...new Set(state[resourceKey].map((row) => row.publish_status || row.status).filter(Boolean))];
+  if (statuses.length > 1) {
+    const filter = el("select", "filter-select");
+    filter.name = "status-filter";
+    filter.setAttribute("aria-label", "按状态筛选");
+    for (const [value, label] of [["all", "全部状态"], ...statuses.map((status) => [status, localizeStatus(status)])]) {
+      const option = el("option", "", label);
+      option.value = value;
+      filter.append(option);
+    }
+    filter.value = statuses.includes(filterStatus) ? filterStatus : "all";
+    filter.addEventListener("change", () => {
+      filterStatus = filter.value;
+      renderTableRows(tableBody, columns);
+    });
+    right.append(filter);
+  }
+  toolbar.append(left, right);
+  section.append(toolbar);
 
   const card = el("section", "card table-card");
   const wrap = el("div", "table-wrap");
   const table = el("table");
-  const columns = currentColumns().concat([["actions", "操作"]]);
-  table.append(makeTableHead(columns));
-  const body = el("tbody");
-  renderTableRows(body, columns);
-  table.append(body);
+  table.append(makeTableHead(columns.concat([["actions", "操作"]])));
+  const tableBody = el("tbody");
+  renderTableRows(tableBody, columns);
+  table.append(tableBody);
   wrap.append(table);
   card.append(wrap);
   const footer = el("div", "table-footer");
-  const countKey = { campaigns: "campaigns", "line-items": "lineItems", creatives: "creatives", budgets: "budgets", quarantine: "quarantine" }[currentPage];
-  footer.append(el("span", "", `DSP 管理 API · ${state[countKey].length} 条记录`));
+  footer.append(el("span", "", `DSP 管理 API · ${state[resourceKey].length} 条记录`));
   const pagination = el("div", "pagination");
-  pagination.append(el("span", "page-number current", "1"));
+  pagination.append(el("span", "page-number current", "1"), el("span", "page-number", "›"));
   footer.append(pagination);
   card.append(footer);
   section.append(card);
   return section;
-}
-
-function renderQuarantineResource() {
-  if (state.quarantine.some((item) => item.status === "open")) return makeNote("对账提示", "隔离记录长期未处置会持续占用 dsp_notice_quarantine；确认业务侧无需重放后可标记 resolved。", "⚑");
-  return el("div");
-}
-
-function makeNote(title, text, icon) {
-  const note = el("div", "callout");
-  note.append(el("span", "", icon), el("div"));
-  note.lastChild.append(el("strong", "", `${title}：`), document.createTextNode(text));
-  return note;
 }
 
 function currentColumns() {
@@ -513,66 +649,25 @@ function cellValue(key, row) {
 
 function publishCell(row) {
   const wrapper = el("td");
-  if (!row.publish_status && "budget_scope" in row) { // budget rows have no publish state
+  if ("budget_scope" in row || currentPage === "quarantine") {
     wrapper.append(el("span", `status-pill ${row.status}`, localizeStatus(row.status)));
     return wrapper;
   }
   const pillRow = el("div", "publish-cell");
   pillRow.append(el("span", `status-pill ${row.publish_status || "draft"}`, localizeStatus(row.publish_status || "draft")));
   if (row.config_version) {
-    pillRow.append(el("span", "cell-sub mono", shortHash(row.config_version)));
-    pillRow.lastChild.title = `config_version ${row.config_version}`;
+    const versionTag = el("span", "cell-sub mono", shortHash(row.config_version));
+    versionTag.title = `config_version ${row.config_version}`;
+    pillRow.append(versionTag);
   }
-  wrapper.append(pillRow, el("div", "cell-sub", `v${row.version}`));
+  wrapper.append(pillRow, el("div", "cell-sub", `v${row.version ?? "—"}`));
   return wrapper;
-}
-
-function makeTableRow(row, columns) {
-  const tr = el("tr");
-  for (const [key] of columns) {
-    const td = el("td");
-    if (key === "id") {
-      const display = currentPage === "campaigns" ? campaignName(row.id) : currentPage === "line-items" ? `${row.currency === "USD" ? "bid " : ""}${String(row.id).slice(0, 10)}…` : String(row.id).slice(0, 12);
-      td.append(el("div", "cell-main", display), el("div", "cell-sub mono", row.id));
-    } else if (key === "publish") {
-      const cell = publishCell(row);
-      td.replaceChildren(...cell.childNodes);
-    } else if (key === "status" && currentPage === "budgets") {
-      td.append(el("span", `status-pill ${row.status}`, localizeStatus(row.status)));
-    } else if (key === "status" && currentPage !== "budgets" && currentPage !== "quarantine") {
-      td.append(el("span", `status-pill ${row.publish_status || row.status}`, localizeStatus(row.publish_status || row.status)));
-    } else {
-      td.textContent = cellValue(key, row);
-    }
-    tr.append(td);
-  }
-  const actions = el("div", "row-actions");
-  if (currentPage === "campaigns" || currentPage === "line-items" || currentPage === "creatives") {
-    actions.append(makeButton("✎", "icon-button", () => openEditDialog(row), `编辑 ${displayName(row)}`));
-    actions.append(makeButton("↑", "icon-button icon-publish", () => openPublishDialog(row), `发布 ${displayName(row)}`));
-  }
-  if (currentPage === "quarantine" && row.status === "open") {
-    actions.append(makeButton("✓", "icon-button", () => openResolveDialog(row), `处置 ${shortHash(row.quarantine_id)}`));
-  }
-  const actionCell = el("td");
-  actionCell.append(actions);
-  tr.append(actionCell);
-  return tr;
-}
-
-function displayName(row) {
-  if (currentPage === "campaigns") return campaignName(row.id);
-  if (currentPage === "line-items") return String(row.campaign_id ? campaignName(row.campaign_id) : row.id);
-  if (currentPage === "creatives") return shortHash(row.asset_sha256);
-  return shortHash(row.id ?? row.quarantine_id);
 }
 
 function renderTableRows(body, columns) {
   const key = { campaigns: "campaigns", "line-items": "lineItems", creatives: "creatives", budgets: "budgets", quarantine: "quarantine" }[currentPage];
   let rows = state[key];
-  if (filterStatus !== "all") {
-    rows = rows.filter((row) => (row.publish_status || row.status) === filterStatus);
-  }
+  if (filterStatus !== "all") rows = rows.filter((row) => (row.publish_status || row.status) === filterStatus);
   if (searchText) {
     const needle = searchText.toLowerCase();
     rows = rows.filter((row) => JSON.stringify(row).toLowerCase().includes(needle));
@@ -581,13 +676,129 @@ function renderTableRows(body, columns) {
   if (!rows.length) {
     const tr = el("tr");
     const td = el("td", "empty-table");
-    td.colSpan = columns.length;
-    td.append(el("strong", "", "暂无记录"), document.createTextNode(" 通过页头按钮创建，或调整搜索条件。"));
+    td.colSpan = columns.length + 1;
+    td.append(el("strong", "", "没有找到匹配记录"), document.createTextNode("调整搜索词或筛选条件后重试。"));
     tr.append(td);
     body.append(tr);
     return;
   }
   for (const row of rows) body.append(makeTableRow(row, columns));
+}
+
+function makeTableRow(row, columns) {
+  const tr = el("tr");
+  for (const [key] of columns) {
+    const td = el("td");
+    if (key === "id") {
+      const display = currentPage === "campaigns" ? campaignName(row.id)
+        : currentPage === "creatives" ? shortHash(row.asset_sha256)
+        : currentPage === "quarantine" ? `rsv ${shortHash(row.reservation_id || row.quarantine_id)}`
+        : String(row.id).slice(0, 12);
+      td.append(el("div", "cell-main", display), el("div", "cell-sub mono", row.id ?? row.quarantine_id));
+    } else if (key === "publish") {
+      const cell = publishCell(row);
+      td.replaceChildren(...cell.childNodes);
+    } else if (key === "status") {
+      td.append(el("span", `status-pill ${row.status}`, localizeStatus(row.status) || "—"));
+    } else {
+      td.textContent = cellValue(key, row);
+    }
+    tr.append(td);
+  }
+  const actions = el("div", "row-actions");
+  if (currentPage === "campaigns" || currentPage === "line-items" || currentPage === "creatives") {
+    actions.append(makeButton("✎", "icon-button", () => openEditDialog(row), `编辑 ${displayName(row)}`));
+    actions.append(makeButton("↑", "icon-button", () => openPublishDialog(row), `发布 ${displayName(row)}`));
+  }
+  if (currentPage === "quarantine" && row.status === "open") {
+    actions.append(makeButton("✓", "icon-button", () => openResolveDialog(row), `处置 ${shortHash(row.quarantine_id)}`));
+  }
+  actions.append(makeButton("⋯", "icon-button", () => openDetails(row), `查看 ${displayName(row)} 详情`));
+  const actionCell = el("td");
+  actionCell.append(actions);
+  tr.append(actionCell);
+  return tr;
+}
+
+function displayName(row) {
+  if (currentPage === "campaigns") return campaignName(row.id);
+  if (currentPage === "line-items") return campaignName(row.campaign_id);
+  if (currentPage === "creatives") return shortHash(row.asset_sha256);
+  if (currentPage === "quarantine") return shortHash(row.quarantine_id);
+  return shortHash(row.id ?? row.line_item_id);
+}
+
+// ---------------------------------------------------------------------------
+// Details dialog — the same "⋯" pattern as the prototype, real field dump.
+
+const detailLabels = {
+  id: "资源 ID", status: "状态", version: "草稿版本", config_version: "Config Version", publish_status: "发布状态",
+  advertiser_id: "Advertiser", campaign_id: "Campaign", starts_at: "开始时间", ends_at: "结束时间",
+  bid_cpm_micros: "Bid CPM (micros)", currency: "币种", daily_budget_micros: "Daily Budget (micros)",
+  lifetime_budget_micros: "Lifetime Budget (micros)", targeting: "Targeting", creative_ids: "关联创意",
+  format: "格式", asset_ref: "Asset Ref", asset_sha256: "Asset SHA-256", width_px: "宽", height_px: "高",
+  landing_url: "落地页", budget_scope: "预算 Scope", period_start: "Period Start",
+  budget_limit_micros: "预算上限", spent_micros: "已消耗", leased_micros: "租约占用", available_micros: "可用",
+  quarantine_id: "隔离记录 ID", reservation_id: "Reservation", source_event_key: "Source Event Key",
+  outcome: "Outcome", reason_code: "Reason Code", received_at: "接收时间", tenant_id: "Tenant",
+  manifest_version: "Manifest 版本", outbox_pending_count: "Outbox 待确认", loaded_snapshot_version: "Bidder 加载版本",
+};
+
+function openDetails(row) {
+  const content = el("div", "detail-panel");
+  const list = el("dl");
+  const details = rawDetails(row);
+  for (const entry of details) {
+    const dt = el("dt", "", detailLabels[entry.key] ?? entry.key);
+    const dd = el("dd", "mono");
+    dd.textContent = entry.value ?? "—";
+    list.append(dt, dd);
+  }
+  content.append(list);
+  openDialog(resourcesTitle(), positionSummary(row), content);
+}
+
+function resourcesTitle() {
+  const titles = {
+    campaigns: "Campaign 详情",
+    "line-items": "Line Item 详情",
+    creatives: "Creative 详情",
+    budgets: "预算账户详情",
+    quarantine: "隔离记录详情",
+  };
+  return titles[currentPage] ?? "详情";
+}
+
+function positionSummary(row) {
+  const summaries = {
+    budgets: `scope ${row.budget_scope} · ${row.currency}`,
+    quarantine: `记录 ${shortHash(row.quarantine_id)}· 状态 ${localizeStatus(row.status)}`,
+  };
+  return summaries[currentPage] ?? `${pages[currentPage].title} ${displayName(row)} · ${localizeStatus(row.publish_status || row.status)}`;
+}
+
+function rawDetails(row) {
+  const details = [];
+  const keys = ["id", "status", "version", "publish_status", "config_version"];
+  const typeKeys = {
+    campaigns: ["advertiser_id", "starts_at", "ends_at"],
+    "line-items": ["campaign_id", "bid_cpm_micros", "currency", "daily_budget_micros", "lifetime_budget_micros", "targeting", "creative_ids"],
+    creatives: ["format", "asset_ref", "asset_sha256", "width_px", "height_px", "landing_url"],
+    budgets: ["line_item_id", "budget_scope", "period_start", "currency", "budget_limit_micros", "spent_micros", "leased_micros", "available_micros", "status"],
+    quarantine: ["quarantine_id", "reservation_id", "source_event_key", "outcome", "reason_code", "status", "received_at"],
+  };
+  for (const sourceKey of (keys.concat(typeKeys[currentPage] ?? []))) {
+    let value = row[sourceKey];
+    if (value === undefined || value === null || value === "") continue;
+    if (typeof value === "object") value = JSON.stringify(value);
+    if (sourceKey === "targeting") value = targetingSummary(row);
+    if (["starts_at", "ends_at", "received_at", "period_start"].includes(sourceKey)) value = formatStamp(value);
+    if (["spent_micros", "leased_micros", "available_micros", "budget_limit_micros", "bid_cpm_micros", "daily_budget_micros", "lifetime_budget_micros"].includes(sourceKey)) {
+      value = `${value} micros (≈${formatIn(value)} ${row.currency ?? "USD"})`;
+    }
+    details.push({ key: sourceKey, value: String(value) });
+  }
+  return details;
 }
 
 // ---------------------------------------------------------------------------
@@ -667,7 +878,6 @@ function openPublishDialog(row) {
   const actions = el("div", "dialog-actions");
   actions.append(makeButton("取消", "button", () => dialog.close()));
   const submit = el("button", "button button-primary", `确认发布 v${row.version}`);
-  submit.type = "submit";
   actions.append(submit);
   content.append(error, actions);
   const dialog = openDialog(`发布 ${kind}`, "发布是版本化但不可逆的审计操作；重复发布会生成新的 config_version。", content);
@@ -683,17 +893,13 @@ function openPublishDialog(row) {
       dialog.close();
       showToast(`已提交发布 · config_version ${shortHash(result.config_version)}`);
       pollPublishOutcome(result.config_version);
-    } catch (error) {
+    } catch (publishError) {
       submit.disabled = false;
       submit.textContent = `确认发布 v${row.version}`;
-      if (handleApiError(error)) dialog.close();
-      else {
-        error.hidden = false;
-        error.textContent = error.message;
-      }
+      if (handleApiError(publishError)) dialog.close();
+      else showFormError(error, submit, publishError.message);
     }
   });
-  void form;
 }
 
 async function pollPublishOutcome(configVersion) {
@@ -714,6 +920,12 @@ async function pollPublishOutcome(configVersion) {
 
 // -- Advertiser / Campaign ------------------------------------------------
 
+function openEditDialog(row) {
+  if (currentPage === "campaigns") return openCampaignDialog(row);
+  if (currentPage === "line-items") return openLineItemDialog(row);
+  return openCreativeDialog(row);
+}
+
 function openCampaignDialog(existing) {
   const form = el("form", "dialog-form");
   form.noValidate = true;
@@ -732,6 +944,7 @@ function openCampaignDialog(existing) {
     option.value = advertiser.id;
     advertiserSelect.append(option);
   }
+  if (existing) advertiserSelect.value = existing.advertiser_id;
   advertiserRow.append(advertiserSelect);
   grid.append(advertiserRow);
 
@@ -783,17 +996,11 @@ function openCampaignDialog(existing) {
     event.preventDefault();
     const payload = { status: statusSelect.value };
     const startsAt = toRFC3339(startInput.value);
-    if (!startsAt) {
-      showFormError(error, startInput, "starts_at 无效");
-      return;
-    }
+    if (!startsAt) return showFormError(error, startInput, "starts_at 无效");
     payload.starts_at = startsAt;
     const endsAt = toRFC3339(endInput.value);
     if (endsAt) payload.ends_at = endsAt;
-    if (endInput.value && (!endsAt || new Date(endsAt) <= new Date(startsAt))) {
-      showFormError(error, endInput, "ends_at 必须晚于 starts_at");
-      return;
-    }
+    if (endsAt && new Date(endsAt) <= new Date(startsAt)) return showFormError(error, endInput, "ends_at 必须晚于 starts_at");
     if (advertiserSelect.value) payload.advertiser_id = advertiserSelect.value;
     if (existing) payload.version = existing.version;
     submit.disabled = true;
@@ -807,16 +1014,12 @@ function openCampaignDialog(existing) {
         showToast("Campaign 已创建（草稿）；发布后进入投放热路径");
       }
       dialog.close();
-      await renderPage();
+      await loadAndRender(true);
     } catch (apiError) {
       submit.disabled = false;
       submit.textContent = existing ? "保存草稿" : "创建 Campaign";
-      if (!handleApiError(apiError)) {
-        error.hidden = false;
-        error.textContent = apiError.message;
-      } else {
-        dialog.close();
-      }
+      if (!handleApiError(apiError)) showFormError(error, submit, apiError.message);
+      else dialog.close();
     }
   });
 }
@@ -867,11 +1070,11 @@ function openAdvertiserDialog(select) {
       option.value = created.id;
       select.append(option);
       select.value = created.id;
+      state.advertisers.push({ id: created.id, status: statusSelect.value, default_currency: currencySelect.value });
       showToast(`Advertiser ${shortHash(created.id)} 已创建`);
     } catch (apiError) {
       submit.disabled = false;
-      error.hidden = false;
-      error.textContent = apiError.message;
+      showFormError(error, submit, apiError.message);
     }
   });
 }
@@ -887,7 +1090,7 @@ function openLineItemDialog(existing) {
   campaignField.append(el("label", "", "Campaign"));
   const campaignSelect = el("select");
   campaignSelect.name = "campaign_id";
-  campaignSelect.required = !existing;
+  campaignSelect.required = true;
   if (!state.campaigns.length) {
     const empty = el("option", "", "（暂无 Campaign，请先创建）");
     empty.value = "";
@@ -975,18 +1178,15 @@ function openLineItemDialog(existing) {
   lifetimeField.append(lifetimeInput);
   grid.append(lifetimeField);
 
-  // Targeting: banner sizes (checkbox list), site domains, page prefixes.
   grid.append(makeSectionLabel("Targeting"));
   const sizeField = el("div", "form-field full");
   sizeField.append(el("label", "", "Banner 尺寸（至少一个）"));
   const sizeList = el("div", "checkbox-list");
   for (const [width, height] of bannerSizes) {
-    const id = `size-${width}-${height}`;
     const label = el("label", "checkbox-item");
     const checkbox = el("input");
     checkbox.type = "checkbox";
     checkbox.value = `${width}x${height}`;
-    checkbox.id = id;
     checkbox.checked = (existing?.targeting?.banner_sizes ?? []).some((size) => size.w === width && size.h === height);
     label.append(checkbox, el("span", "", `${width} × ${height}`));
     sizeList.append(label);
@@ -1020,12 +1220,10 @@ function openLineItemDialog(existing) {
     creativeList.append(el("small", "", "暂无 Creative，请先在素材页上传。"));
   }
   for (const creative of state.creatives) {
-    const id = `creative-${creative.id}`;
     const label = el("label", "checkbox-item");
     const checkbox = el("input");
     checkbox.type = "checkbox";
     checkbox.value = creative.id;
-    checkbox.id = id;
     checkbox.checked = (existing?.creative_ids ?? []).includes(creative.id);
     label.append(
       checkbox,
@@ -1057,7 +1255,7 @@ function openLineItemDialog(existing) {
     const creativeIds = [...creativeList.querySelectorAll("input:checked")].map((box) => box.value);
     if (Number(bidInput.value) <= 0) return showFormError(error, bidInput, "Bid CPM micros 必须为正");
     if (Number(dailyInput.value) <= 0 || Number(lifetimeInput.value) <= 0) return showFormError(error, dailyInput, "daily / lifetime 预算必须为正数（micros）");
-    if (existing && !campaignSelect.value) return showFormError(error, campaignSelect, "请选择 Campaign");
+    if (!campaignSelect.value && existing) return showFormError(error, campaignSelect, "请选择 Campaign");
     if (sizes.length === 0) return showFormError(error, sizeList, "至少选择一个 banner 尺寸");
     if (creativeIds.length === 0) return showFormError(error, creativeList, "至少关联一个 Creative");
     const payload = {
@@ -1086,16 +1284,12 @@ function openLineItemDialog(existing) {
         showToast("Line Item 已创建（草稿）");
       }
       dialog.close();
-      await renderPage();
+      await loadAndRender(true);
     } catch (apiError) {
       submit.disabled = false;
       submit.textContent = existing ? "保存草稿" : "创建 Line Item";
-      if (!handleApiError(apiError)) {
-        error.hidden = false;
-        error.textContent = apiError.message;
-      } else {
-        dialog.close();
-      }
+      if (!handleApiError(apiError)) showFormError(error, submit, apiError.message);
+      else dialog.close();
     }
   });
 }
@@ -1199,16 +1393,12 @@ function openCreativeDialog(existing) {
         showToast(`Creative 已登记（${shortHash(assetSHA)}）`);
       }
       dialog.close();
-      await renderPage();
+      await loadAndRender(true);
     } catch (apiError) {
       submit.disabled = false;
       submit.textContent = existing ? "保存 Creative" : "上传并登记 Creative";
-      if (!handleApiError(apiError)) {
-        error.hidden = false;
-        error.textContent = apiError.message;
-      } else {
-        dialog.close();
-      }
+      if (!handleApiError(apiError)) showFormError(error, submit, apiError.message);
+      else dialog.close();
     }
   });
 }
@@ -1235,20 +1425,20 @@ function openResolveDialog(row) {
     summary.append(li);
   }
   content.append(summary, el("p", "publish-hint", "标记 resolved 表示业务侧已确认该 notice 不可重放；操作经由管理 API 幂等完成。"));
-  const actionState = el("div", "dialog-actions");
-  actionState.append(makeButton("取消", "button", () => dialog.close()));
+  const actions = el("div", "dialog-actions");
+  actions.append(makeButton("取消", "button", () => dialog.close()));
   const submit = el("button", "button button-primary", "标记 resolved");
-  actionState.append(submit);
-  content.append(actionState);
+  actions.append(submit);
+  content.append(actions);
   const dialog = openDialog("处置账务隔离记录", "确认后该记录从 open 列表移除；处置属于审计操作。", content);
   submit.addEventListener("click", async () => {
     submit.disabled = true;
     submit.textContent = "处置中…";
     try {
-      await apiFetch(`quarantine/${row.quarantine_id}/resolve`, { method: "POST", body: null, headers: {} });
+      await apiFetch(`quarantine/${row.quarantine_id}/resolve`, { method: "POST", headers: {} });
       dialog.close();
       showToast("隔离记录已处置");
-      await renderPage();
+      await loadAndRender(true);
     } catch (error) {
       submit.disabled = false;
       submit.textContent = "标记 resolved";
@@ -1259,11 +1449,27 @@ function openResolveDialog(row) {
 
 // -- Shared form helpers ----------------------------------------------------
 
+function showToast(message) {
+  const toast = document.querySelector("#console-toast");
+  if (!toast) return;
+  toast.textContent = message;
+  toast.hidden = false;
+  window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => { toast.hidden = true; }, 2600);
+}
+
 function showFormError(errorNode, focusNode, message) {
   errorNode.textContent = message;
   errorNode.hidden = false;
   if (focusNode) focusNode.focus();
   return false;
+}
+
+function makeNote(title, text, icon) {
+  const note = el("div", "callout");
+  note.append(el("span", "", icon), el("div"));
+  note.lastChild.append(el("strong", "", `${title}：`), document.createTextNode(text));
+  return note;
 }
 
 // ---------------------------------------------------------------------------
@@ -1278,7 +1484,7 @@ async function loadAndRender(force = false) {
     state.onlineError = error?.message || "连接失败";
   }
   renderShell();
-  await renderPage();
+  renderPage();
 }
 
 window.addEventListener("hashchange", () => {
