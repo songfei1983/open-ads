@@ -178,9 +178,14 @@ func (s *Server) handleAdRequests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	audience := []audienceSegment{}
 	if req.Consent.Value != "" && s.cfg.DMPURL != "" {
-		if err := s.resolveAudience(r.Context(), reqID, req); err != nil {
-			s.logger.Warn("audience resolve failed", slog.String("request_id", reqID), slog.Any("error", err))
+		// Privacy gate: audience resolution is consent-based and the SSP
+		// fails closed to no-fill when the DMP cannot resolve segments.
+		var audienceErr error
+		audience, audienceErr = s.resolveAudience(r.Context(), reqID, req)
+		if audienceErr != nil {
+			s.logger.Warn("audience resolve failed", slog.String("request_id", reqID), slog.Any("error", audienceErr))
 			writeNoFill(w, reqID)
 			return
 		}
@@ -209,6 +214,7 @@ func (s *Server) handleAdRequests(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"request_id": reqID,
 		"status":     "filled",
+		"audience":   map[string]any{"segments": audience},
 		"ad": map[string]any{
 			"creative_id": resp.CreativeID,
 			"format":      "image",
@@ -305,9 +311,24 @@ type bidResponse struct {
 }
 type selectedBid struct{ CreativeID, RenderURL, ClickURL, EventToken string }
 
-func (s *Server) resolveAudience(ctx context.Context, reqID string, req adRequest) error {
+// audienceSegment is one resolved interest segment; only campaign-agnostic
+// metadata ever crosses the SSP boundary.
+type audienceSegment struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+func (s *Server) resolveAudience(ctx context.Context, reqID string, req adRequest) ([]audienceSegment, error) {
 	payload := audienceResolveRequest{RequestID: reqID, TenantID: "tenant-default", ProviderID: "dmp-provider-01", Namespace: "publisher-account-v1", SubjectToken: req.Consent.Value, Purposes: []string{"personalized_ads"}, MaxSegments: 10}
-	return s.postJSON(ctx, s.cfg.DMPURL+"/internal/v1/audiences:resolve", payload, &struct{}{}, s.cfg.DMPTimeout)
+	target := struct {
+		Segments []audienceSegment `json:"segments"`
+	}{}
+	if err := s.postJSON(ctx, s.cfg.DMPURL+"/internal/v1/audiences:resolve", payload, &target, s.cfg.DMPTimeout); err != nil {
+		return nil, err
+	}
+	s.metrics.ObserveAudienceResolve()
+	s.logger.Info("audience resolved", slog.String("request_id", reqID), slog.Int("segments", len(target.Segments)))
+	return target.Segments, nil
 }
 
 func (s *Server) requestBid(ctx context.Context, reqID string, req adRequest) (*selectedBid, error) {

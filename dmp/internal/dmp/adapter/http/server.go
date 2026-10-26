@@ -2,8 +2,11 @@ package http
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -91,15 +94,67 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// audienceResolveMessage mirrors the internal resolve API request; only
+// server-declared fields are accepted (fail-closed decoding).
+type audienceResolveMessage struct {
+	RequestID    string   `json:"request_id"`
+	TenantID     string   `json:"tenant_id"`
+	ProviderID   string   `json:"provider_id"`
+	Namespace    string   `json:"namespace"`
+	SubjectToken string   `json:"subject_token"`
+	Purposes     []string `json:"purposes"`
+	MaxSegments  int      `json:"max_segments"`
+}
+
+// sandboxResolvedSegment is a documented demo-only interest segment returned
+// for the well-known sandbox consent token. Production resolution must come
+// from membership snapshots, never from this stub path.
+type sandboxResolvedSegment struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// sandboxFixtureSubjectToken is the token the console UI sends when the user
+// opts in; other tokens resolve no segments.
+const sandboxFixtureSubjectToken = "sandbox-consent-demo-01"
+
 func (s *Server) handleAudienceResolve(w http.ResponseWriter, r *http.Request) {
 	reqID := observability.RequestIDFromContext(r.Context())
+	var req audienceResolveMessage
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
+	if err != nil || len(body) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "invalid_request", "message": "invalid audience resolve request", "request_id": reqID})
+		return
+	}
+	dec := json.NewDecoder(strings.NewReader(string(body)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "invalid_request", "message": "invalid audience resolve request", "request_id": reqID})
+		return
+	}
+
+	// Audit without ever persisting the raw subject token.
+	digest := sha256.Sum256([]byte(req.SubjectToken))
+	subjectHash := hex.EncodeToString(digest[:8])
+	segments := []sandboxResolvedSegment{}
+	if req.SubjectToken == sandboxFixtureSubjectToken {
+		segments = []sandboxResolvedSegment{
+			{ID: "seg-demo-sports", Name: "演示 · 运动爱好者"},
+			{ID: "seg-demo-tech", Name: "演示 · 数码科技"},
+		}
+	}
+	if req.MaxSegments > 0 && len(segments) > req.MaxSegments {
+		segments = segments[:req.MaxSegments]
+	}
+	s.logger.Info("audience resolve", slog.String("request_id", reqID),
+		slog.String("subject_hash", subjectHash), slog.Int("segments", len(segments)))
 
 	// Standard resolve response matching API.md
 	writeJSON(w, http.StatusOK, map[string]any{
 		"request_id":  reqID,
-		"snapshot_id": "snap-initial-empty",
-		"provider_id": "dmp-provider-default",
-		"segments":    []any{},
+		"snapshot_id": "snap-sandbox-fixture",
+		"provider_id": req.ProviderID,
+		"segments":    segments,
 		"resolved_at": time.Now().UTC().Format(time.RFC3339),
 	})
 }

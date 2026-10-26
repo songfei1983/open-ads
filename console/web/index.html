@@ -96,6 +96,17 @@
               </div>
             </fieldset>
 
+            <fieldset>
+              <legend>隐私与受众</legend>
+              <div class="field">
+                <label class="field-label" style="display:flex;align-items:center;gap:8px">
+                  <input id="consent" name="consent" type="checkbox">
+                  <span>附加 consent 演示令牌</span>
+                </label>
+                <span class="field-hint">开启后请求携带 consent 令牌，SSP 将调用 DMP 做受众解析并回填 segments；关闭则不调用 DMP（隐私 fail-closed）。</span>
+              </div>
+            </fieldset>
+
             <fieldset class="scenario-fieldset">
               <legend>模拟场景</legend>
               <label class="field-label" for="scenario">响应类型</label>

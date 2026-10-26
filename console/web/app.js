@@ -172,7 +172,7 @@ async function requestLive(payload) {
         placement_id: payload.placement_id,
         slot: payload.slot,
         page: payload.page,
-        consent: { source: "test-fixture", value: null }
+        consent: { source: "test-fixture", value: document.querySelector("#consent").checked ? "sandbox-consent-demo-01" : "" }
       })
     });
     const body = await response.json();
