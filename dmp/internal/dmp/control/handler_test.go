@@ -764,3 +764,71 @@ func TestRejectionFailsClosedWhenItCannotBeAudited(t *testing.T) {
 		t.Fatalf("an unauditable rejection must fail closed, got %d %v", status, payload)
 	}
 }
+
+func TestMaintenanceDuplicatesDefaultsToADryRun(t *testing.T) {
+	store := newPrunableStore()
+	handler := control.NewHandler(control.HandlerOptions{Store: store, Token: testToken, Actor: "sandbox-operator"})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler.ServeHTTP(w, r.WithContext(observability.WithRequestID(r.Context(), "req-maintenance")))
+	}))
+	t.Cleanup(ts.Close)
+
+	status, body := rawCall(t, ts, http.MethodGet, "/admin/v1/maintenance/duplicate-versions")
+	if status != http.StatusOK {
+		t.Fatalf("inspect duplicates: %d %s", status, body)
+	}
+	var report control.PruneReport
+	if err := json.Unmarshal([]byte(body), &report); err != nil {
+		t.Fatalf("decode report: %v (%s)", err, body)
+	}
+	if !report.DryRun || report.RowsToDelete != 1 || len(report.Groups) != 1 {
+		t.Fatalf("inspection must count the losing row: %+v", report)
+	}
+	if store.pruned {
+		t.Fatal("inspection must not delete anything")
+	}
+
+	status, payload := call(t, ts, http.MethodPost, "/admin/v1/maintenance/duplicate-versions", "")
+	if status != http.StatusOK || payload["dry_run"] != true {
+		t.Fatalf("a body-less prune must dry run, got %d %v", status, payload)
+	}
+	if store.pruned {
+		t.Fatal("the default prune must not delete anything")
+	}
+
+	status, payload = call(t, ts, http.MethodPost, "/admin/v1/maintenance/duplicate-versions", `{"dry_run":false}`)
+	if status != http.StatusOK || payload["dry_run"] != false || payload["deleted_rows"] != float64(1) {
+		t.Fatalf("explicit prune must delete the losing row, got %d %v", status, payload)
+	}
+	if !store.pruned {
+		t.Fatal("the explicit prune did not delete")
+	}
+}
+
+// prunableStore exposes the maintenance surface over the memory store.
+type prunableStore struct {
+	*memoryStore
+	pruned bool
+}
+
+func newPrunableStore() *prunableStore {
+	return &prunableStore{memoryStore: newMemoryStore()}
+}
+
+func (p *prunableStore) FindDuplicateVersions(context.Context) ([]control.DuplicateVersion, error) {
+	return []control.DuplicateVersion{{
+		ResourceType: "namespace", ResourceID: "publisher-account-v1", Version: 1, Rows: 2,
+		Keeper: "018f0000-0000-7000-8000-000000000001",
+	}}, nil
+}
+
+func (p *prunableStore) PruneDuplicateVersions(_ context.Context, dryRun bool) (control.PruneReport, error) {
+	groups, _ := p.FindDuplicateVersions(context.Background())
+	report := control.PruneReport{DryRun: dryRun, Groups: groups, RowsToDelete: 1}
+	if !dryRun {
+		p.pruned = true
+		report.DeletedRows = 1
+		report.MutationsFired = 1
+	}
+	return report, nil
+}

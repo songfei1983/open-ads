@@ -64,6 +64,17 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.listAudit(w, r)
 		return
 	}
+	if path == "maintenance/duplicate-versions" {
+		switch r.Method {
+		case http.MethodGet:
+			h.reportDuplicateVersions(w, r)
+		case http.MethodPost:
+			h.pruneDuplicateVersions(w, r)
+		default:
+			h.methodNotAllowed(w, r, http.MethodGet, http.MethodPost)
+		}
+		return
+	}
 
 	parts := strings.Split(path, "/")
 	if path == "" || parts[0] == "" || len(parts) > 2 || (len(parts) == 2 && parts[1] == "") {
@@ -294,6 +305,72 @@ func (h *handler) listUnfinishedIntents(w http.ResponseWriter, r *http.Request) 
 		entries = []AuditEntry{}
 	}
 	writeJSON(w, http.StatusOK, entries)
+}
+
+// maintenance returns the optional store maintenance surface.
+func (h *handler) maintenance(w http.ResponseWriter, r *http.Request) (Maintenance, bool) {
+	store, ok := h.store.(Maintenance)
+	if !ok {
+		writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusServiceUnavailable, "control_plane_unavailable", "definition store does not support maintenance")
+		return nil, false
+	}
+	return store, true
+}
+
+// reportDuplicateVersions counts losing rows without deleting anything.
+func (h *handler) reportDuplicateVersions(w http.ResponseWriter, r *http.Request) {
+	store, ok := h.maintenance(w, r)
+	if !ok {
+		return
+	}
+	groups, err := store.FindDuplicateVersions(r.Context())
+	if err != nil {
+		h.fail(w, r, "maintenance", "", err)
+		return
+	}
+	if groups == nil {
+		groups = []DuplicateVersion{}
+	}
+	report := PruneReport{DryRun: true, Groups: groups}
+	for _, group := range groups {
+		report.RowsToDelete += group.Rows - 1
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+// pruneDuplicateVersions deletes losing rows. It defaults to a dry run so an
+// accidental call never mutates storage.
+func (h *handler) pruneDuplicateVersions(w http.ResponseWriter, r *http.Request) {
+	store, ok := h.maintenance(w, r)
+	if !ok {
+		return
+	}
+	input := struct {
+		DryRun *bool `json:"dry_run"`
+	}{}
+	if r.ContentLength > 0 {
+		if !decode(w, r, &input) {
+			return
+		}
+	}
+	dryRun := true
+	if input.DryRun != nil {
+		dryRun = *input.DryRun
+	}
+	report, err := store.PruneDuplicateVersions(r.Context(), dryRun)
+	if err != nil {
+		h.fail(w, r, "maintenance", "", err)
+		return
+	}
+	if report.Groups == nil {
+		report.Groups = []DuplicateVersion{}
+	}
+	h.logger.Info("DMP duplicate version sweep",
+		slog.String("request_id", observability.RequestIDFromContext(r.Context())),
+		slog.Bool("dry_run", report.DryRun),
+		slog.Uint64("groups", uint64(len(report.Groups))),
+		slog.Uint64("deleted_rows", report.DeletedRows))
+	writeJSON(w, http.StatusOK, report)
 }
 
 func (h *handler) respond(w http.ResponseWriter, r *http.Request, resourceType, resourceID string, status int, value any, err error) {

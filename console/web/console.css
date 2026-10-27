@@ -96,6 +96,7 @@ h1 { margin-top: 7px; color: #282e28; font: 700 23px "Manrope", "PingFang SC", s
 .card-header { min-height: 54px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 15px; border-bottom: 1px solid #edf0eb; }
 .card-header h2 { color: #343a34; font: 700 12px "Manrope", "PingFang SC", sans-serif; }
 .card-header p { margin-top: 3px; color: #92978f; font-size: 9px; }
+.card-actions { display: flex; gap: 8px; padding: 11px 15px; border-bottom: 1px solid #edf0eb; }
 .card-link { border: 0; color: #4e805c; background: transparent; font-size: 9px; font-weight: 600; cursor: pointer; }
 .table-wrap { width: 100%; overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; text-align: left; }

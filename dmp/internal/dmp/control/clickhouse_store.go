@@ -45,6 +45,9 @@ func NewClickHouseStore(conn clickhouse.Conn, tenantID uuid.UUID) *ClickHouseSto
 	return &ClickHouseStore{conn: conn, tenantID: tenantID, now: func() time.Time { return time.Now().UTC() }}
 }
 
+// TenantID returns the tenant this store is bound to.
+func (s *ClickHouseStore) TenantID() uuid.UUID { return s.tenantID }
+
 // OpenClickHouse opens a connection pool and verifies it is reachable.
 func OpenClickHouse(ctx context.Context, addr, user, password, database string) (clickhouse.Conn, error) {
 	conn, err := clickhouse.Open(&clickhouse.Options{

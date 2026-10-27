@@ -23,6 +23,7 @@ const state = {
   publications: [],
   revocations: [],
   retention: null,
+  duplicates: null,
   lastSweep: null,
   connected: false,
   error: "",
@@ -801,6 +802,8 @@ function renderRetention(main) {
   main.append(stats);
   main.append(note("删除边界", "快照删除按 tenant + snapshot_id 精确执行；同月分区中的其他快照不受影响，当前服务快照永不删除。撤回 token 的物理删除会清空 membership 与事件行，但保留 tombstone。", "⌛"));
 
+  main.append(maintenanceCard());
+
   if (state.lastSweep) {
     const sweep = state.lastSweep;
     main.append(tableCard("最近一次 sweep", fmtTime(sweep.finished_at), ["过期快照", "删除行数", "物理删除主体", "待处理", "失败"], [[
@@ -810,6 +813,55 @@ function renderRetention(main) {
       cell(String(sweep.pending_purges ?? 0)),
       cell(String(sweep.failures?.length ?? 0)),
     ]]));
+  }
+}
+
+// -- maintenance -------------------------------------------------------------
+
+function maintenanceCard() {
+  const card = el("section", "card");
+  const header = el("div", "card-header");
+  const title = el("div");
+  title.append(el("h2", "", "同版本落败行"), el("p", "card-subtitle", "并发写同一版本时 ClickHouse 会保留所有行；保留 argMin(revision_id) 后清理其余行"));
+  header.append(title);
+  card.append(header);
+  if (!state.duplicates) {
+    card.append(note("巡检不可用", "当前 definition store 不支持维护巡检。", "ⓘ"));
+    return card;
+  }
+  const groups = state.duplicates.groups ?? [];
+  if (groups.length === 0) {
+    card.append(note("没有落败行", "每个版本只有一行，无需清理。", "✓"));
+    return card;
+  }
+  const actions = el("div", "card-actions");
+  actions.append(
+    makeButton("仅巡检（dry run）", "button", () => runPrune(false)),
+    makeButton(`清理 ${state.duplicates.rows_to_delete} 行`, "button button-danger", () => runPrune(true)),
+  );
+  card.append(actions);
+  card.append(tableCard("重复版本", `预计清理 ${state.duplicates.rows_to_delete} 行`, ["资源", "ID", "版本", "行数", "保留 revision"], groups.map((group) => [
+    cell(group.resource_type),
+    nodeCell(el("code", "", group.resource_id)),
+    cell(String(group.version)),
+    cell(String(group.rows)),
+    nodeCell(el("code", "", short(group.keeper_revision_id, 12))),
+  ])));
+  return card;
+}
+
+async function runPrune(apply) {
+  try {
+    const report = await apiFetch("/admin/v1/maintenance/duplicate-versions", {
+      method: "POST",
+      body: JSON.stringify({ dry_run: !apply }),
+    });
+    showToast(report.dry_run
+      ? `巡检：${report.groups.length} 个版本、${report.rows_to_delete} 行待清理`
+      : `已清理 ${report.deleted_rows} 行落败行`);
+    await loadAndRender(true);
+  } catch (error) {
+    handleError(error);
   }
 }
 
@@ -826,7 +878,7 @@ async function runSweep() {
 // -- data + render -----------------------------------------------------------
 
 async function refreshAll() {
-  const [providers, namespaces, segments, snapshots, publications, revocations, retention] = await Promise.all([
+  const [providers, namespaces, segments, snapshots, publications, revocations, retention, duplicates] = await Promise.all([
     apiFetch("/admin/v1/providers"),
     apiFetch("/admin/v1/namespaces"),
     apiFetch("/admin/v1/segments"),
@@ -834,6 +886,8 @@ async function refreshAll() {
     apiFetch("/internal/v1/publications"),
     apiFetch("/internal/v1/identity-revocations"),
     apiFetch("/internal/v1/retention:policy"),
+    // A store without maintenance support must not blank the whole console.
+    apiFetch("/admin/v1/maintenance/duplicate-versions").catch(() => null),
   ]);
   state.providers = providers ?? [];
   state.namespaces = namespaces ?? [];
@@ -842,6 +896,7 @@ async function refreshAll() {
   state.publications = publications ?? [];
   state.revocations = revocations ?? [];
   state.retention = retention;
+  state.duplicates = duplicates;
   state.publishedCount = state.publications.length;
   state.pendingRevocations = state.revocations.filter((r) => r.physical_delete_status === "pending").length;
   state.connected = true;

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/google/uuid"
 
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/control"
@@ -34,6 +35,22 @@ func newIntegrationStore(t *testing.T) *control.ClickHouseStore {
 	store := control.NewClickHouseStore(conn, uuid.New())
 	t.Cleanup(func() { _ = store.Close() })
 	return store
+}
+
+// newIntegrationConn opens a second connection for seeding raw rows.
+func newIntegrationConn(t *testing.T) clickhouse.Conn {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := control.OpenClickHouse(ctx, os.Getenv("DMP_CLICKHOUSE_TEST_ADDR"),
+		envOr("DMP_CLICKHOUSE_TEST_USER", "dmp_user"),
+		envOr("DMP_CLICKHOUSE_TEST_PASSWORD", "dmp_clickhouse_password"),
+		envOr("DMP_CLICKHOUSE_TEST_DATABASE", "dmp"))
+	if err != nil {
+		t.Fatalf("open clickhouse: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
 }
 
 func envOr(key, fallback string) string {
@@ -236,5 +253,65 @@ func TestClickHouseAuditPairsIntentWithOutcome(t *testing.T) {
 		if entry.ResourceID == "audit-namespace" {
 			t.Fatalf("completed attempts must not be reported as unfinished: %+v", entry)
 		}
+	}
+}
+
+func TestClickHousePrunesLosingDuplicateVersions(t *testing.T) {
+	store := newIntegrationStore(t)
+	ctx := context.Background()
+	meta := control.Mutation{Actor: "integration-prune", RequestID: "req-integration-prune"}
+	namespace := control.NamespaceInput{
+		ID: "prune-namespace", DisplayName: "Prune namespace",
+		HashingAlgorithm: control.HashingAlgorithmHMACSHA256, SubjectKeyVersion: 1, RetentionMonths: 3,
+	}
+	if _, err := store.CreateNamespace(ctx, namespace, meta); err != nil {
+		t.Fatalf("create namespace: %v", err)
+	}
+	// Simulate a losing concurrent writer of version 1: the row exists but the
+	// current version comes from the lower revision id.
+	conn := newIntegrationConn(t)
+	if err := conn.Exec(ctx, `INSERT INTO dmp_namespace_version (tenant_id, namespace, version, revision_id,
+		display_name, hashing_algorithm, subject_key_version, retention_months, status, written_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, now64(3))`,
+		store.TenantID(), "prune-namespace", uint64(1), uuid.New(), "Prune namespace",
+		control.HashingAlgorithmHMACSHA256, uint16(1), uint16(3), control.StatusActive); err != nil {
+		t.Fatalf("seed duplicate: %v", err)
+	}
+
+	maintenance, ok := any(store).(control.Maintenance)
+	if !ok {
+		t.Fatal("ClickHouse store must support maintenance")
+	}
+	dryRun, err := maintenance.PruneDuplicateVersions(ctx, true)
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if len(dryRun.Groups) != 1 || dryRun.RowsToDelete != 1 || dryRun.DeletedRows != 0 {
+		t.Fatalf("dry run must count without deleting: %+v", dryRun)
+	}
+
+	applied, err := maintenance.PruneDuplicateVersions(ctx, false)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if applied.DeletedRows != 1 || applied.MutationsFired != 1 {
+		t.Fatalf("prune did not delete the losing row: %+v", applied)
+	}
+
+	after, err := maintenance.FindDuplicateVersions(ctx)
+	if err != nil {
+		t.Fatalf("re-inspect: %v", err)
+	}
+	for _, group := range after {
+		if group.ResourceID == "prune-namespace" {
+			t.Fatalf("duplicate survived the prune: %+v", after)
+		}
+	}
+	current, err := store.GetNamespace(ctx, "prune-namespace")
+	if err != nil {
+		t.Fatalf("namespace must survive the prune: %v", err)
+	}
+	if current.Version != 1 {
+		t.Fatalf("prune changed the current version: %+v", current)
 	}
 }

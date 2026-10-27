@@ -89,10 +89,12 @@ I4-08 实测（浏览器）：控制台各页无 console/page error；代理白�
 | R4+R6 | 引入 `Principal{Caller,Tenant,Scopes}` 与 `Authenticator`（Bearer 现状 + 预留 mTLS），resolve 强制 `tenant_id`（缺失 400、跨租户 403，过渡期保留 `tenant-default` 别名） | 待办 |
 | R1 | 控制面审计改为 intent + outcome 两行，缺 outcome 即"结果未知"并提供巡检查询；拒绝路径审计失败改为 fail-closed | ✅ 完成 |
 | R9 | DMP 业务指标：resolve 结果/时延、gate admission、导入校验、保留删除、epoch、tombstone 数 | ✅ 完成 |
-| R2 | 同版本落败行巡检清理（保留 `argMin(revision_id)`，先 dry-run 计数） | 待办 |
+| R2 | 同版本落败行巡检清理（保留 `argMin(revision_id)`，先 dry-run 计数） | ✅ 完成 |
 | R5 | 抽出共享 `identity.TokenPolicy` + 负例 fixture 集 + 疑似原始身份指标 | 待办 |
 | R3 | 负载/POC 参数化并归档报告，D-01 后按生产拓扑复测 | 待办 |
 | R10 | DMP OpenAPI 3.1 契约工件 + import/revoke 幂等键 | 待办 |
+
+R2 验收（2026-10-27）：新增 `control.Maintenance`（可选接口，不改动 `Store`）：`GET /admin/v1/maintenance/duplicate-versions` 只统计同版本多行（`GROUP BY id, version HAVING count() > 1`），`POST` 默认 `dry_run=true`、显式 `{"dry_run":false}` 才删除；删除语句 `revision_id != argMin(revision_id)` 且 `mutations_sync=1`，保证返回时存储已修复。控制台「保留策略」页新增"同版本落败行"卡片（巡检/清理两个动作）。live 验证：历史并发写入留下 8 行 v2，dry run 报 7 行、清理后巡检为空且当前版本仍为 2；随后并发写 6 次复现 6 行 → 控制台一步清理 5 行、toast 与卡片均正确。ClickHouse 集成测试覆盖 dry-run 不删除、清理只删落败行、当前版本不变。
 
 R9 验收（2026-10-27）：`observability.Business` 提供有界标签的业务计数/仪表，`/metrics` 在 HTTP 指标之后输出：`dmp_audience_resolve_total{result=resolved|empty|denied|no_publication|unavailable|error}`、resolve 时延直方图（0.005~0.25s，累积）、`dmp_audience_resolve_segments_total`、`dmp_gate_admissions_total{result=admitted|denied|unavailable|finalize_denied|finalize_unavailable}`、`dmp_gate_denied_subjects_total`、`dmp_gate_epoch`、`dmp_snapshot_imported_rows_total`、`dmp_snapshot_verify_total{result}`、`dmp_snapshot_publish_total{result}`、`dmp_revocation_subjects_total`（撤回转 tombstone 的主体数）、`dmp_retention_{sweeps_total,deleted_rows_total,purged_subjects_total,pending_purges}`。live 验证：integration.sh 后 `/metrics` 同时出现 resolved/denied 两种结果、admitted/denied 两种 admission、epoch=1、import 2 行、purge 1 个主体、直方图 count=2。
 
