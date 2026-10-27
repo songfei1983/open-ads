@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +13,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -100,8 +103,80 @@ func NewServer(webDir string) http.Handler {
 		}
 		writeJSON(w, map[string]any{"revision": revision, "files": files})
 	})
+	mux.Handle("/api/dsp/", newDSPAdminProxy())
 	mux.Handle("/", &staticHandler{webDir: webDir})
 	return mux
+}
+
+// dspAdminProxyTLSGrace is how long a proxied admin request is allowed to
+// take; the sandbox console never batch-loads, so this is generous.
+const dspAdminProxyTimeout = 15 * time.Second
+
+// newDSPAdminProxy builds the browser-facing bridge to the DSP management
+// API. The DSP admin contract is the ONLY upstream — no database, no
+// Valkey, no side channels — and the bearer token stays server side so the
+// UI cannot leak it. Without a configured token the endpoint answers 503
+// instead of silently proxying unauthenticated requests.
+func newDSPAdminProxy() http.Handler {
+	logger := slog.Default()
+	target := strings.TrimRight(os.Getenv("DSP_ADMIN_URL"), "/")
+	if target == "" {
+		target = "http://127.0.0.1:8081"
+	}
+	upstream, err := url.Parse(target)
+	if err != nil || upstream.Scheme == "" || upstream.Host == "" {
+		logger.Error("DSP_ADMIN_URL is not a valid admin upstream URL", slog.String("target", target), slog.Any("error", err))
+	}
+	proxy := httputil.NewSingleHostReverseProxy(upstream)
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, proxyErr error) {
+		logger.Warn("DSP admin upstream failed", slog.String("upstream", target), slog.Any("error", proxyErr))
+		writeAPIError(w, http.StatusBadGateway, "dsp_admin_unreachable", "DSP 管理 API 不可达，请确认 DSP 服务在运行")
+	}
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		resp.Header.Set("Cache-Control", "no-store")
+		return nil
+	}
+	token := ""
+	if value := os.Getenv("DSP_ADMIN_TOKEN"); strings.TrimSpace(value) != "" {
+		token = strings.TrimSpace(value)
+	}
+	transport := &http.Transport{
+		// Bounded proxying: a sandbox console must not queue unbounded work.
+		MaxIdleConns:        4,
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     30 * time.Second,
+	}
+	proxy.Transport = transport
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if token == "" {
+			writeAPIError(w, http.StatusServiceUnavailable, "dsp_admin_unconfigured", "DSP 管理 API token 未配置（DSP_ADMIN_TOKEN）")
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodPut {
+			writeAPIError(w, http.StatusMethodNotAllowed, "invalid_request", "console 仅转发 GET/POST/PUT 到 DSP 管理 API")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), dspAdminProxyTimeout)
+		defer cancel()
+		request := r.Clone(ctx)
+		// /api/dsp/admin/v1/x → /admin/v1/x on the upstream.
+		request.URL.Path = strings.TrimPrefix(request.URL.Path, "/api/dsp")
+		if !strings.HasPrefix(request.URL.Path, "/admin/v1/") {
+			writeAPIError(w, http.StatusNotFound, "not_found", "仅 /admin/v1/* 可通过代理访问")
+			return
+		}
+		request.Host = upstream.Host
+		request.Header.Set("Authorization", "Bearer "+token)
+		request.Header.Del("Cookie")
+		proxy.ServeHTTP(w, request)
+	})
+}
+
+func writeAPIError(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"code": code, "message": message})
 }
 
 // staticHandler serves the web/ tree and injects the revision watcher into

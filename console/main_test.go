@@ -2,6 +2,7 @@ package main_test
 
 import (
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -122,4 +123,101 @@ func TestRevisionMovesOnEdit(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("revision did not move after an edit: %s", before)
+}
+
+// newDSPAdminStub answers the admin requests the console is allowed to make
+// and records what it saw, so the proxy contract can be asserted exactly.
+func newDSPAdminStub(t *testing.T, recorded *[]string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*recorded = append(*recorded, r.Method+" "+r.URL.Path+" auth="+r.Header.Get("Authorization"))
+		if r.URL.Path == "/admin/v1/error" {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(`{"code":"business_rule_violation","message":"invalid"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+}
+
+func proxyClient(t *testing.T, env map[string]string) (*http.Client, string) {
+	t.Helper()
+	dir := webDir(t)
+	for key, value := range env {
+		t.Setenv(key, value)
+	}
+	// NewServer reads the env once, so build a fresh server per client.
+	ts := httptest.NewServer(console.NewServer(dir))
+	t.Cleanup(ts.Close)
+	client := ts.Client()
+	return client, ts.URL
+}
+
+func TestDSPAdminProxyInjectsTokenAndRewritesPath(t *testing.T) {
+	var recorded []string
+	stub := newDSPAdminStub(t, &recorded)
+	client, baseURL := proxyClient(t, map[string]string{
+		"DSP_ADMIN_URL":   stub.URL,
+		"DSP_ADMIN_TOKEN": "secret-token",
+	})
+
+	resp, err := client.Get(baseURL + "/api/dsp/admin/v1/campaigns")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("proxied admin call: %d", resp.StatusCode)
+	}
+	if len(recorded) != 1 || recorded[0] != "GET /admin/v1/campaigns auth=Bearer secret-token" {
+		t.Fatalf("unexpected upstream call: %v", recorded)
+	}
+}
+
+func TestDSPAdminProxyRejectsNonAdminPathsAndMethods(t *testing.T) {
+	var recorded []string
+	stub := newDSPAdminStub(t, &recorded)
+	client, baseURL := proxyClient(t, map[string]string{
+		"DSP_ADMIN_URL":   stub.URL,
+		"DSP_ADMIN_TOKEN": "secret-token",
+	})
+
+	resp, err := client.Get(baseURL + "/api/dsp/openrtb2/bid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Fatalf("non-admin path should be 404, got %d", resp.StatusCode)
+	}
+
+	request, err := http.NewRequest(http.MethodDelete, baseURL+"/api/dsp/admin/v1/campaigns/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteResp, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteResp.Body.Close()
+	if deleteResp.StatusCode != 405 {
+		t.Fatalf("DELETE should be 405, got %d", deleteResp.StatusCode)
+	}
+	if len(recorded) != 0 {
+		t.Fatalf("requests leaked to upstream: %v", recorded)
+	}
+}
+
+func TestDSPAdminProxyRequiresToken(t *testing.T) {
+	client, baseURL := proxyClient(t, map[string]string{"DSP_ADMIN_TOKEN": ""})
+	resp, err := client.Get(baseURL + "/api/dsp/admin/v1/campaigns")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 503 {
+		t.Fatalf("missing token should be 503, got %d", resp.StatusCode)
+	}
 }
