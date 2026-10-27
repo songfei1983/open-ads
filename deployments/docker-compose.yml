@@ -46,7 +46,16 @@ services:
       - "127.0.0.1:8123:8123"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
-      - ../dmp/migrations:/docker-entrypoint-initdb.d:ro
+      # The ClickHouse entrypoint executes every *.sql file in this directory,
+      # including rollback scripts. Mount the up migrations explicitly so a
+      # fresh volume only applies forward migrations.
+      - ../dmp/migrations/000001_init_dmp_schema.up.sql:/docker-entrypoint-initdb.d/000001_init_dmp_schema.up.sql:ro
+      - ../dmp/migrations/000002_dmp_control_plane.up.sql:/docker-entrypoint-initdb.d/000002_dmp_control_plane.up.sql:ro
+      - ../dmp/migrations/000003_dmp_snapshot_import.up.sql:/docker-entrypoint-initdb.d/000003_dmp_snapshot_import.up.sql:ro
+      - ../dmp/migrations/000004_dmp_retention.up.sql:/docker-entrypoint-initdb.d/000004_dmp_retention.up.sql:ro
+      - ../dmp/migrations/000005_dmp_snapshot_purge.up.sql:/docker-entrypoint-initdb.d/000005_dmp_snapshot_purge.up.sql:ro
+      - ../dmp/migrations/000006_dmp_control_audit_phases.up.sql:/docker-entrypoint-initdb.d/000006_dmp_control_audit_phases.up.sql:ro
+      - ../dmp/migrations/000007_dmp_idempotency.up.sql:/docker-entrypoint-initdb.d/000007_dmp_idempotency.up.sql:ro
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "127.0.0.1:8123/ping"]
       interval: 5s
@@ -96,11 +105,17 @@ services:
       dockerfile: Dockerfile
     image: open-ads-console:dev
     container_name: open-ads-console
+    depends_on:
+      - dsp
+      - dmp
     environment:
       # Console proxies the browser to the DSP management API and injects
       # the admin bearer token server side; the UI holds no credentials.
       DSP_ADMIN_URL: "http://dsp:8081"
       DSP_ADMIN_TOKEN: "supersecrettoken1234567890abcdEF"
+      # Same pattern for DMP: the operator token stays in the console process.
+      DMP_ADMIN_URL: "http://dmp:8082"
+      DMP_ADMIN_TOKEN: "dmp-admin-token-0123456789abcdef"
     ports:
       - "127.0.0.1:8083:8083"
     volumes:
@@ -139,21 +154,47 @@ services:
   # DMP service – built from the local Dockerfile.
   dmp:
     build:
-      context: ../dmp
-      dockerfile: Dockerfile
+      # The repository root is the context so the shared identity module is
+      # available to the go.mod replace directive.
+      context: ..
+      dockerfile: dmp/Dockerfile
       # dev target runs air for hot reload; drop it for production-style builds.
       target: dev
     image: open-ads-dmp:dev
     container_name: open-ads-dmp
     depends_on:
       - clickhouse
+      - valkey
     environment:
       DMP_PORT: "8082"
+      CLICKHOUSE_ADDR: "clickhouse:9000"
+      CLICKHOUSE_USER: "dmp_user"
+      CLICKHOUSE_PASSWORD: "dmp_clickhouse_password"
+      CLICKHOUSE_DATABASE: "dmp"
+      # The management API is tenant scoped: the token is bound to exactly one
+      # tenant, so a browser or operator credential can never cross tenants.
+      DMP_ADMIN_TENANT_ID: "00000000-0000-0000-0000-000000000001"
+      DMP_ADMIN_TOKEN: "dmp-admin-token-0123456789abcdef"
+      DMP_ADMIN_ACTOR: "sandbox-dmp-operator"
+      # Trusted tokenization/import adapters use this token; browsers never see it.
+      DMP_INTERNAL_TOKEN: "dmp-internal-token-0123456789abcdef"
+      # Isolated deny-gate keyspace/ACL (dmp:* only).
+      VALKEY_ADDR: "valkey:6379"
+      DMP_VALKEY_USER: "dmp"
+      DMP_VALKEY_PASSWORD: "dmp_valkey_password"
+      # Approved retention envelope plus a zero grace so drill sweeps can purge
+      # revoked subjects immediately in the sandbox.
+      DMP_MEMBERSHIP_RETENTION_DAYS: "90"
+      DMP_EVENT_RETENTION_DAYS: "365"
+      DMP_PHYSICAL_DELETE_SLA_DAYS: "30"
+      DMP_PHYSICAL_DELETE_GRACE_MINUTES: "0"
+      DMP_RETENTION_INTERVAL_MINUTES: "15"
     ports:
       - "127.0.0.1:8082:8082"
     volumes:
       - ../dmp:/src
       - ../dmp/.air.toml:/src/.air.toml
+      - ../identity:/identity:ro
     command: ["-c", ".air.toml"]
 
 volumes:

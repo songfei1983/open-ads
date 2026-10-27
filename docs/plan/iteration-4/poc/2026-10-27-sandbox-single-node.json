@@ -1,0 +1,19 @@
+{
+  "recorded_at": "2026-10-27T13:22:10Z",
+  "topology": "sandbox-single-node",
+  "endpoint": "http://127.0.0.1:8082/internal/v1",
+  "rows": 100000,
+  "requests": 600,
+  "concurrency": 20,
+  "imported_rows_per_second": 28383,
+  "p50_ms": 25.14,
+  "p95_ms": 37.1,
+  "p99_ms": 44.76,
+  "errors": 0,
+  "import_seconds": 3.52,
+  "verify_seconds": 0.09,
+  "delete_seconds": 0.15,
+  "serving_segments_after_delete": 1,
+  "p95_target_ms": 50.0,
+  "delete_target_seconds": 60.0
+}

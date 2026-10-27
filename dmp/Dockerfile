@@ -3,10 +3,13 @@ FROM golang:1.27-alpine AS builder
 
 WORKDIR /src
 
-COPY go.mod ./
+# The shared identity policy is a sibling module (go.mod replace ../identity), so
+# the build context is the repository root.
+COPY dmp/go.mod dmp/go.sum ./
 RUN go mod download
 
-COPY . .
+COPY dmp/ ./
+COPY identity/ /identity/
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dmp ./cmd/dmp/main.go
 

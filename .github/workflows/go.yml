@@ -8,7 +8,7 @@ jobs:
   verify:
     strategy:
       matrix:
-        service: [ssp, dsp, dmp]
+        service: [identity, ssp, dsp, dmp]
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -45,7 +45,14 @@ jobs:
           test "$(docker compose -f deployments/docker-compose.yml exec -T mariadb mariadb -uroot -proot_password -Nse 'SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = "ssp_db";')" -gt 0
           test "$(docker compose -f deployments/docker-compose.yml exec -T mariadb mariadb -uroot -proot_password -Nse 'SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = "dsp_db";')" -gt 0
       - name: Verify ClickHouse schema
-        run: test "$(docker compose -f deployments/docker-compose.yml exec -T clickhouse clickhouse-client --query 'SHOW TABLES FROM dmp' | wc -l)" -eq 6
+        run: |
+          tables="$(docker compose -f deployments/docker-compose.yml exec -T clickhouse clickhouse-client --query 'SHOW TABLES FROM dmp')"
+          echo "$tables"
+          for table in dmp_membership_snapshot dmp_snapshot_publication dmp_segment_definition_version \
+            dmp_identity_revocation dmp_identity_revocation_status dmp_event \
+            dmp_namespace_version dmp_provider_version dmp_control_audit; do
+            echo "$tables" | grep -qx "$table" || { echo "missing table: $table"; exit 1; }
+          done
       - name: Start SSP and DSP for RTB smoke test
         run: |
           (cd dsp && nohup go run ./cmd/dsp > "$RUNNER_TEMP/dsp.log" 2>&1 & echo $! > "$RUNNER_TEMP/dsp.pid")
