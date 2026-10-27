@@ -12,9 +12,14 @@ type Mutation struct {
 	RequestID string
 }
 
-// AuditEntry is one append-only record of a control-plane attempt.
+// AuditEntry is one append-only record of a control-plane attempt. An accepted
+// or refused write leaves an "intent" row before touching storage and an
+// "outcome" row after, sharing IntentID. An intent without its outcome means the
+// result is unknown and must be reconciled by an operator.
 type AuditEntry struct {
 	AuditID         string    `json:"audit_id"`
+	IntentID        string    `json:"intent_id,omitempty"`
+	Phase           string    `json:"phase"`
 	Actor           string    `json:"actor"`
 	Action          string    `json:"action"`
 	ResourceType    string    `json:"resource_type"`
@@ -30,6 +35,9 @@ type AuditEntry struct {
 const (
 	ActionCreate = "create"
 	ActionUpdate = "update"
+
+	PhaseIntent  = "intent"
+	PhaseOutcome = "outcome"
 
 	OutcomeAccepted = "accepted"
 	OutcomeConflict = "conflict"
@@ -69,6 +77,9 @@ type Store interface {
 	UpdateSegment(ctx context.Context, id string, input SegmentInput, meta Mutation) (Segment, error)
 
 	ListAudit(ctx context.Context, query AuditQuery) ([]AuditEntry, error)
+	// UnfinishedIntents returns intents older than grace that never recorded an
+	// outcome: those attempts have an unknown result and need reconciliation.
+	UnfinishedIntents(ctx context.Context, grace time.Duration, limit int) ([]AuditEntry, error)
 	// RecordRejected audits a request that was refused before any write, so a
 	// rejected attempt is as traceable as an accepted one.
 	RecordRejected(ctx context.Context, meta Mutation, action, resourceType, resourceID, detail string) error

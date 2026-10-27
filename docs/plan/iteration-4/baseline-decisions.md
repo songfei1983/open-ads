@@ -87,12 +87,14 @@ I4-08 实测（浏览器）：控制台各页无 console/page error；代理白�
 | R7 | 快照发布即封版：`verify` 对已发布快照返回 `409 snapshot_sealed`，`publish` 保持幂等；撤回 purge 写入 `dmp_snapshot_purge` 台账（`purged_rows`），控制台显示"已撤回 N"并隐藏封版快照的校验/删除动作，消除 purge 后的 checksum 假失败 | ✅ 完成 |
 | R8 | retention worker 用 Valkey 租约选主，避免多副本重复 sweep | ✅ 完成 |
 | R4+R6 | 引入 `Principal{Caller,Tenant,Scopes}` 与 `Authenticator`（Bearer 现状 + 预留 mTLS），resolve 强制 `tenant_id`（缺失 400、跨租户 403，过渡期保留 `tenant-default` 别名） | 待办 |
-| R1 | 控制面审计改为 intent + outcome 两行，缺 outcome 即"结果未知"并提供巡检查询；拒绝路径审计失败改为 fail-closed | 待办 |
+| R1 | 控制面审计改为 intent + outcome 两行，缺 outcome 即"结果未知"并提供巡检查询；拒绝路径审计失败改为 fail-closed | ✅ 完成 |
 | R9 | DMP 业务指标：resolve 结果/时延、gate admission、导入校验、保留删除、epoch、tombstone 数 | 待办 |
 | R2 | 同版本落败行巡检清理（保留 `argMin(revision_id)`，先 dry-run 计数） | 待办 |
 | R5 | 抽出共享 `identity.TokenPolicy` + 负例 fixture 集 + 疑似原始身份指标 | 待办 |
 | R3 | 负载/POC 参数化并归档报告，D-01 后按生产拓扑复测 | 待办 |
 | R10 | DMP OpenAPI 3.1 契约工件 + import/revoke 幂等键 | 待办 |
+
+R1 验收（2026-10-27）：迁移 `000006` 为 `dmp_control_audit` 增加 `phase`（`intent`/`outcome`）与 `intent_id`；每次定义写入先写 intent 行（写不进去就不做写入），完成后写同 `intent_id` 的 outcome 行，崩溃或断连留下的 intent 即"结果未知"。新增 `GET /admin/v1/audit/unfinished`（默认 2 分钟宽限）列出这些尝试；拒绝路径审计失败不再只记日志，改为 `503 control_plane_unavailable`。live 验证：创建命名空间后审计出现成对的 intent/outcome 行，`unfinished` 为 `[]`；注入一条 10 分钟前的孤立 intent 后该接口返回它。ClickHouse 集成测试断言 4 次尝试 = 4 intent + 4 outcome。
 
 R4+R6 验收（2026-10-27）：新增 `internal/dmp/authn`：`Principal{Caller,Tenant,Scopes}`、`Authenticator`、常量时间 `BearerAuth`（空 token 环境变量不会成为凭据）、预留 `MTLS`（按已校验链的 CN 映射身份）。内部 API 每个路由显式要求 scope（`snapshots:read|write`、`identity:revoke`、`retention:run`），缺 scope 返回 `403 insufficient_scope`，凭据与数据面租户不符返回 `403 tenant_mismatch`；resolve 必须携带 `tenant_id`（缺失 `400 tenant_required`、跨租户 `403 tenant_mismatch`），过渡期 `tenant-default` 解析到数据面租户，未绑定租户的数据面直接 `503 internal_api_unconfigured`。live 验证：缺 tenant 400 / 跨租户 403 / 别名 200，integration.sh 与 gate-drills.sh 全 PASS，POC 200 请求 0 错误。
 

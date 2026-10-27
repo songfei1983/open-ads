@@ -133,24 +133,29 @@ func TestClickHouseStoreVersionedDefinitions(t *testing.T) {
 		t.Fatalf("list audit: %v", err)
 	}
 	// One accepted create, one duplicate create, one accepted update and one
-	// stale update: every attempt is recorded.
-	if len(entries) != 4 {
-		t.Fatalf("expected 4 audited attempts, got %d: %+v", len(entries), entries)
+	// stale update: every attempt records an intent row and an outcome row.
+	if len(entries) != 8 {
+		t.Fatalf("expected 8 audit rows (4 intents and 4 outcomes), got %d: %+v", len(entries), entries)
 	}
-	if entries[0].Outcome != control.OutcomeConflict {
-		t.Fatalf("newest audit entry should be the stale update conflict: %+v", entries[0])
+	if entries[0].Phase != control.PhaseOutcome || entries[0].Outcome != control.OutcomeConflict {
+		t.Fatalf("newest audit entry should be the stale update outcome: %+v", entries[0])
 	}
-	var conflicts int
+	var conflicts, intents int
 	for _, entry := range entries {
 		if entry.Actor != "integration-test" || entry.RequestID != "req-integration-1" {
 			t.Fatalf("audit entry lost caller context: %+v", entry)
 		}
-		if entry.Outcome == control.OutcomeConflict {
-			conflicts++
+		switch entry.Phase {
+		case control.PhaseIntent:
+			intents++
+		case control.PhaseOutcome:
+			if entry.Outcome == control.OutcomeConflict {
+				conflicts++
+			}
 		}
 	}
-	if conflicts != 2 {
-		t.Fatalf("conflict was not audited: %+v", entries)
+	if conflicts != 2 || intents != 4 {
+		t.Fatalf("attempts were not paired: %+v", entries)
 	}
 }
 
@@ -175,5 +180,61 @@ func TestClickHouseStoreRejectsMissingDefinition(t *testing.T) {
 	}
 	if len(entries) == 0 || entries[0].Outcome != control.OutcomeNotFound {
 		t.Fatalf("missing-definition attempt was not audited: %+v", entries)
+	}
+}
+
+func TestClickHouseAuditPairsIntentWithOutcome(t *testing.T) {
+	store := newIntegrationStore(t)
+	ctx := context.Background()
+	meta := control.Mutation{Actor: "integration-audit", RequestID: "req-integration-audit"}
+
+	namespace := control.NamespaceInput{
+		ID: "audit-namespace", DisplayName: "Audit namespace",
+		HashingAlgorithm: control.HashingAlgorithmHMACSHA256, SubjectKeyVersion: 1, RetentionMonths: 3,
+	}
+	if _, err := store.CreateNamespace(ctx, namespace, meta); err != nil {
+		t.Fatalf("create namespace: %v", err)
+	}
+	if _, err := store.CreateNamespace(ctx, namespace, meta); !errors.Is(err, control.ErrAlreadyExists) {
+		t.Fatalf("duplicate create should conflict, got %v", err)
+	}
+
+	entries, err := store.ListAudit(ctx, control.AuditQuery{ResourceType: "namespace", ResourceID: "audit-namespace", Limit: 50})
+	if err != nil {
+		t.Fatalf("list audit: %v", err)
+	}
+	intents := map[string]bool{}
+	outcomes := map[string]string{}
+	for _, entry := range entries {
+		switch entry.Phase {
+		case control.PhaseIntent:
+			intents[entry.IntentID] = true
+		case control.PhaseOutcome:
+			outcomes[entry.IntentID] = entry.Outcome
+		default:
+			t.Fatalf("audit row without a phase: %+v", entry)
+		}
+	}
+	if len(intents) != 2 {
+		t.Fatalf("each attempt must write one intent, got %d: %+v", len(intents), entries)
+	}
+	if len(outcomes) != len(intents) {
+		t.Fatalf("every intent must record an outcome: %+v", entries)
+	}
+	for intentID := range intents {
+		if outcomes[intentID] == "" {
+			t.Fatalf("intent %s has no outcome: %+v", intentID, entries)
+		}
+	}
+
+	// A fresh store sees no unfinished intents: nothing crashed mid-write.
+	unfinished, err := store.UnfinishedIntents(ctx, time.Minute, 50)
+	if err != nil {
+		t.Fatalf("unfinished intents: %v", err)
+	}
+	for _, entry := range unfinished {
+		if entry.ResourceID == "audit-namespace" {
+			t.Fatalf("completed attempts must not be reported as unfinished: %+v", entry)
+		}
 	}
 }

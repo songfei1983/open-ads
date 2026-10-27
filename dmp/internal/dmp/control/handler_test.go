@@ -244,28 +244,74 @@ func (m *memoryStore) ListAudit(_ context.Context, query control.AuditQuery) ([]
 func (m *memoryStore) RecordRejected(_ context.Context, meta control.Mutation, action, resourceType, resourceID, detail string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.audit = append(m.audit, control.AuditEntry{
-		AuditID: fmt.Sprintf("audit-%d", len(m.audit)+1), Actor: meta.Actor, Action: action,
-		ResourceType: resourceType, ResourceID: resourceID, RequestID: meta.RequestID,
-		Outcome: control.OutcomeRejected, Detail: detail, OccurredAt: m.now,
-	})
+	m.recordOutcome(meta, action, resourceType, resourceID, 0, control.OutcomeRejected, detail)
 	return nil
 }
 
 func (m *memoryStore) auditAccept(meta control.Mutation, action, resourceType, resourceID string, version uint64) {
+	m.recordOutcome(meta, action, resourceType, resourceID, version, control.OutcomeAccepted, "")
+}
+
+// recordOutcome stores the terminal row of an attempt, paired with the intent
+// that the real store writes before touching storage.
+func (m *memoryStore) recordOutcome(meta control.Mutation, action, resourceType, resourceID string, version uint64, outcome, detail string) {
+	id := len(m.audit) + 1
 	m.audit = append(m.audit, control.AuditEntry{
-		AuditID: fmt.Sprintf("audit-%d", len(m.audit)+1), Actor: meta.Actor, Action: action,
-		ResourceType: resourceType, ResourceID: resourceID, ResourceVersion: version,
-		RequestID: meta.RequestID, Outcome: control.OutcomeAccepted, OccurredAt: m.now,
+		AuditID: fmt.Sprintf("audit-%d", id), IntentID: fmt.Sprintf("intent-%d", id), Phase: control.PhaseOutcome,
+		Actor: meta.Actor, Action: action, ResourceType: resourceType, ResourceID: resourceID,
+		ResourceVersion: version, RequestID: meta.RequestID, Outcome: outcome, Detail: detail, OccurredAt: m.now,
 	})
 }
 
-func (m *memoryStore) auditFail(meta control.Mutation, action, resourceType, resourceID string, version uint64, outcome string, cause error) error {
+// seedIntent stores an attempt whose outcome was never recorded.
+func (m *memoryStore) seedIntent(actor, action, resourceType, resourceID string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id := fmt.Sprintf("intent-unfinished-%d", len(m.audit)+1)
 	m.audit = append(m.audit, control.AuditEntry{
-		AuditID: fmt.Sprintf("audit-%d", len(m.audit)+1), Actor: meta.Actor, Action: action,
-		ResourceType: resourceType, ResourceID: resourceID, ResourceVersion: version,
-		RequestID: meta.RequestID, Outcome: outcome, Detail: cause.Error(), OccurredAt: m.now,
+		AuditID: id, IntentID: id, Phase: control.PhaseIntent, Actor: actor, Action: action,
+		ResourceType: resourceType, ResourceID: resourceID, RequestID: "req-lost",
+		OccurredAt: m.now.Add(-time.Hour),
 	})
+	return id
+}
+
+// resolveIntent appends the outcome an operator recorded while reconciling.
+func (m *memoryStore) resolveIntent(intentID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.audit = append(m.audit, control.AuditEntry{
+		AuditID: "audit-reconciled", IntentID: intentID, Phase: control.PhaseOutcome,
+		Actor: "sandbox-operator", Action: control.ActionCreate, ResourceType: "provider",
+		ResourceID: "prov-orphan", RequestID: "req-reconciled", Outcome: control.OutcomeAccepted, OccurredAt: m.now,
+	})
+}
+
+func (m *memoryStore) UnfinishedIntents(_ context.Context, grace time.Duration, limit int) ([]control.AuditEntry, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	completed := map[string]bool{}
+	for _, entry := range m.audit {
+		if entry.Phase == control.PhaseOutcome {
+			completed[entry.IntentID] = true
+		}
+	}
+	cutoff := m.now.Add(-grace)
+	var unfinished []control.AuditEntry
+	for _, entry := range m.audit {
+		if entry.Phase != control.PhaseIntent || completed[entry.IntentID] || !entry.OccurredAt.Before(cutoff) {
+			continue
+		}
+		unfinished = append(unfinished, entry)
+		if limit > 0 && len(unfinished) == limit {
+			break
+		}
+	}
+	return unfinished, nil
+}
+
+func (m *memoryStore) auditFail(meta control.Mutation, action, resourceType, resourceID string, version uint64, outcome string, cause error) error {
+	m.recordOutcome(meta, action, resourceType, resourceID, version, outcome, cause.Error())
 	return cause
 }
 
@@ -654,5 +700,67 @@ func TestStoreOutageIsReportedAsUnavailable(t *testing.T) {
 	status, payload := call(t, ts, http.MethodGet, "/admin/v1/namespaces", "")
 	if status != http.StatusServiceUnavailable || payload["code"] != "control_plane_unavailable" {
 		t.Fatalf("store outage should be 503 control_plane_unavailable, got %d %v", status, payload)
+	}
+}
+
+func TestUnfinishedIntentsAreReported(t *testing.T) {
+	store := newMemoryStore()
+	ts, _ := newTestServer(t, store)
+
+	status, body := rawCall(t, ts, http.MethodGet, "/admin/v1/audit/unfinished")
+	if status != http.StatusOK || strings.TrimSpace(string(body)) != "[]" {
+		t.Fatalf("no unfinished intents expected: %d %s", status, body)
+	}
+
+	intentID := store.seedIntent("sandbox-operator", control.ActionCreate, "provider", "prov-orphan")
+	status, body = rawCall(t, ts, http.MethodGet, "/admin/v1/audit/unfinished")
+	if status != http.StatusOK {
+		t.Fatalf("list unfinished intents: %d %s", status, body)
+	}
+	var entries []control.AuditEntry
+	if err := json.Unmarshal([]byte(body), &entries); err != nil {
+		t.Fatalf("decode unfinished intents: %v (%s)", err, body)
+	}
+	if len(entries) != 1 || entries[0].IntentID != intentID || entries[0].Phase != control.PhaseIntent {
+		t.Fatalf("the outstanding attempt must be reported: %+v", entries)
+	}
+
+	// Recording the outcome clears it from the report.
+	store.resolveIntent(intentID)
+	status, body = rawCall(t, ts, http.MethodGet, "/admin/v1/audit/unfinished")
+	if status != http.StatusOK {
+		t.Fatalf("list unfinished intents: %d %s", status, body)
+	}
+	if err := json.Unmarshal([]byte(body), &entries); err != nil {
+		t.Fatalf("decode unfinished intents: %v (%s)", err, body)
+	}
+	for _, entry := range entries {
+		if entry.IntentID == intentID {
+			t.Fatalf("a reconciled attempt must no longer be reported: %+v", entries)
+		}
+	}
+}
+
+// unrecordableAudit refuses to persist audit rows, simulating an audit outage.
+type unrecordableAudit struct {
+	control.Store
+}
+
+func (u unrecordableAudit) RecordRejected(context.Context, control.Mutation, string, string, string, string) error {
+	return control.ErrStoreUnavailable
+}
+
+func TestRejectionFailsClosedWhenItCannotBeAudited(t *testing.T) {
+	store := unrecordableAudit{newMemoryStore()}
+	handler := control.NewHandler(control.HandlerOptions{Store: store, Token: testToken, Actor: "sandbox-operator"})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler.ServeHTTP(w, r.WithContext(observability.WithRequestID(r.Context(), "req-audit-outage")))
+	}))
+	t.Cleanup(ts.Close)
+
+	status, payload := call(t, ts, http.MethodPost, "/admin/v1/namespaces",
+		`{"id":"ns-retention","display_name":"x","hashing_algorithm":"hmac-sha256","subject_key_version":1,"retention_months":4}`)
+	if status != http.StatusServiceUnavailable || payload["code"] != "control_plane_unavailable" {
+		t.Fatalf("an unauditable rejection must fail closed, got %d %v", status, payload)
 	}
 }

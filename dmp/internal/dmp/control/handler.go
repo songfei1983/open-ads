@@ -11,11 +11,15 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/observability"
 )
 
 const adminPrefix = "/admin/v1"
+
+// unfinishedIntentGrace keeps an in-flight attempt out of the unfinished report.
+const unfinishedIntentGrace = 2 * time.Minute
 
 // HandlerOptions binds the admin surface to one tenant and one bearer token.
 type HandlerOptions struct {
@@ -48,9 +52,13 @@ type handler struct {
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.Trim(strings.TrimPrefix(r.URL.Path, adminPrefix), "/")
-	if path == "audit" {
+	if path == "audit" || path == "audit/unfinished" {
 		if r.Method != http.MethodGet {
 			h.methodNotAllowed(w, r, http.MethodGet)
+			return
+		}
+		if path == "audit/unfinished" {
+			h.listUnfinishedIntents(w, r)
 			return
 		}
 		h.listAudit(w, r)
@@ -265,6 +273,29 @@ func (h *handler) listAudit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, entries)
 }
 
+// listUnfinishedIntents reports attempts that never recorded an outcome, so an
+// operator can reconcile writes whose result is unknown.
+func (h *handler) listUnfinishedIntents(w http.ResponseWriter, r *http.Request) {
+	limit := 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 || parsed > 200 {
+			writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusBadRequest, "invalid_request", "limit must be between 1 and 200")
+			return
+		}
+		limit = parsed
+	}
+	entries, err := h.store.UnfinishedIntents(r.Context(), unfinishedIntentGrace, limit)
+	if err != nil {
+		h.fail(w, r, "audit", "", err)
+		return
+	}
+	if entries == nil {
+		entries = []AuditEntry{}
+	}
+	writeJSON(w, http.StatusOK, entries)
+}
+
 func (h *handler) respond(w http.ResponseWriter, r *http.Request, resourceType, resourceID string, status int, value any, err error) {
 	if err != nil {
 		h.fail(w, r, resourceType, resourceID, err)
@@ -282,9 +313,13 @@ func (h *handler) reject(w http.ResponseWriter, r *http.Request, action, resourc
 		err = fmt.Errorf("%w: %s", ErrInvalidDefinition, err)
 	}
 	if auditErr := h.store.RecordRejected(r.Context(), h.mutation(r), action, resourceType, resourceID, err.Error()); auditErr != nil {
-		h.logger.Warn("DMP control plane rejection could not be audited",
+		// A refusal that cannot be audited must not be reported as a validation
+		// outcome: the caller would otherwise probe the API untraced.
+		h.logger.Error("DMP control plane rejection could not be audited",
 			slog.String("request_id", observability.RequestIDFromContext(r.Context())),
 			slog.Any("error", auditErr))
+		writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusServiceUnavailable, "control_plane_unavailable", "DMP audit trail is unavailable")
+		return
 	}
 	writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusUnprocessableEntity, "invalid_definition", err.Error())
 }
