@@ -119,3 +119,45 @@ func TestRevocationRejectsRawIdentity(t *testing.T) {
 		t.Fatalf("raw identity must be rejected, got %v", err)
 	}
 }
+
+func TestPurgeSubjectRemovesMembershipAndEvents(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+	token := strings.Repeat("9a", 32)
+
+	// Seed membership and event rows for the subject through a dedicated tenant
+	// connection so the purge has something to remove.
+	tenant := uuid.New()
+	conn, err := control.OpenClickHouse(ctx, os.Getenv("DMP_CLICKHOUSE_TEST_ADDR"),
+		envOr("DMP_CLICKHOUSE_TEST_USER", "dmp_user"),
+		envOr("DMP_CLICKHOUSE_TEST_PASSWORD", "dmp_clickhouse_password"),
+		envOr("DMP_CLICKHOUSE_TEST_DATABASE", "dmp"))
+	if err != nil {
+		t.Fatalf("open clickhouse: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	purgeStore := revocation.NewStore(conn, tenant)
+	snapshotID := uuid.New()
+	if err := conn.Exec(ctx, `INSERT INTO dmp_membership_snapshot
+		(tenant_id, provider_id, namespace, snapshot_id, snapshot_month, subject_token,
+		 subject_token_key_version, segment_id, ingested_at)
+		VALUES (?, 'p', 'n', ?, toStartOfMonth(now()), ?, 1, 'seg', now64(3))`, tenant, snapshotID, token); err != nil {
+		t.Fatalf("seed membership: %v", err)
+	}
+	if err := conn.Exec(ctx, `INSERT INTO dmp_event
+		(tenant_id, event_date, event_id, event_type, provider_id, namespace, subject_token, segment_id, occurred_at, ingested_at, schema_version)
+		VALUES (?, today(), ?, 'impression', 'p', 'n', ?, 'seg', now64(3), now64(3), 1)`, tenant, uuid.New(), token); err != nil {
+		t.Fatalf("seed event: %v", err)
+	}
+	if remaining, err := purgeStore.TokenCounts(ctx, "n", token); err != nil || remaining != 2 {
+		t.Fatalf("expected two subject rows before purge: %v %d", err, remaining)
+	}
+
+	if _, err := purgeStore.PurgeSubject(ctx, "n", token); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if remaining, err := purgeStore.TokenCounts(ctx, "n", token); err != nil || remaining != 0 {
+		t.Fatalf("subject rows survived the purge: %v %d", err, remaining)
+	}
+	_ = store
+}

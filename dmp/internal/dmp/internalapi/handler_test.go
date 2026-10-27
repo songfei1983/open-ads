@@ -153,6 +153,22 @@ func (f *fakeSnapshots) Verify(_ context.Context, id string) (snapshot.Job, erro
 	return job.job, nil
 }
 
+func (f *fakeSnapshots) DeleteSnapshot(_ context.Context, id string) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	job, ok := f.jobs[id]
+	if !ok {
+		return 0, snapshot.ErrJobNotFound
+	}
+	if job.job.Status == snapshot.StatusPublished {
+		return 0, snapshot.ErrPublished
+	}
+	deleted := uint64(len(f.rows[id]))
+	delete(f.rows, id)
+	job.job.Status = snapshot.StatusRetired
+	return deleted, nil
+}
+
 func (f *fakeSnapshots) Publish(_ context.Context, id string) (snapshot.Job, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -132,6 +132,10 @@ func (s slowSnapshotService) Publish(context.Context, string) (snapshot.Job, err
 	return snapshot.Job{}, errors.New("not used")
 }
 
+func (s slowSnapshotService) DeleteSnapshot(context.Context, string) (uint64, error) {
+	return 0, errors.New("not used")
+}
+
 func (s slowSnapshotService) Resolve(ctx context.Context, _ snapshot.ResolveInput) (snapshot.ResolveResult, error) {
 	select {
 	case <-time.After(s.delay):

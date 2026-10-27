@@ -1822,6 +1822,10 @@ ORDER BY (tenant_id, occurred_at, audit_id);
 
 实时查询输入至少包含 request ID、租户、namespace、subject token 和 consent context。DMP 对不允许的目的返回空结果或明确 policy denial；SSP 必须 fail closed，不得把拒绝解释为可继续带受众出价。
 
+#### 4.3.1 保留与物理删除
+
+保留上限在配置层强制：membership/身份映射 ≤92 天、DMP 事件 ≤365 天、撤回触发后物理删除 ≤30 天，越界配置直接启动失败。`dmp_event` 使用 `TTL event_date + 365 DAY`；membership 不用 TTL，而是由 retention worker 或运维以 `ALTER TABLE dmp_membership_snapshot DELETE WHERE tenant_id AND snapshot_id SETTINGS mutations_sync=1` 精确删除，因此同一月分区中的其他快照不会被误删。当前服务快照永不删除。撤回的物理删除按主体删除 membership 与事件行并复核归零，tombstone 保留为拒绝依据与删除证明；状态追加 `physical_delete_status=completed`。备份按 90 天滚动到期，由部署侧脚本 `dmp/scripts/backup-expiry.sh` 执行（默认 dry-run）。
+
 ### 4.4 ClickHouse 运行约束
 
 - membership 和 event 都使用批量写入，避免逐行 insert；批大小/等待时间由吞吐与新鲜度压测确定。

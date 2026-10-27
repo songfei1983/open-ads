@@ -18,6 +18,7 @@ import (
 
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/gate"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/observability"
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/retention"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/revocation"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/snapshot"
 )
@@ -30,6 +31,7 @@ type SnapshotService interface {
 	AppendRows(ctx context.Context, snapshotID string, rows []snapshot.MemberRow) (snapshot.AppendResult, error)
 	Verify(ctx context.Context, snapshotID string) (snapshot.Job, error)
 	Publish(ctx context.Context, snapshotID string) (snapshot.Job, error)
+	DeleteSnapshot(ctx context.Context, snapshotID string) (uint64, error)
 	Resolve(ctx context.Context, input snapshot.ResolveInput) (snapshot.ResolveResult, error)
 }
 
@@ -50,12 +52,19 @@ type Revocations interface {
 	ListStatuses(ctx context.Context, limit int) ([]revocation.Status, error)
 }
 
+// RetentionService runs and reports the retention policy.
+type RetentionService interface {
+	RunOnce(ctx context.Context) (retention.Report, error)
+	Policy() retention.Policy
+}
+
 // HandlerOptions carries the trusted-adapter dependency set.
 type HandlerOptions struct {
 	Token       string
 	Snapshots   SnapshotService
 	Gate        DenyGate
 	Revocations Revocations
+	Retention   RetentionService
 	Logger      *slog.Logger
 }
 
@@ -67,7 +76,8 @@ func NewHandler(opts HandlerOptions) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	h := &handler{token: opts.Token, snapshots: opts.Snapshots, gate: opts.Gate, revocations: opts.Revocations, logger: logger}
+	h := &handler{token: opts.Token, snapshots: opts.Snapshots, gate: opts.Gate, revocations: opts.Revocations,
+		retention: opts.Retention, logger: logger}
 	return h.authenticate(h)
 }
 
@@ -76,6 +86,7 @@ type handler struct {
 	snapshots   SnapshotService
 	gate        DenyGate
 	revocations Revocations
+	retention   RetentionService
 	logger      *slog.Logger
 }
 
@@ -111,6 +122,12 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.verifySnapshot(w, r, parts[1])
+	case len(parts) == 3 && parts[0] == "snapshots" && parts[2] == "delete":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, r, http.MethodPost)
+			return
+		}
+		h.deleteSnapshot(w, r, parts[1])
 	case len(parts) == 3 && parts[0] == "snapshots" && parts[2] == "publish":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, r, http.MethodPost)
@@ -141,6 +158,18 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.listRevocations(w, r)
+	case path == "retention:run":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, r, http.MethodPost)
+			return
+		}
+		h.runRetention(w, r)
+	case path == "retention:policy":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, r, http.MethodGet)
+			return
+		}
+		h.retentionPolicy(w, r)
 	default:
 		notFound(w, r)
 	}
@@ -256,6 +285,19 @@ func (h *handler) publishSnapshot(w http.ResponseWriter, r *http.Request, id str
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+func (h *handler) deleteSnapshot(w http.ResponseWriter, r *http.Request, id string) {
+	deleted, err := h.snapshots.DeleteSnapshot(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, snapshot.ErrPublished) {
+			writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusConflict, "invalid_state", "the serving snapshot cannot be deleted")
+			return
+		}
+		h.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"snapshot_id": id, "deleted_rows": deleted})
 }
 
 func (h *handler) resolveAudience(w http.ResponseWriter, r *http.Request) {
@@ -478,6 +520,36 @@ func (h *handler) listRevocations(w http.ResponseWriter, r *http.Request) {
 		statuses = []revocation.Status{}
 	}
 	writeJSON(w, http.StatusOK, statuses)
+}
+
+func (h *handler) runRetention(w http.ResponseWriter, r *http.Request) {
+	if h.retention == nil {
+		writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusServiceUnavailable, "internal_api_unconfigured", "retention worker is not configured")
+		return
+	}
+	report, err := h.retention.RunOnce(r.Context())
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+func (h *handler) retentionPolicy(w http.ResponseWriter, r *http.Request) {
+	if h.retention == nil {
+		writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusServiceUnavailable, "internal_api_unconfigured", "retention worker is not configured")
+		return
+	}
+	policy := h.retention.Policy()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"membership_retention_hours":   policy.MembershipRetention.Hours(),
+		"event_retention_hours":        policy.EventRetention.Hours(),
+		"physical_delete_sla_hours":    policy.PhysicalDeleteSLA.Hours(),
+		"physical_delete_grace_hours":  policy.PhysicalDeleteGrace.Hours(),
+		"membership_retention_ceiling": "92 days",
+		"event_retention_ceiling":      "365 days",
+		"physical_delete_sla_ceiling":  "30 days",
+	})
 }
 
 func (h *handler) fail(w http.ResponseWriter, r *http.Request, err error) {

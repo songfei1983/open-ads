@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -341,5 +342,76 @@ func TestSnapshotPublishRequiresVerification(t *testing.T) {
 	}
 	if _, err := store.Publish(ctx, job.SnapshotID); !errors.Is(err, snapshot.ErrNotVerified) {
 		t.Fatalf("unverified snapshot must not publish, got %v", err)
+	}
+}
+
+func TestDeleteSnapshotLeavesOtherSnapshotsIntact(t *testing.T) {
+	store, defs, _ := newIntegrationStore(t)
+	seedDefinitions(t, defs)
+	ctx := context.Background()
+
+	tokenA := strings.Repeat("7", 64)
+	tokenB := strings.Repeat("6", 64)
+	first, err := store.CreateJob(ctx, snapshot.CreateJobInput{
+		ProviderID: "dmp-provider-01", Namespace: "publisher-account-v1",
+		SchemaVersion: 1, SourceVersion: "feed-delete-1", ExpectedRows: 1,
+	})
+	if err != nil {
+		t.Fatalf("create first: %v", err)
+	}
+	second, err := store.CreateJob(ctx, snapshot.CreateJobInput{
+		ProviderID: "dmp-provider-01", Namespace: "publisher-account-v1",
+		SchemaVersion: 1, SourceVersion: "feed-delete-2", ExpectedRows: 1,
+	})
+	if err != nil {
+		t.Fatalf("create second: %v", err)
+	}
+	for _, item := range []struct {
+		job   snapshot.Job
+		token string
+	}{{first, tokenA}, {second, tokenB}} {
+		if _, err := store.AppendRows(ctx, item.job.SnapshotID, []snapshot.MemberRow{
+			{SubjectToken: item.token, SubjectKeyVersion: 1, SegmentIDs: []string{"seg-tech-enthusiasts"}},
+		}); err != nil {
+			t.Fatalf("append %s: %v", item.job.SourceVersion, err)
+		}
+	}
+
+	// The serving snapshot cannot be deleted.
+	if _, err := store.Verify(ctx, second.SnapshotID); err != nil {
+		t.Fatalf("verify second: %v", err)
+	}
+	if _, err := store.Publish(ctx, second.SnapshotID); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if _, err := store.DeleteSnapshot(ctx, second.SnapshotID); !errors.Is(err, snapshot.ErrPublished) {
+		t.Fatalf("the serving snapshot must not be deletable, got %v", err)
+	}
+
+	// Deleting one snapshot only removes its own rows, even though both live in
+	// the same monthly partition.
+	deleted, err := store.DeleteSnapshot(ctx, first.SnapshotID)
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected one deleted row, got %d", deleted)
+	}
+	if count, _, err := store.ChecksumOf(ctx, first.SnapshotID); err != nil || count != 0 {
+		t.Fatalf("deleted snapshot still has rows: %v %d", err, count)
+	}
+	if count, _, err := store.ChecksumOf(ctx, second.SnapshotID); err != nil || count != 1 {
+		t.Fatalf("the other snapshot lost rows: %v %d", err, count)
+	}
+	job, err := store.GetJob(ctx, first.SnapshotID)
+	if err != nil || job.Status != snapshot.StatusRetired {
+		t.Fatalf("deleted snapshot is not retired: %v %+v", err, job)
+	}
+	// Resolution still serves the surviving snapshot.
+	result, err := store.Resolve(ctx, snapshot.ResolveInput{
+		Namespace: "publisher-account-v1", ProviderID: "dmp-provider-01", SubjectToken: tokenB,
+	})
+	if err != nil || len(result.Segments) != 1 {
+		t.Fatalf("serving snapshot still resolves: %v %+v", err, result)
 	}
 }

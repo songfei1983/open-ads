@@ -165,6 +165,13 @@ services:
       VALKEY_ADDR: "valkey:6379"
       DMP_VALKEY_USER: "dmp"
       DMP_VALKEY_PASSWORD: "dmp_valkey_password"
+      # Approved retention envelope plus a zero grace so drill sweeps can purge
+      # revoked subjects immediately in the sandbox.
+      DMP_MEMBERSHIP_RETENTION_DAYS: "90"
+      DMP_EVENT_RETENTION_DAYS: "365"
+      DMP_PHYSICAL_DELETE_SLA_DAYS: "30"
+      DMP_PHYSICAL_DELETE_GRACE_MINUTES: "0"
+      DMP_RETENTION_INTERVAL_MINUTES: "15"
     ports:
       - "127.0.0.1:8082:8082"
     volumes:

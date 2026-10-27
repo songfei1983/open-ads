@@ -37,6 +37,13 @@ type Config struct {
 	// Internal API token for trusted adapters (snapshot import, publication, revocation)
 	InternalToken string
 
+	// Retention policy (approved ceilings are enforced at load time)
+	MembershipRetentionDays int
+	EventRetentionDays      int
+	PhysicalDeleteGraceMins int
+	PhysicalDeleteSLADays   int
+	RetentionInterval       time.Duration
+
 	// Observability
 	LogLevel string
 }
@@ -51,24 +58,49 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	retentionDays, err := getEnvInt("DMP_MEMBERSHIP_RETENTION_DAYS", 90)
+	if err != nil {
+		return nil, err
+	}
+	eventRetentionDays, err := getEnvInt("DMP_EVENT_RETENTION_DAYS", 365)
+	if err != nil {
+		return nil, err
+	}
+	graceMins, err := getEnvInt("DMP_PHYSICAL_DELETE_GRACE_MINUTES", 5)
+	if err != nil {
+		return nil, err
+	}
+	slaDays, err := getEnvInt("DMP_PHYSICAL_DELETE_SLA_DAYS", 30)
+	if err != nil {
+		return nil, err
+	}
+	retentionIntervalMins, err := getEnvInt("DMP_RETENTION_INTERVAL_MINUTES", 15)
+	if err != nil {
+		return nil, err
+	}
 	cfg := &Config{
-		ServiceName:        getEnv("SERVICE_NAME", "open-ads-dmp"),
-		Environment:        getEnv("ENVIRONMENT", "development"),
-		ConfigVersion:      getEnv("CONFIG_VERSION", "dev"),
-		Port:               port,
-		ClickHouseAddr:     getEnv("CLICKHOUSE_ADDR", "127.0.0.1:9000"),
-		ClickHouseUser:     getEnv("CLICKHOUSE_USER", "dmp_user"),
-		ClickHousePassword: getEnv("CLICKHOUSE_PASSWORD", "dmp_clickhouse_password"),
-		ClickHouseDatabase: getEnv("CLICKHOUSE_DATABASE", "dmp"),
-		ValkeyAddr:         getEnv("VALKEY_ADDR", "127.0.0.1:6379"),
-		ValkeyUser:         getEnv("DMP_VALKEY_USER", "dmp"),
-		ValkeyPassword:     getEnv("DMP_VALKEY_PASSWORD", "dmp_valkey_password"),
-		RequestTimeout:     time.Duration(requestTimeout) * time.Millisecond,
-		AdminToken:         strings.TrimSpace(getEnv("DMP_ADMIN_TOKEN", "")),
-		AdminTenantID:      strings.TrimSpace(getEnv("DMP_ADMIN_TENANT_ID", "")),
-		AdminActor:         getEnv("DMP_ADMIN_ACTOR", "dmp-admin"),
-		InternalToken:      strings.TrimSpace(getEnv("DMP_INTERNAL_TOKEN", "")),
-		LogLevel:           getEnv("LOG_LEVEL", "INFO"),
+		ServiceName:             getEnv("SERVICE_NAME", "open-ads-dmp"),
+		Environment:             getEnv("ENVIRONMENT", "development"),
+		ConfigVersion:           getEnv("CONFIG_VERSION", "dev"),
+		Port:                    port,
+		ClickHouseAddr:          getEnv("CLICKHOUSE_ADDR", "127.0.0.1:9000"),
+		ClickHouseUser:          getEnv("CLICKHOUSE_USER", "dmp_user"),
+		ClickHousePassword:      getEnv("CLICKHOUSE_PASSWORD", "dmp_clickhouse_password"),
+		ClickHouseDatabase:      getEnv("CLICKHOUSE_DATABASE", "dmp"),
+		ValkeyAddr:              getEnv("VALKEY_ADDR", "127.0.0.1:6379"),
+		ValkeyUser:              getEnv("DMP_VALKEY_USER", "dmp"),
+		ValkeyPassword:          getEnv("DMP_VALKEY_PASSWORD", "dmp_valkey_password"),
+		RequestTimeout:          time.Duration(requestTimeout) * time.Millisecond,
+		AdminToken:              strings.TrimSpace(getEnv("DMP_ADMIN_TOKEN", "")),
+		AdminTenantID:           strings.TrimSpace(getEnv("DMP_ADMIN_TENANT_ID", "")),
+		AdminActor:              getEnv("DMP_ADMIN_ACTOR", "dmp-admin"),
+		InternalToken:           strings.TrimSpace(getEnv("DMP_INTERNAL_TOKEN", "")),
+		MembershipRetentionDays: retentionDays,
+		EventRetentionDays:      eventRetentionDays,
+		PhysicalDeleteGraceMins: graceMins,
+		PhysicalDeleteSLADays:   slaDays,
+		RetentionInterval:       time.Duration(retentionIntervalMins) * time.Minute,
+		LogLevel:                getEnv("LOG_LEVEL", "INFO"),
 	}
 	if !validLogLevel(cfg.LogLevel) {
 		return nil, fmt.Errorf("invalid log level: %q", cfg.LogLevel)
@@ -96,6 +128,23 @@ func Load() (*Config, error) {
 	}
 	if cfg.InternalToken != "" && len(cfg.InternalToken) < 32 {
 		return nil, fmt.Errorf("DMP_INTERNAL_TOKEN must be at least 32 characters")
+	}
+	// Approved ceilings: identity mappings at most 3 months, events at most
+	// 12 months, physical deletion within 30 days of the trigger.
+	if cfg.MembershipRetentionDays < 1 || cfg.MembershipRetentionDays > 92 {
+		return nil, fmt.Errorf("DMP_MEMBERSHIP_RETENTION_DAYS must be between 1 and 92")
+	}
+	if cfg.EventRetentionDays < 1 || cfg.EventRetentionDays > 365 {
+		return nil, fmt.Errorf("DMP_EVENT_RETENTION_DAYS must be between 1 and 365")
+	}
+	if cfg.PhysicalDeleteSLADays < 1 || cfg.PhysicalDeleteSLADays > 30 {
+		return nil, fmt.Errorf("DMP_PHYSICAL_DELETE_SLA_DAYS must be between 1 and 30")
+	}
+	if cfg.PhysicalDeleteGraceMins < 0 {
+		return nil, fmt.Errorf("DMP_PHYSICAL_DELETE_GRACE_MINUTES must not be negative")
+	}
+	if cfg.RetentionInterval < time.Minute {
+		return nil, fmt.Errorf("DMP_RETENTION_INTERVAL_MINUTES must be at least 1")
 	}
 
 	return cfg, nil

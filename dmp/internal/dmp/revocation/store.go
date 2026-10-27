@@ -297,3 +297,89 @@ func isToken(token string) bool {
 	}
 	return true
 }
+
+// TokensOf returns the tombstones recorded for one revocation.
+func (s *Store) TokensOf(ctx context.Context, revocationID string) ([]Tombstone, error) {
+	id, err := uuid.Parse(revocationID)
+	if err != nil {
+		return nil, ErrNotFound
+	}
+	rows, err := s.conn.Query(ctx, `SELECT namespace, subject_token, subject_token_key_version, any(reason_code)
+		FROM dmp_identity_revocation
+		WHERE tenant_id = ? AND revocation_id = ?
+		GROUP BY namespace, subject_token, subject_token_key_version`, s.tenant, id)
+	if err != nil {
+		return nil, fmt.Errorf("%w: read revocation tokens: %v", ErrStoreUnavailable, err)
+	}
+	defer rows.Close()
+	var tombstones []Tombstone
+	for rows.Next() {
+		var tombstone Tombstone
+		if err := rows.Scan(&tombstone.Namespace, &tombstone.Token, &tombstone.KeyVersion, &tombstone.ReasonCode); err != nil {
+			return nil, fmt.Errorf("%w: scan revocation token: %v", ErrStoreUnavailable, err)
+		}
+		tombstones = append(tombstones, tombstone)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: read revocation tokens: %v", ErrStoreUnavailable, err)
+	}
+	return tombstones, nil
+}
+
+// TokenCounts returns how many membership and event rows still reference the
+// subject. Physical deletion is only complete at zero.
+func (s *Store) TokenCounts(ctx context.Context, namespace, token string) (uint64, error) {
+	var membership, events uint64
+	if err := s.count(ctx, `SELECT count() FROM dmp_membership_snapshot
+		WHERE tenant_id = ? AND namespace = ? AND subject_token = ?`, namespace, token, &membership); err != nil {
+		return 0, err
+	}
+	if err := s.count(ctx, `SELECT count() FROM dmp_event
+		WHERE tenant_id = ? AND namespace = ? AND subject_token = ?`, namespace, token, &events); err != nil {
+		return 0, err
+	}
+	return membership + events, nil
+}
+
+// PurgeSubject physically deletes membership and analytic event rows for one
+// revoked subject. The tombstone is kept: it is the authoritative deny record
+// and the proof that the deletion was requested.
+func (s *Store) PurgeSubject(ctx context.Context, namespace, token string) (uint64, error) {
+	var removed uint64
+	for _, statement := range []string{
+		`ALTER TABLE dmp_membership_snapshot DELETE WHERE tenant_id = ? AND namespace = ? AND subject_token = ?
+		 SETTINGS mutations_sync = 1`,
+		`ALTER TABLE dmp_event DELETE WHERE tenant_id = ? AND namespace = ? AND subject_token = ?
+		 SETTINGS mutations_sync = 1`,
+	} {
+		if err := s.conn.Exec(ctx, statement, s.tenant, namespace, token); err != nil {
+			return removed, fmt.Errorf("%w: purge subject rows: %v", ErrStoreUnavailable, err)
+		}
+	}
+	remaining, err := s.TokenCounts(ctx, namespace, token)
+	if err != nil {
+		return 0, err
+	}
+	if remaining != 0 {
+		return 0, fmt.Errorf("%w: %d rows survived the purge", ErrStoreUnavailable, remaining)
+	}
+	removed = 1
+	return removed, nil
+}
+
+func (s *Store) count(ctx context.Context, query, namespace, token string, destination *uint64) error {
+	rows, err := s.conn.Query(ctx, query, s.tenant, namespace, token)
+	if err != nil {
+		return fmt.Errorf("%w: count subject rows: %v", ErrStoreUnavailable, err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		if err := rows.Scan(destination); err != nil {
+			return fmt.Errorf("%w: scan subject row count: %v", ErrStoreUnavailable, err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("%w: count subject rows: %v", ErrStoreUnavailable, err)
+	}
+	return nil
+}

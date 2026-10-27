@@ -18,6 +18,7 @@ import (
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/control"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/gate"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/observability"
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/retention"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/revocation"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/snapshot"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/valkey"
@@ -127,6 +128,15 @@ func controlPlaneOptions(cfg *config.Config, logger *slog.Logger) ([]adapterHTTP
 		}
 		options = append(options, adapterHTTP.WithDenyGate(denyGate))
 	}
+
+	retentionWorker := retention.NewWorker(snapshotStore, revocationStore, retention.Policy{
+		MembershipRetention: time.Duration(cfg.MembershipRetentionDays) * 24 * time.Hour,
+		EventRetention:      time.Duration(cfg.EventRetentionDays) * 24 * time.Hour,
+		PhysicalDeleteGrace: time.Duration(cfg.PhysicalDeleteGraceMins) * time.Minute,
+		PhysicalDeleteSLA:   time.Duration(cfg.PhysicalDeleteSLADays) * 24 * time.Hour,
+	}, logger)
+	options = append(options, adapterHTTP.WithRetentionService(retentionWorker))
+	go retentionWorker.Run(context.Background(), cfg.RetentionInterval)
 
 	// Readiness fails while the store is unreachable and while the deny gate is
 	// rebuilding, so traffic is never routed to an instance that could answer

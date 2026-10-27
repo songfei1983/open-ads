@@ -249,3 +249,61 @@ func scanPublication(row rowScanner) (Publication, error) {
 	publication.SnapshotID = readID.String()
 	return publication, nil
 }
+
+// ErrPublished reports a snapshot that still serves traffic and therefore cannot
+// be deleted.
+var ErrPublished = errors.New("snapshot is the current publication")
+
+// DeleteSnapshot physically removes one snapshot's membership rows through a
+// controlled mutation keyed by snapshot_id. Because the filter is tenant+snapshot
+// scoped, other snapshots sharing the same monthly partition are untouched.
+func (s *Store) DeleteSnapshot(ctx context.Context, snapshotID string) (uint64, error) {
+	job, err := s.GetJob(ctx, snapshotID)
+	if err != nil {
+		return 0, err
+	}
+	if job.Status == StatusPublished {
+		return 0, ErrPublished
+	}
+	if current, err := s.CurrentPublication(ctx, job.ProviderID, job.Namespace); err == nil && current.SnapshotID == job.SnapshotID {
+		return 0, ErrPublished
+	} else if err != nil && !errors.Is(err, ErrNoPublication) {
+		return 0, err
+	}
+
+	before, _, err := s.ChecksumOf(ctx, job.SnapshotID)
+	if err != nil {
+		return 0, err
+	}
+	id, err := uuid.Parse(job.SnapshotID)
+	if err != nil {
+		return 0, ErrJobNotFound
+	}
+	if err := s.conn.Exec(ctx, `ALTER TABLE dmp_membership_snapshot DELETE
+		WHERE tenant_id = ? AND snapshot_id = ?
+		SETTINGS mutations_sync = 1`, s.tenant, id); err != nil {
+		return 0, fmt.Errorf("%w: delete snapshot rows: %v", ErrStoreUnavailable, err)
+	}
+	after, _, err := s.ChecksumOf(ctx, job.SnapshotID)
+	if err != nil {
+		return 0, err
+	}
+	if after != 0 {
+		return before, fmt.Errorf("%w: %d rows survived the deletion", ErrStoreUnavailable, after)
+	}
+	if job.Status != StatusRetired {
+		if _, err := s.appendState(ctx, job, StatusRetired, "retention deletion"); err != nil {
+			return before, err
+		}
+	}
+	return before, nil
+}
+
+// CreatedBefore reports whether the snapshot import started before cutoff.
+func (s *Store) CreatedBefore(ctx context.Context, snapshotID string, cutoff time.Time) (bool, error) {
+	job, err := s.GetJob(ctx, snapshotID)
+	if err != nil {
+		return false, err
+	}
+	return job.CreatedAt.Before(cutoff), nil
+}

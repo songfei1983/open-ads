@@ -36,6 +36,7 @@ type Server struct {
 	snapshots   internalapi.SnapshotService
 	gate        internalapi.DenyGate
 	revocations internalapi.Revocations
+	retention   internalapi.RetentionService
 }
 
 // Option customizes the server at construction time.
@@ -74,6 +75,15 @@ func WithDenyGate(g *gate.Gate) Option {
 	return func(s *Server) {
 		if g != nil {
 			s.gate = g
+		}
+	}
+}
+
+// WithRetentionService attaches the retention worker used by the internal API.
+func WithRetentionService(service internalapi.RetentionService) Option {
+	return func(s *Server) {
+		if service != nil {
+			s.retention = service
 		}
 	}
 }
@@ -158,6 +168,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		Snapshots:   s.snapshots,
 		Gate:        s.gate,
 		Revocations: s.revocations,
+		Retention:   s.retention,
 		Logger:      s.logger,
 	})
 	mux.Handle("/internal/v1/", internalHandler)
