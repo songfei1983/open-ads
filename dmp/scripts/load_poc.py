@@ -15,6 +15,7 @@ import hashlib
 import http.client
 import json
 import os
+import pathlib
 import random
 import statistics
 import sys
@@ -54,7 +55,8 @@ def token_for(index: int) -> str:
     return f"{index:016x}".rjust(64, "0")
 
 
-def seed_snapshot(rows: int, source_version: str) -> str:
+def seed_snapshot(rows: int, source_version: str) -> tuple[str, float, float]:
+    """Import and verify a snapshot, returning its id and the two timings."""
     tokens = [token_for(i) for i in range(rows)]
     checksum = hashlib.sha256(
         "".join(f"{token}\t1\t{SEGMENT}\n" for token in sorted(tokens)).encode()
@@ -84,7 +86,7 @@ def seed_snapshot(rows: int, source_version: str) -> str:
         raise SystemExit(f"verify failed: {status} {verified}")
     print(f"  import: {rows} rows in {imported:.2f}s ({rows / imported:,.0f} rows/s), "
           f"verify {verify_seconds:.2f}s, checksum ok")
-    return snapshot_id
+    return snapshot_id, imported, verify_seconds
 
 
 def resolve_latencies(tokens: list[str], requests: int, concurrency: int) -> tuple[list[float], list[int]]:
@@ -129,6 +131,19 @@ def resolve_latencies(tokens: list[str], requests: int, concurrency: int) -> tup
     return latencies, statuses
 
 
+def write_report(args: argparse.Namespace, report: dict) -> str:
+    """Archive the run so a later topology re-test can be compared to it."""
+    if args.report:
+        path = pathlib.Path(args.report)
+    else:
+        stamp = time.strftime("%Y-%m-%d", time.gmtime())
+        path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "plan" / "iteration-4" / "poc" / f"{stamp}-{args.label}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"  report archived to {path}")
+    return str(path)
+
+
 def percentile(values: list[float], fraction: float) -> float:
     if not values:
         return 0.0
@@ -142,11 +157,15 @@ def main() -> int:
     parser.add_argument("--rows", type=int, default=100_000)
     parser.add_argument("--requests", type=int, default=600)
     parser.add_argument("--concurrency", type=int, default=20)
+    parser.add_argument("--label", default="sandbox-single-node",
+                        help="topology label written into the archived report")
+    parser.add_argument("--report", default="",
+                        help="path of the JSON report to archive (default: docs/plan/iteration-4/poc/<date>-<label>.json)")
     args = parser.parse_args()
 
     run = str(int(time.time()))[-6:]
     print(f"DMP load POC: rows={args.rows} requests={args.requests} concurrency={args.concurrency}")
-    serving = seed_snapshot(args.rows, f"poc-serving-{run}")
+    serving, import_seconds, verify_seconds = seed_snapshot(args.rows, f"poc-serving-{run}")
     print(f"  publish serving snapshot: {call('POST', f'/snapshots/{serving}/publish')[0]}")
 
     tokens = [token_for(i) for i in range(min(args.rows, 5000))]
@@ -154,7 +173,7 @@ def main() -> int:
     p50, p95, p99 = percentile(latencies, 0.50), percentile(latencies, 0.95), percentile(latencies, 0.99)
     print(f"  latency: p50={p50:.2f}ms p95={p95:.2f}ms p99={p99:.2f}ms max={max(latencies):.2f}ms")
 
-    doomed = seed_snapshot(args.rows, f"poc-doomed-{run}")
+    doomed, _, _ = seed_snapshot(args.rows, f"poc-doomed-{run}")
     started = time.perf_counter()
     status, deleted = call("POST", f"/snapshots/{doomed}/delete")
     delete_seconds = time.perf_counter() - started
@@ -166,14 +185,21 @@ def main() -> int:
     print(f"  serving snapshot still resolves after the deletion: status={status} segments={served}")
 
     report = {
+        "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "topology": args.label,
+        "endpoint": BASE,
         "rows": args.rows, "requests": len(latencies), "concurrency": args.concurrency,
+        "imported_rows_per_second": round(args.rows / max(import_seconds, 1e-9)),
         "p50_ms": round(p50, 2), "p95_ms": round(p95, 2), "p99_ms": round(p99, 2),
         "errors": sum(1 for s in statuses if s != 200),
+        "import_seconds": round(import_seconds, 2),
+        "verify_seconds": round(verify_seconds, 2),
         "delete_seconds": round(delete_seconds, 2),
         "serving_segments_after_delete": served,
         "p95_target_ms": RESOLVE_P95_TARGET_MS, "delete_target_seconds": DELETE_TARGET_SECONDS,
     }
     print(json.dumps(report, indent=2))
+    write_report(args, report)
 
     failures = []
     if report["errors"]:

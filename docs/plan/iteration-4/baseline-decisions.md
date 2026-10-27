@@ -91,8 +91,10 @@ I4-08 实测（浏览器）：控制台各页无 console/page error；代理白�
 | R9 | DMP 业务指标：resolve 结果/时延、gate admission、导入校验、保留删除、epoch、tombstone 数 | ✅ 完成 |
 | R2 | 同版本落败行巡检清理（保留 `argMin(revision_id)`，先 dry-run 计数） | ✅ 完成 |
 | R5 | 抽出共享 `identity.TokenPolicy` + 负例 fixture 集 + 疑似原始身份指标 | ✅ 完成 |
-| R3 | 负载/POC 参数化并归档报告，D-01 后按生产拓扑复测 | 待办 |
+| R3 | 负载/POC 参数化并归档报告，D-01 后按生产拓扑复测 | ✅ 完成（复测待 D-01） |
 | R10 | DMP OpenAPI 3.1 契约工件 + import/revoke 幂等键 | 待办 |
+
+R3 验收（2026-10-27）：`load_poc.py` 增加 `--label`/`--report`，报告含 `recorded_at`、拓扑标签、端点、导入 rows/s、校验耗时、删除耗时与目标阈值，默认归档到 `docs/plan/iteration-4/poc/<日期>-<label>.json`；新增 `poc/README.md` 说明复测命令、PASS/FAIL 判定与解读边界。归档 `2026-10-27-sandbox-single-node.json`：100k 行导入 28,383 rows/s、verify 0.09s、600 次 resolve p50 25.1ms / p95 37.1ms / p99 44.8ms（0 错误）、100k 行删除 0.15s、服务快照无损。生产拓扑（多副本 DMP、ClickHouse 分片、Valkey 集群、跨 AZ）复测仍待 D-01。
 
 R5 验收（2026-10-27）：新增独立模块 `identity`（`go.work` 与 `dmp/go.mod` replace 引入，CI matrix 增加 `identity`）：`Policy.Validate` 只接受 64 位小写 hex 摘要（大写自动规范化），并把"原始身份"与"格式错误"分成 `ErrRawIdentity` / `ErrInvalidToken` 两类可 `errors.Is` 的错误，`Error.Kind` 暴露封闭分类（`email`/`phone`/`uuid`/`device_id`/`wrong_length`/`not_hex`/`empty`）。共享负例集 `fixtures/identity/subject_tokens.json`（4 接受 + 19 拒绝）被 `identity` 与 DMP import/resolve 两侧的测试共同断言。`/metrics` 新增 `dmp_raw_identity_rejected_total{kind}`。live 验证：邮箱 resolve 与手机号 revoke 均 400 且消息含"not a raw identifier"，大写摘要 200，指标分别记到 email/phone。DMP 镜像构建上下文改为仓库根目录以包含 `identity` 模块。
 
