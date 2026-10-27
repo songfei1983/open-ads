@@ -16,7 +16,9 @@ import (
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/config"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/control"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/domain"
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/internalapi"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/observability"
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/snapshot"
 )
 
 // adminRequestTimeout bounds management API requests, which write to ClickHouse
@@ -25,12 +27,13 @@ const adminRequestTimeout = 10 * time.Second
 
 // Server wraps the standard library http.Server for DMP.
 type Server struct {
-	server  *http.Server
-	logger  *slog.Logger
-	cfg     *config.Config
-	metrics *observability.Metrics
-	isReady atomic.Bool
-	control control.Store
+	server    *http.Server
+	logger    *slog.Logger
+	cfg       *config.Config
+	metrics   *observability.Metrics
+	isReady   atomic.Bool
+	control   control.Store
+	snapshots *snapshot.Store
 }
 
 // Option customizes the server at construction time.
@@ -40,6 +43,11 @@ type Option func(*Server)
 // management API. Without it the admin surface answers 503.
 func WithControlStore(store control.Store) Option {
 	return func(s *Server) { s.control = store }
+}
+
+// WithSnapshotStore attaches the snapshot import/verification store.
+func WithSnapshotStore(store *snapshot.Store) Option {
+	return func(s *Server) { s.snapshots = store }
 }
 
 // NewServer initializes the HTTP server with router, middlewares, and probes.
@@ -88,6 +96,14 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /metrics", s.metrics.Handler)
 	mux.HandleFunc("POST /internal/v1/audiences:resolve", s.handleAudienceResolve)
 	mux.HandleFunc("POST /internal/v1/identity:revoke", s.handleIdentityRevoke)
+
+	internalHandler := internalapi.NewHandler(internalapi.HandlerOptions{
+		Token:     s.cfg.InternalToken,
+		Snapshots: s.snapshots,
+		Logger:    s.logger,
+	})
+	mux.Handle("/internal/v1/snapshots", internalHandler)
+	mux.Handle("/internal/v1/snapshots/", internalHandler)
 
 	controlHandler := control.NewHandler(control.HandlerOptions{
 		Store:  s.control,

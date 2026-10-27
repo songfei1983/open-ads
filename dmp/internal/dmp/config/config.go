@@ -34,6 +34,9 @@ type Config struct {
 	AdminTenantID string
 	AdminActor    string
 
+	// Internal API token for trusted adapters (snapshot import, publication, revocation)
+	InternalToken string
+
 	// Observability
 	LogLevel string
 }
@@ -64,6 +67,7 @@ func Load() (*Config, error) {
 		AdminToken:         strings.TrimSpace(getEnv("DMP_ADMIN_TOKEN", "")),
 		AdminTenantID:      strings.TrimSpace(getEnv("DMP_ADMIN_TENANT_ID", "")),
 		AdminActor:         getEnv("DMP_ADMIN_ACTOR", "dmp-admin"),
+		InternalToken:      strings.TrimSpace(getEnv("DMP_INTERNAL_TOKEN", "")),
 		LogLevel:           getEnv("LOG_LEVEL", "INFO"),
 	}
 	if !validLogLevel(cfg.LogLevel) {
@@ -89,6 +93,9 @@ func Load() (*Config, error) {
 	}
 	if cfg.AdminActor == "" {
 		return nil, fmt.Errorf("DMP_ADMIN_ACTOR must not be empty")
+	}
+	if cfg.InternalToken != "" && len(cfg.InternalToken) < 32 {
+		return nil, fmt.Errorf("DMP_INTERNAL_TOKEN must be at least 32 characters")
 	}
 
 	return cfg, nil

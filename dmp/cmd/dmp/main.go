@@ -17,6 +17,7 @@ import (
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/config"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/control"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/observability"
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/snapshot"
 )
 
 func main() {
@@ -71,6 +72,8 @@ func main() {
 func controlPlaneOptions(cfg *config.Config, logger *slog.Logger) ([]adapterHTTP.Option, func(), error) {
 	if cfg.AdminToken == "" {
 		logger.Warn("DMP management API is disabled; DMP_ADMIN_TOKEN is not configured")
+	}
+	if cfg.AdminToken == "" && cfg.InternalToken == "" {
 		return nil, func() {}, nil
 	}
 	tenantID, err := uuid.Parse(cfg.AdminTenantID)
@@ -81,10 +84,15 @@ func controlPlaneOptions(cfg *config.Config, logger *slog.Logger) ([]adapterHTTP
 	defer cancel()
 	conn, err := control.OpenClickHouse(ctx, cfg.ClickHouseAddr, cfg.ClickHouseUser, cfg.ClickHousePassword, cfg.ClickHouseDatabase)
 	if err != nil {
-		logger.Warn("DMP control plane store unavailable; management API answers 503",
+		logger.Warn("DMP definition stores unavailable; management and internal APIs answer 503",
 			slog.String("clickhouse_addr", cfg.ClickHouseAddr), slog.Any("error", err))
 		return nil, func() {}, nil
 	}
-	store := control.NewClickHouseStore(conn, tenantID)
-	return []adapterHTTP.Option{adapterHTTP.WithControlStore(store)}, func() { _ = store.Close() }, nil
+	controlStore := control.NewClickHouseStore(conn, tenantID)
+	snapshotStore := snapshot.NewStore(conn, controlStore, tenantID)
+	options := []adapterHTTP.Option{
+		adapterHTTP.WithControlStore(controlStore),
+		adapterHTTP.WithSnapshotStore(snapshotStore),
+	}
+	return options, func() { _ = controlStore.Close() }, nil
 }

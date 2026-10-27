@@ -58,6 +58,22 @@ func TestLoadRejectsShortAdminToken(t *testing.T) {
 	}
 }
 
+func TestLoadInternalToken(t *testing.T) {
+	t.Setenv("DMP_INTERNAL_TOKEN", "dmp-internal-token-0123456789abcdef")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.InternalToken != "dmp-internal-token-0123456789abcdef" {
+		t.Fatalf("internal token not loaded: %q", cfg.InternalToken)
+	}
+
+	t.Setenv("DMP_INTERNAL_TOKEN", "short")
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected short internal token to be rejected")
+	}
+}
+
 func TestLoadRejectsInvalidAdminTenant(t *testing.T) {
 	t.Setenv("DMP_ADMIN_TOKEN", "dmp-admin-token-0123456789abcdef")
 	t.Setenv("DMP_ADMIN_TENANT_ID", "not-a-uuid")
