@@ -1,0 +1,113 @@
+{
+  "description": "Negative and positive subject-token cases shared by the DMP import, revocation and resolve paths. Raw personal identifiers must never be accepted.",
+  "accept": [
+    {
+      "value": "9f2c1d3e4b5a69788796a5b4c3d2e1f00918273645546372819a0b1c2d3e4f50",
+      "note": "64 lowercase hex HMAC digest"
+    },
+    {
+      "value": "  00000000000000000000000000000000000000000000000000000000000000ff  ",
+      "note": "surrounding whitespace is trimmed before validation"
+    },
+    {
+      "value": "13800138000a1b2c3d4e5f60718293a4b5c6d7e8f9012345678901234567890a",
+      "note": "digit prefix plus hex is a valid digest"
+    },
+    {
+      "value": "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789",
+      "note": "uppercase digest is canonicalised to lowercase before storage"
+    }
+  ],
+  "reject": [
+    {
+      "value": "alice@example.com",
+      "kind": "email",
+      "note": "raw e-mail address"
+    },
+    {
+      "value": "Alice.Example+ads@Example.COM",
+      "kind": "email",
+      "note": "raw e-mail address, mixed case"
+    },
+    {
+      "value": "+8613800138000",
+      "kind": "phone",
+      "note": "international phone number"
+    },
+    {
+      "value": "138-0013-8000",
+      "kind": "phone",
+      "note": "national phone number with separators"
+    },
+    {
+      "value": "13800138000",
+      "kind": "phone",
+      "note": "bare 11-digit phone number"
+    },
+    {
+      "value": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+      "kind": "uuid",
+      "note": "bare UUID (device or user id)"
+    },
+    {
+      "value": "9f2c1d3e4b5a69788796a5b4c3d2e1f00918273645546372819a0b1c2d3e4f5",
+      "kind": "wrong_length",
+      "note": "63 hex characters"
+    },
+    {
+      "value": "9f2c1d3e4b5a69788796a5b4c3d2e1f00918273645546372819a0b1c2d3e4f5000",
+      "kind": "wrong_length",
+      "note": "66 hex characters"
+    },
+    {
+      "value": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "kind": "wrong_length",
+      "note": "32 hex characters (MD5-sized)"
+    },
+    {
+      "value": "idfa-3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+      "kind": "device_id",
+      "note": "vendor advertising id with prefix"
+    },
+    {
+      "value": "device_id_0123456789abcdef",
+      "kind": "device_id",
+      "note": "device identifier"
+    },
+    {
+      "value": "session:cb2f1e9a8d7c6b5a4f3e2d1c",
+      "kind": "device_id",
+      "note": "session cookie value"
+    },
+    {
+      "value": "alice",
+      "kind": "not_hex",
+      "note": "raw username"
+    },
+    {
+      "value": "张三",
+      "kind": "not_hex",
+      "note": "raw name"
+    },
+    {
+      "value": "192.168.1.10",
+      "kind": "not_hex",
+      "note": "IP address"
+    },
+    {
+      "value": "",
+      "kind": "empty",
+      "note": "missing token"
+    },
+    {
+      "value": "   ",
+      "kind": "empty",
+      "note": "blank token"
+    },
+    {
+      "value": "A1B2C3D4E5F60718293A4B5C6D7E8F90",
+      "kind": "wrong_length",
+      "note": "uppercase 32-character digest is still the wrong length"
+    }
+  ]
+}

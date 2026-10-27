@@ -5,6 +5,7 @@ go 1.27.3
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.50.0
 	github.com/google/uuid v1.6.0
+	github.com/songfei1983/open-ads/identity v0.0.0
 )
 
 require (
@@ -22,3 +23,6 @@ require (
 	go.opentelemetry.io/otel/trace v1.47.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 )
+
+// The shared identity policy lives in the same repository and workspace.
+replace github.com/songfei1983/open-ads/identity => ../identity

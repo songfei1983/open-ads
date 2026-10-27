@@ -153,8 +153,10 @@ services:
   # DMP service – built from the local Dockerfile.
   dmp:
     build:
-      context: ../dmp
-      dockerfile: Dockerfile
+      # The repository root is the context so the shared identity module is
+      # available to the go.mod replace directive.
+      context: ..
+      dockerfile: dmp/Dockerfile
       # dev target runs air for hot reload; drop it for production-style builds.
       target: dev
     image: open-ads-dmp:dev
@@ -191,6 +193,7 @@ services:
     volumes:
       - ../dmp:/src
       - ../dmp/.air.toml:/src/.air.toml
+      - ../identity:/identity:ro
     command: ["-c", ".air.toml"]
 
 volumes:

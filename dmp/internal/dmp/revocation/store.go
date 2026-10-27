@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/songfei1983/open-ads/identity"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -60,9 +62,9 @@ func (r *Request) Validate() error {
 	}
 	seen := make(map[TokenVersion]struct{}, len(r.Tokens))
 	for i := range r.Tokens {
-		r.Tokens[i].Token = strings.ToLower(strings.TrimSpace(r.Tokens[i].Token))
-		if !isToken(r.Tokens[i].Token) {
-			return fmt.Errorf("%w: subject_token must be a 64-character lowercase hex digest", ErrInvalidRequest)
+		r.Tokens[i].Token = identity.Normalize(r.Tokens[i].Token)
+		if err := identity.Default().Validate(r.Tokens[i].Token); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 		}
 		if r.Tokens[i].KeyVersion == 0 {
 			return fmt.Errorf("%w: key_version must be at least 1", ErrInvalidRequest)
@@ -283,19 +285,6 @@ func NewID() (string, error) {
 		return "", fmt.Errorf("parse revocation id: %w", err)
 	}
 	return id.String(), nil
-}
-
-func isToken(token string) bool {
-	if len(token) != 64 {
-		return false
-	}
-	for i := 0; i < len(token); i++ {
-		c := token[i]
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
-			return false
-		}
-	}
-	return true
 }
 
 // TokensOf returns the tombstones recorded for one revocation.

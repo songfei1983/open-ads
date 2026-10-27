@@ -90,9 +90,11 @@ I4-08 实测（浏览器）：控制台各页无 console/page error；代理白�
 | R1 | 控制面审计改为 intent + outcome 两行，缺 outcome 即"结果未知"并提供巡检查询；拒绝路径审计失败改为 fail-closed | ✅ 完成 |
 | R9 | DMP 业务指标：resolve 结果/时延、gate admission、导入校验、保留删除、epoch、tombstone 数 | ✅ 完成 |
 | R2 | 同版本落败行巡检清理（保留 `argMin(revision_id)`，先 dry-run 计数） | ✅ 完成 |
-| R5 | 抽出共享 `identity.TokenPolicy` + 负例 fixture 集 + 疑似原始身份指标 | 待办 |
+| R5 | 抽出共享 `identity.TokenPolicy` + 负例 fixture 集 + 疑似原始身份指标 | ✅ 完成 |
 | R3 | 负载/POC 参数化并归档报告，D-01 后按生产拓扑复测 | 待办 |
 | R10 | DMP OpenAPI 3.1 契约工件 + import/revoke 幂等键 | 待办 |
+
+R5 验收（2026-10-27）：新增独立模块 `identity`（`go.work` 与 `dmp/go.mod` replace 引入，CI matrix 增加 `identity`）：`Policy.Validate` 只接受 64 位小写 hex 摘要（大写自动规范化），并把"原始身份"与"格式错误"分成 `ErrRawIdentity` / `ErrInvalidToken` 两类可 `errors.Is` 的错误，`Error.Kind` 暴露封闭分类（`email`/`phone`/`uuid`/`device_id`/`wrong_length`/`not_hex`/`empty`）。共享负例集 `fixtures/identity/subject_tokens.json`（4 接受 + 19 拒绝）被 `identity` 与 DMP import/resolve 两侧的测试共同断言。`/metrics` 新增 `dmp_raw_identity_rejected_total{kind}`。live 验证：邮箱 resolve 与手机号 revoke 均 400 且消息含"not a raw identifier"，大写摘要 200，指标分别记到 email/phone。DMP 镜像构建上下文改为仓库根目录以包含 `identity` 模块。
 
 R2 验收（2026-10-27）：新增 `control.Maintenance`（可选接口，不改动 `Store`）：`GET /admin/v1/maintenance/duplicate-versions` 只统计同版本多行（`GROUP BY id, version HAVING count() > 1`），`POST` 默认 `dry_run=true`、显式 `{"dry_run":false}` 才删除；删除语句 `revision_id != argMin(revision_id)` 且 `mutations_sync=1`，保证返回时存储已修复。控制台「保留策略」页新增"同版本落败行"卡片（巡检/清理两个动作）。live 验证：历史并发写入留下 8 行 v2，dry run 报 7 行、清理后巡检为空且当前版本仍为 2；随后并发写 6 次复现 6 行 → 控制台一步清理 5 行、toast 与卡片均正确。ClickHouse 集成测试覆盖 dry-run 不删除、清理只删落败行、当前版本不变。
 

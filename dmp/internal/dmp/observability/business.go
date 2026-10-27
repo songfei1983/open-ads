@@ -182,6 +182,12 @@ func (m *DMPMetrics) Publish(result string) {
 	m.business.Inc("dmp_snapshot_publish_total", "result", result)
 }
 
+// RawIdentityRejected records a request refused because it carried a raw
+// personal identifier. kind is the closed identity.Kind vocabulary.
+func (m *DMPMetrics) RawIdentityRejected(kind string) {
+	m.business.Inc("dmp_raw_identity_rejected_total", "kind", kind)
+}
+
 // Revocation records how many subject tokens a revocation request carried.
 func (m *DMPMetrics) Revocation(subjects int) {
 	m.business.Add("dmp_revocation_subjects_total", float64(subjects), "", "")

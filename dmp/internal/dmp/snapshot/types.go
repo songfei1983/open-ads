@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/songfei1983/open-ads/identity"
 )
 
 // Import and publication failures.
@@ -41,11 +43,6 @@ const MaxBatchRows = 1000
 
 // MaxDuplicateRate is the data-quality ceiling applied during verification.
 const MaxDuplicateRate = 0.05
-
-// subjectTokenPattern is the only accepted token shape: 64 lowercase hex
-// characters, i.e. an HMAC-SHA256 (or equivalent) digest. Raw identifiers such
-// as e-mail addresses, phone numbers or device IDs can never match it.
-var subjectTokenPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 var sourceVersionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$`)
 
@@ -123,9 +120,9 @@ type MemberRow struct {
 // Validate checks that the row only carries a pseudonymous token and known
 // segments. Raw identifiers are rejected before anything is persisted.
 func (r *MemberRow) Validate() error {
-	r.SubjectToken = strings.ToLower(strings.TrimSpace(r.SubjectToken))
-	if !subjectTokenPattern.MatchString(r.SubjectToken) {
-		return fmt.Errorf("%w: subject_token must be a 64-character lowercase hex digest of a pseudonymous identifier", ErrInvalidImport)
+	r.SubjectToken = identity.Normalize(r.SubjectToken)
+	if err := identity.Default().Validate(r.SubjectToken); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidImport, err)
 	}
 	if r.SubjectKeyVersion == 0 {
 		return fmt.Errorf("%w: subject_key_version must be at least 1", ErrInvalidImport)

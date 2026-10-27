@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/songfei1983/open-ads/identity"
 )
 
 // SegmentRef is one resolved segment; names and profile details never leave DMP.
@@ -58,12 +60,12 @@ const DefaultResolveSegments = 10
 func (in *ResolveInput) Validate() error {
 	in.Namespace = strings.TrimSpace(in.Namespace)
 	in.ProviderID = strings.TrimSpace(in.ProviderID)
-	in.SubjectToken = strings.ToLower(strings.TrimSpace(in.SubjectToken))
+	in.SubjectToken = identity.Normalize(in.SubjectToken)
 	if in.Namespace == "" {
 		return fmt.Errorf("%w: namespace is required", ErrInvalidImport)
 	}
-	if !subjectTokenPattern.MatchString(in.SubjectToken) {
-		return fmt.Errorf("%w: subject_token must be a 64-character lowercase hex digest", ErrInvalidImport)
+	if err := identity.Default().Validate(in.SubjectToken); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidImport, err)
 	}
 	if in.MaxSegments == 0 {
 		in.MaxSegments = DefaultResolveSegments

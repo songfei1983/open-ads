@@ -8,7 +8,7 @@ jobs:
   verify:
     strategy:
       matrix:
-        service: [ssp, dsp, dmp]
+        service: [identity, ssp, dsp, dmp]
     runs-on: ubuntu-latest
     defaults:
       run:

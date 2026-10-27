@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/songfei1983/open-ads/identity"
+
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/authn"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/gate"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/observability"
@@ -507,6 +509,19 @@ func (h *handler) bindResolveTenant(w http.ResponseWriter, r *http.Request, inpu
 	return true
 }
 
+// observeRawIdentity counts refusals caused by a raw personal identifier so an
+// attempted plaintext leak is alertable rather than just a 400.
+func (h *handler) observeRawIdentity(err error) {
+	if h.metrics == nil || !errors.Is(err, identity.ErrRawIdentity) {
+		return
+	}
+	kind := "unknown"
+	if classified, ok := identity.KindOf(err); ok {
+		kind = string(classified)
+	}
+	h.metrics.RawIdentityRejected(kind)
+}
+
 func (h *handler) observeResolve(result string, segments int, started time.Time) {
 	if h.metrics == nil {
 		return
@@ -750,6 +765,7 @@ func (h *handler) retentionPolicy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) fail(w http.ResponseWriter, r *http.Request, err error) {
+	h.observeRawIdentity(err)
 	requestID := observability.RequestIDFromContext(r.Context())
 	switch {
 	case errors.Is(err, snapshot.ErrInvalidImport):
