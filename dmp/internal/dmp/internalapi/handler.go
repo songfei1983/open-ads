@@ -73,7 +73,9 @@ type HandlerOptions struct {
 	Gate        DenyGate
 	Revocations Revocations
 	Retention   RetentionService
-	Logger      *slog.Logger
+	// Metrics records the business signals; nil disables them.
+	Metrics *observability.DMPMetrics
+	Logger  *slog.Logger
 }
 
 // NewHandler returns the internal API. Every request must present the internal
@@ -89,7 +91,7 @@ func NewHandler(opts HandlerOptions) http.Handler {
 		authenticator = sandboxAuthenticator(opts.Token, opts.AdminToken)
 	}
 	h := &handler{authenticator: authenticator, tenantID: opts.TenantID, snapshots: opts.Snapshots, gate: opts.Gate,
-		revocations: opts.Revocations, retention: opts.Retention, logger: logger,
+		revocations: opts.Revocations, retention: opts.Retention, logger: logger, metrics: opts.Metrics,
 		configured: opts.Authenticator != nil || opts.Token != "" || opts.AdminToken != ""}
 	return h.authenticate(h)
 }
@@ -112,6 +114,7 @@ type handler struct {
 	gate          DenyGate
 	revocations   Revocations
 	retention     RetentionService
+	metrics       *observability.DMPMetrics
 	logger        *slog.Logger
 }
 
@@ -330,6 +333,9 @@ func (h *handler) appendRows(w http.ResponseWriter, r *http.Request, id string) 
 		h.fail(w, r, err)
 		return
 	}
+	if h.metrics != nil {
+		h.metrics.Import(result.StoredRows)
+	}
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -337,6 +343,7 @@ func (h *handler) verifySnapshot(w http.ResponseWriter, r *http.Request, id stri
 	job, err := h.snapshots.Verify(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, snapshot.ErrVerification) {
+			h.observeVerify("failed")
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
 				"code":       "verification_failed",
 				"message":    err.Error(),
@@ -345,9 +352,13 @@ func (h *handler) verifySnapshot(w http.ResponseWriter, r *http.Request, id stri
 			})
 			return
 		}
+		if errors.Is(err, snapshot.ErrSealed) {
+			h.observeVerify("sealed")
+		}
 		h.fail(w, r, err)
 		return
 	}
+	h.observeVerifySuccess()
 	writeJSON(w, http.StatusOK, job)
 }
 
@@ -355,12 +366,15 @@ func (h *handler) publishSnapshot(w http.ResponseWriter, r *http.Request, id str
 	job, err := h.snapshots.Publish(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, snapshot.ErrVerification) {
+			h.observePublish("verification_failed")
 			writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusUnprocessableEntity, "verification_failed", err.Error())
 			return
 		}
+		h.observePublish("error")
 		h.fail(w, r, err)
 		return
 	}
+	h.observePublish("published")
 	writeJSON(w, http.StatusOK, job)
 }
 
@@ -390,6 +404,7 @@ func (h *handler) deleteSnapshot(w http.ResponseWriter, r *http.Request, id stri
 }
 
 func (h *handler) resolveAudience(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	var input snapshot.ResolveInput
 	if !decode(w, r, &input) {
 		return
@@ -411,14 +426,19 @@ func (h *handler) resolveAudience(w http.ResponseWriter, r *http.Request) {
 	if h.gate != nil {
 		switch err := h.gate.Admit(r.Context(), input.Namespace, input.SubjectToken, leaseID); {
 		case err == nil:
+			h.observeGate("admitted")
 		case errors.Is(err, gate.ErrSubjectDenied):
 			// A revoked subject never reaches storage: answer with no audience.
+			h.observeGate("denied")
+			h.observeResolve("denied", 0, started)
 			writeJSON(w, http.StatusOK, snapshot.ResolveResult{
 				RequestID: input.RequestID, ProviderID: input.ProviderID,
 				Segments: []snapshot.SegmentRef{}, ResolvedAt: time.Now().UTC(),
 			})
 			return
 		default:
+			h.observeGate("unavailable")
+			h.observeResolve("unavailable", 0, started)
 			h.gateUnavailable(w, r, err)
 			return
 		}
@@ -431,8 +451,11 @@ func (h *handler) resolveAudience(w http.ResponseWriter, r *http.Request) {
 		if resolveErr == nil && finalizeErr != nil {
 			// The answer may only be released if the barrier still holds.
 			if errors.Is(finalizeErr, gate.ErrSubjectDenied) {
+				h.observeGate("finalize_denied")
 				result.Segments = []snapshot.SegmentRef{}
 			} else {
+				h.observeGate("finalize_unavailable")
+				h.observeResolve("unavailable", 0, started)
 				h.gateUnavailable(w, r, finalizeErr)
 				return
 			}
@@ -441,11 +464,18 @@ func (h *handler) resolveAudience(w http.ResponseWriter, r *http.Request) {
 
 	if resolveErr != nil {
 		if errors.Is(resolveErr, snapshot.ErrNoPublication) {
+			h.observeResolve("no_publication", 0, started)
 			writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusServiceUnavailable, "no_published_snapshot", "no published snapshot serves this provider/namespace")
 			return
 		}
+		h.observeResolve("error", 0, started)
 		h.fail(w, r, resolveErr)
 		return
+	}
+	if len(result.Segments) == 0 {
+		h.observeResolve("empty", 0, started)
+	} else {
+		h.observeResolve("resolved", len(result.Segments), started)
 	}
 	writeJSON(w, http.StatusOK, result)
 }
@@ -475,6 +505,44 @@ func (h *handler) bindResolveTenant(w http.ResponseWriter, r *http.Request, inpu
 	}
 	input.TenantID = tenant
 	return true
+}
+
+func (h *handler) observeResolve(result string, segments int, started time.Time) {
+	if h.metrics == nil {
+		return
+	}
+	h.metrics.Resolve(result, segments, time.Since(started))
+}
+
+func (h *handler) observeVerify(result string) {
+	if h.metrics == nil {
+		return
+	}
+	h.metrics.Verify(result)
+}
+
+// observeVerifySuccess records a verification that matched the manifest.
+func (h *handler) observeVerifySuccess() { h.observeVerify("verified") }
+
+func (h *handler) observeRetention(result string, report retention.Report) {
+	if h.metrics == nil {
+		return
+	}
+	h.metrics.Retention(result, report.DeletedRows, report.PurgedSubjects, report.PendingPurges)
+}
+
+func (h *handler) observePublish(result string) {
+	if h.metrics == nil {
+		return
+	}
+	h.metrics.Publish(result)
+}
+
+func (h *handler) observeGate(result string) {
+	if h.metrics == nil {
+		return
+	}
+	h.metrics.GateAdmission(result)
 }
 
 func (h *handler) gateUnavailable(w http.ResponseWriter, r *http.Request, err error) {
@@ -511,6 +579,9 @@ func (h *handler) revokeIdentity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.metrics != nil {
+		h.metrics.Revocation(len(request.Tokens))
+	}
 	var registered uint64
 	for _, token := range request.Tokens {
 		count, denyErr := h.gate.Deny(r.Context(), request.Namespace, token.Token, request.ReasonCode)
@@ -649,12 +720,15 @@ func (h *handler) runRetention(w http.ResponseWriter, r *http.Request) {
 	report, err := h.retention.RunOnce(r.Context())
 	if err != nil {
 		if errors.Is(err, retention.ErrLeaderHeld) {
+			h.observeRetention("skipped", retention.Report{})
 			writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusConflict, "retention_in_progress", "另一实例正在执行 retention sweep，请稍后重试")
 			return
 		}
+		h.observeRetention("error", retention.Report{})
 		h.fail(w, r, err)
 		return
 	}
+	h.observeRetention("ok", report)
 	writeJSON(w, http.StatusOK, report)
 }
 

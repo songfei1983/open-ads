@@ -111,7 +111,9 @@ func controlPlaneOptions(cfg *config.Config, logger *slog.Logger) ([]adapterHTTP
 	}
 
 	var denyGate *gate.Gate
+	businessMetrics := observability.NewDMPMetrics(nil)
 	options := []adapterHTTP.Option{
+		adapterHTTP.WithBusinessMetrics(businessMetrics),
 		adapterHTTP.WithControlStore(controlStore),
 		adapterHTTP.WithSnapshotStore(snapshotStore),
 		adapterHTTP.WithRevocationStore(revocationStore),
@@ -124,6 +126,7 @@ func controlPlaneOptions(cfg *config.Config, logger *slog.Logger) ([]adapterHTTP
 			logger.Warn("deny gate is not ready; audience lookups fail closed",
 				slog.String("valkey_addr", cfg.ValkeyAddr), slog.Any("error", gateErr))
 		} else {
+			businessMetrics.GateEpoch(epoch)
 			logger.Info("deny gate ready", slog.String("valkey_addr", cfg.ValkeyAddr), slog.Uint64("epoch", epoch))
 		}
 		options = append(options, adapterHTTP.WithDenyGate(denyGate))
@@ -148,9 +151,11 @@ func controlPlaneOptions(cfg *config.Config, logger *slog.Logger) ([]adapterHTTP
 			return fmt.Errorf("clickhouse unreachable: %w", err)
 		}
 		if denyGate != nil {
-			if _, err := denyGate.Recover(checkCtx, loadTombstones); err != nil {
+			epoch, err := denyGate.Recover(checkCtx, loadTombstones)
+			if err != nil {
 				return fmt.Errorf("deny gate not ready: %w", err)
 			}
+			businessMetrics.GateEpoch(epoch)
 		}
 		return nil
 	}))

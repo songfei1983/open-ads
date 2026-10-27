@@ -26,18 +26,28 @@ const managementRequestTimeout = 10 * time.Second
 
 // Server wraps the standard library http.Server for DMP.
 type Server struct {
-	server      *http.Server
-	logger      *slog.Logger
-	cfg         *config.Config
-	metrics     *observability.Metrics
-	isReady     atomic.Bool
-	readyErr    atomic.Value
-	readyCheck  func(context.Context) error
-	control     control.Store
-	snapshots   internalapi.SnapshotService
-	gate        internalapi.DenyGate
-	revocations internalapi.Revocations
-	retention   internalapi.RetentionService
+	server          *http.Server
+	logger          *slog.Logger
+	cfg             *config.Config
+	businessMetrics *observability.DMPMetrics
+	metrics         *observability.Metrics
+	isReady         atomic.Bool
+	readyErr        atomic.Value
+	readyCheck      func(context.Context) error
+	control         control.Store
+	snapshots       internalapi.SnapshotService
+	gate            internalapi.DenyGate
+	revocations     internalapi.Revocations
+	retention       internalapi.RetentionService
+}
+
+// businessMetrics returns the business metric set, defaulting to the registry
+// published by /metrics.
+func (s *Server) businessMetricsSet() *observability.DMPMetrics {
+	if s.businessMetrics != nil {
+		return s.businessMetrics
+	}
+	return observability.NewDMPMetrics(s.metrics.Business())
 }
 
 // Option customizes the server at construction time.
@@ -62,6 +72,17 @@ func WithSnapshotStore(store *snapshot.Store) Option {
 // by alternative store implementations.
 func WithSnapshotService(service internalapi.SnapshotService) Option {
 	return func(s *Server) { s.snapshots = service }
+}
+
+// WithBusinessMetrics attaches a caller-owned business metric set, so the
+// process that owns the deny gate can publish its epoch.
+func WithBusinessMetrics(metrics *observability.DMPMetrics) Option {
+	return func(s *Server) {
+		if metrics != nil {
+			s.businessMetrics = metrics
+			s.metrics.SetBusiness(metrics.Registry())
+		}
+	}
 }
 
 // WithReadinessCheck attaches the composed readiness probe. While the check
@@ -183,6 +204,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		Gate:          s.gate,
 		Revocations:   s.revocations,
 		Retention:     s.retention,
+		Metrics:       s.businessMetricsSet(),
 		Logger:        s.logger,
 	})
 	mux.Handle("/internal/v1/", internalHandler)
