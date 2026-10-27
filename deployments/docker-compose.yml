@@ -46,7 +46,13 @@ services:
       - "127.0.0.1:8123:8123"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
-      - ../dmp/migrations:/docker-entrypoint-initdb.d:ro
+      # The ClickHouse entrypoint executes every *.sql file in this directory,
+      # including rollback scripts. Mount the up migrations explicitly so a
+      # fresh volume only applies forward migrations.
+      - ../dmp/migrations/000001_init_dmp_schema.up.sql:/docker-entrypoint-initdb.d/000001_init_dmp_schema.up.sql:ro
+      - ../dmp/migrations/000002_dmp_control_plane.up.sql:/docker-entrypoint-initdb.d/000002_dmp_control_plane.up.sql:ro
+      - ../dmp/migrations/000003_dmp_snapshot_import.up.sql:/docker-entrypoint-initdb.d/000003_dmp_snapshot_import.up.sql:ro
+      - ../dmp/migrations/000004_dmp_retention.up.sql:/docker-entrypoint-initdb.d/000004_dmp_retention.up.sql:ro
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "127.0.0.1:8123/ping"]
       interval: 5s
