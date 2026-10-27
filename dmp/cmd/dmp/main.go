@@ -94,34 +94,54 @@ func controlPlaneOptions(cfg *config.Config, logger *slog.Logger) ([]adapterHTTP
 	controlStore := control.NewClickHouseStore(conn, tenantID)
 	snapshotStore := snapshot.NewStore(conn, controlStore, tenantID)
 	revocationStore := revocation.NewStore(conn, tenantID)
+
+	loadTombstones := func(loadCtx context.Context) ([]gate.DenyEntry, error) {
+		tombstones, err := revocationStore.Tombstones(loadCtx)
+		if err != nil {
+			return nil, err
+		}
+		entries := make([]gate.DenyEntry, 0, len(tombstones))
+		for _, tombstone := range tombstones {
+			entries = append(entries, gate.DenyEntry{
+				Namespace: tombstone.Namespace, Token: tombstone.Token, ReasonCode: tombstone.ReasonCode,
+			})
+		}
+		return entries, nil
+	}
+
+	var denyGate *gate.Gate
 	options := []adapterHTTP.Option{
 		adapterHTTP.WithControlStore(controlStore),
 		adapterHTTP.WithSnapshotStore(snapshotStore),
 		adapterHTTP.WithRevocationStore(revocationStore),
 	}
-
 	if cfg.InternalToken != "" {
 		gateClient := &valkey.Client{Address: cfg.ValkeyAddr, Username: cfg.ValkeyUser, Password: cfg.ValkeyPassword, Timeout: 2 * time.Second}
-		denyGate := gate.New(gateClient, tenantID.String())
-		tombstones, tombstoneErr := revocationStore.Tombstones(ctx)
-		if tombstoneErr != nil {
-			logger.Warn("deny gate rebuild could not read tombstones; lookups fail closed",
-				slog.Any("error", tombstoneErr))
-		}
-		entries := make([]gate.DenyEntry, 0, len(tombstones))
-		for _, tombstone := range tombstones {
-			entries = append(entries, gate.DenyEntry{Namespace: tombstone.Namespace, Token: tombstone.Token, ReasonCode: tombstone.ReasonCode})
-		}
-		epoch, gateErr := denyGate.EnsureEpoch(ctx, entries)
+		denyGate = gate.New(gateClient, tenantID.String())
+		epoch, gateErr := denyGate.Recover(ctx, loadTombstones)
 		if gateErr != nil {
 			logger.Warn("deny gate is not ready; audience lookups fail closed",
 				slog.String("valkey_addr", cfg.ValkeyAddr), slog.Any("error", gateErr))
 		} else {
-			logger.Info("deny gate ready",
-				slog.String("valkey_addr", cfg.ValkeyAddr), slog.Uint64("epoch", epoch),
-				slog.Int("tombstones", len(entries)))
+			logger.Info("deny gate ready", slog.String("valkey_addr", cfg.ValkeyAddr), slog.Uint64("epoch", epoch))
 		}
 		options = append(options, adapterHTTP.WithDenyGate(denyGate))
 	}
+
+	// Readiness fails while the store is unreachable and while the deny gate is
+	// rebuilding, so traffic is never routed to an instance that could answer
+	// with an unverified audience.
+	options = append(options, adapterHTTP.WithReadinessCheck(func(checkCtx context.Context) error {
+		if err := conn.Ping(checkCtx); err != nil {
+			return fmt.Errorf("clickhouse unreachable: %w", err)
+		}
+		if denyGate != nil {
+			if _, err := denyGate.Recover(checkCtx, loadTombstones); err != nil {
+				return fmt.Errorf("deny gate not ready: %w", err)
+			}
+		}
+		return nil
+	}))
+
 	return options, func() { _ = controlStore.Close() }, nil
 }

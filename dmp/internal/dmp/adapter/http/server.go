@@ -30,6 +30,8 @@ type Server struct {
 	cfg         *config.Config
 	metrics     *observability.Metrics
 	isReady     atomic.Bool
+	readyErr    atomic.Value
+	readyCheck  func(context.Context) error
 	control     control.Store
 	snapshots   internalapi.SnapshotService
 	gate        internalapi.DenyGate
@@ -58,6 +60,13 @@ func WithSnapshotStore(store *snapshot.Store) Option {
 // by alternative store implementations.
 func WithSnapshotService(service internalapi.SnapshotService) Option {
 	return func(s *Server) { s.snapshots = service }
+}
+
+// WithReadinessCheck attaches the composed readiness probe. While the check
+// fails the service reports itself not ready, so traffic is never routed to an
+// instance whose deny gate has not been rebuilt or whose store is unreachable.
+func WithReadinessCheck(check func(context.Context) error) Option {
+	return func(s *Server) { s.readyCheck = check }
 }
 
 // WithDenyGate attaches the Valkey deny gate used to admit audience lookups.
@@ -111,6 +120,27 @@ func NewServer(cfg *config.Config, logger *slog.Logger, opts ...Option) *Server 
 // SetReady updates the readiness state of the server.
 func (s *Server) SetReady(ready bool) {
 	s.isReady.Store(ready)
+	if ready {
+		s.readyErr.Store("")
+	}
+}
+
+// RefreshReadiness runs the configured readiness checks once and records the
+// outcome. The readiness loop calls it; tests call it directly.
+func (s *Server) RefreshReadiness(ctx context.Context) error {
+	if s.readyCheck == nil {
+		s.SetReady(true)
+		return nil
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if err := s.readyCheck(checkCtx); err != nil {
+		s.readyErr.Store(err.Error())
+		s.isReady.Store(false)
+		return err
+	}
+	s.SetReady(true)
+	return nil
 }
 
 // Handler returns the root http.Handler for testing.
@@ -152,10 +182,14 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	if !s.isReady.Load() {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+		payload := map[string]string{
 			"status":  "not_ready",
 			"service": s.cfg.ServiceName,
-		})
+		}
+		if reason, ok := s.readyErr.Load().(string); ok && reason != "" {
+			payload["reason"] = reason
+		}
+		writeJSON(w, http.StatusServiceUnavailable, payload)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
@@ -167,7 +201,11 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 
 // Start runs the HTTP server.
 func (s *Server) Start() error {
-	s.isReady.Store(true)
+	if s.readyCheck != nil {
+		go s.readinessLoop()
+	} else {
+		s.isReady.Store(true)
+	}
 	s.logger.Info("starting DMP HTTP server", slog.String("addr", s.server.Addr))
 	if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("listen and serve: %w", err)
@@ -180,6 +218,22 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info("shutting down DMP HTTP server")
 	s.isReady.Store(false)
 	return s.server.Shutdown(ctx)
+}
+
+// readinessLoop refreshes the readiness checks until the process exits, so a
+// gate rebuild or a store outage is reflected without a restart.
+func (s *Server) readinessLoop() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		err := s.RefreshReadiness(ctx)
+		cancel()
+		if err != nil {
+			s.logger.Warn("readiness check failed", slog.Any("error", err))
+		}
+		<-ticker.C
+	}
 }
 
 func (s *Server) requestIDMiddleware(next http.Handler) http.Handler {
@@ -202,11 +256,12 @@ func (s *Server) requestIDMiddleware(next http.Handler) http.Handler {
 
 func (s *Server) requestDeadlineMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The bid-path deadline is far too tight for ClickHouse reads/writes on
-		// the management and internal APIs, so they get their own budget.
+		// Every management and internal route touches ClickHouse or the deny
+		// gate, so the bid-path deadline (tens of milliseconds) would cancel
+		// them. Callers still bound their own side (SSP uses its auction
+		// deadline); this is only the upper bound inside DMP.
 		timeout := s.cfg.RequestTimeout
-		if strings.HasPrefix(r.URL.Path, "/admin/") || strings.HasPrefix(r.URL.Path, "/internal/v1/snapshots") ||
-			strings.HasPrefix(r.URL.Path, "/internal/v1/identity") {
+		if strings.HasPrefix(r.URL.Path, "/admin/") || strings.HasPrefix(r.URL.Path, "/internal/") {
 			timeout = managementRequestTimeout
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)

@@ -1,6 +1,6 @@
 # Iteration 4 基线决策与架构映射记录
 
-状态：I4-01~I4-04 完成；I4-05~I4-08 未开始
+状态：I4-01~I4-05 完成；I4-06~I4-08 未开始
 适用分支：`feat/iteration-4`
 关联文档：[Iteration 3 基线决策](../iteration-3/baseline-decisions.md) | [首期开发计划](../implementation-plan.md) | [API](../../design/API.md) | [LLD](../../design/LLD.md)
 
@@ -35,7 +35,7 @@ Iteration 4 聚焦 DMP 独立子系统与隐私门禁：先把 Provider/namespac
 | I4-02 | ✅ 完成 | — | 新增 `POST/GET /internal/v1/snapshots`、`POST /internal/v1/snapshots/{id}/rows`、`POST /internal/v1/snapshots/{id}/verify`（`DMP_INTERNAL_TOKEN` 保护，未配置 503）。导入只接受 64 位小写 hex 的伪名 token，邮箱/手机号/设备 ID 等原始身份在写入前即被拒绝；segment 必须是该 provider 的 active 定义；批次内重复计为 duplicate、已存在行按幂等跳过；`Verify` 重算 distinct 行数、规范 SHA-256 checksum 与重复率（≤5%），任一不符则 job 置 `failed` 并停止接收行，已发布快照不受影响。批次计数写入独立 batch 表，避免并发追加丢计数。 |
 | I4-03 | ✅ 完成 | — | 新增 `POST /internal/v1/snapshots/{id}/publish` 与真实 `POST /internal/v1/audiences:resolve`。发布前重新校验 stored rows 与 checksum（与 verify 结果一致才写入 `dmp_snapshot_publication`），重复发布幂等，并能在"marker 已写但状态追加失败"时自动对账；当前发布指针按 `published_at` 取最新。解析默认只查当前发布快照，携带 `snapshot_id` 时仅当该快照已发布才可命中（verified 但未发布 → 503 `no_published_snapshot`），结果按 `max_segments`（默认 10、上限 100）截断，只返回 segment ID，不回显 token。 |
 | I4-04 | ✅ 完成 | — | 新增独立 Valkey deny gate（`dmp:<tenant>:gate:*`，仅 `dmp:*` ACL）：epoch 校验 + Lua 原子 admission 登记有界 in-flight lease（2s TTL）、`finalize` 复核后再释放、`deny` 原子写入主体级 deny key 并返回当时在途数；解析在 admission 前阻断已撤回主体（返回空受众、不查存储），finalize 复核失败时丢弃已解析 segments，gate 不可用/epoch 丢失返回 `503 policy_state_unavailable`。新增 `POST /internal/v1/identity:revoke`（tombstone 写 `dmp_identity_revocation`，状态追加 `dmp_identity_revocation_status`，等待 ≤1s drain 后返回 `completed`/`pending`，tombstone 失败仍保留 gate 并返回 pending）与 `GET /internal/v1/identity-revocations/{id}`、`GET /internal/v1/identity-revocations`。启动时若 epoch 缺失，从 ClickHouse tombstone 重建 deny key 后才发布 epoch（重建期间 admission 一律 fail-closed）。 |
-| I4-05 | 未开始 | gate 重建、ClickHouse 故障、节点重启与撤回恢复演练 | 重建一致前不 ready；恢复期间无越权受众响应 |
+| I4-05 | ✅ 完成 | — | readiness 改为依赖检查：每 2s 校验 ClickHouse 可达性并调用 `gate.Recover`（epoch 缺失时先从 ClickHouse tombstone 重建 deny key、再发布 epoch），检查失败期间 `/readyz` 返回 503 并带 `reason`；epoch 丢失无需重启即可自动重建，重建窗口内所有 admission 仍 fail-closed。新增 `dmp/scripts/gate-drills.sh` 覆盖 5 组演练：epoch 丢失在线重建、ClickHouse 停机（拒绝解析且 deny 保留）、恢复后回升、节点重启后撤回保持、在途 lease 统计与立即阻断。 |
 | I4-06 | 未开始 | 保留策略、物理删除与备份到期自动化 | 期限合规；单 snapshot 删除不误删共享分区数据 |
 | I4-07 | 未开始 | DMP 独立集成、负载与物理删除 POC 复测 | D-10 结论 |
 | I4-08 | 未开始 | DMP 管理台（Provider/Segment/Snapshot/撤回状态） | 导入校验状态清晰；发布需显式确认；UI 不接收原始身份/token |
@@ -51,6 +51,8 @@ I4-02 实测：无 token 401；创建 job 201；`alice@example.com` 被 400 拒�
 I4-03 实测：verified 未发布快照的固定 ID 查询 503；publish 200 且 job 转 `published`；当前解析返回该快照与 segment；已发布快照固定 ID 仍可解析；未知主体返回空数组；`max_segments=101` 400；SSP 形状请求（含 `tenant_id`/`consent_context`）200 且响应不含 token。
 
 I4-04 实测：revoke 202 `completed`（`drained_lookup_count` 反映在途数，注入 1 个 live lease 时报告 1，lease 过期后归零）；撤回后同一主体解析返回空、其他主体不受影响；Valkey 停机 → 503 `policy_state_unavailable`；epoch 丢失 → 503，重启后从 tombstone 重建，已撤回主体仍空、未撤回主体正常；未认证 revoke 401，原始身份 token 400。gate 单测（真实 Valkey）覆盖 admit/deny/finalize/重建/epoch 丢失。
+
+I4-05 演练（`./dmp/scripts/gate-drills.sh`，全部 PASS）：epoch 丢失瞬间解析 503 且无受众泄漏、2s 内 readiness 自动恢复、重启后已撤回主体仍为空；ClickHouse 停机时 readiness 503、解析 503、Valkey deny key 保留，恢复后重新 ready 且撤回仍生效；DMP 节点重启后撤回保持；注入在途 lease 后撤回报告 1 并立即阻断。修复演练暴露的缺陷：`/internal/v1/audiences:resolve` 曾误用 15ms bid-path 超时导致 ClickHouse/Valkey 偶发超时，现内部 API 全部使用 10s 管理预算。
 
 运行中服务验收（`/admin/v1`，沙箱租户）：
 - 认证：无 token / 错误 token → `401 unauthenticated`。

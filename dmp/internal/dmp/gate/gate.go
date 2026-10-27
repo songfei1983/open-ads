@@ -108,6 +108,24 @@ func (g *Gate) denyKey(ns, token string) string {
 	return "dmp:" + g.tenant + ":gate:deny:" + ns + ":" + token
 }
 
+// Recover makes the gate ready, rebuilding the deny set from persisted
+// tombstones when the epoch is missing. It is safe to call on every readiness
+// tick: with a healthy keyspace it only reads the epoch.
+func (g *Gate) Recover(ctx context.Context, load func(context.Context) ([]DenyEntry, error)) (uint64, error) {
+	epoch, err := g.Epoch(ctx)
+	if err == nil {
+		return epoch, nil
+	}
+	if !errors.Is(err, ErrNotReady) {
+		return 0, err
+	}
+	entries, loadErr := load(ctx)
+	if loadErr != nil {
+		return 0, fmt.Errorf("%w: load tombstones for rebuild: %v", ErrUnavailable, loadErr)
+	}
+	return g.EnsureEpoch(ctx, entries)
+}
+
 // DenyEntry is one persisted revocation fact used to rebuild the gate.
 type DenyEntry struct {
 	Namespace  string
