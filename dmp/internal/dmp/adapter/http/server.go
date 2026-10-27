@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/authn"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/config"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/control"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/domain"
@@ -153,6 +154,16 @@ func (s *Server) RefreshReadiness(ctx context.Context) error {
 	return nil
 }
 
+// sandboxAuthenticator binds each shared token to this data plane's tenant with
+// explicit scopes. D-01 swaps it for mTLS workload identities.
+func sandboxAuthenticator(cfg *config.Config) authn.Authenticator {
+	all := []authn.Scope{authn.ScopeSnapshotsRead, authn.ScopeSnapshotsWrite, authn.ScopeIdentityRevoke, authn.ScopeRetentionRun}
+	return authn.NewBearerAuth(
+		authn.Credential{Token: cfg.InternalToken, Caller: "trusted-adapter", Tenant: cfg.AdminTenantID, Scopes: all},
+		authn.Credential{Token: cfg.AdminToken, Caller: "operator", Tenant: cfg.AdminTenantID, Scopes: all},
+	)
+}
+
 // Handler returns the root http.Handler for testing.
 func (s *Server) Handler() http.Handler {
 	return s.server.Handler
@@ -164,13 +175,15 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /metrics", s.metrics.Handler)
 
 	internalHandler := internalapi.NewHandler(internalapi.HandlerOptions{
-		Token:       s.cfg.InternalToken,
-		AdminToken:  s.cfg.AdminToken,
-		Snapshots:   s.snapshots,
-		Gate:        s.gate,
-		Revocations: s.revocations,
-		Retention:   s.retention,
-		Logger:      s.logger,
+		Authenticator: sandboxAuthenticator(s.cfg),
+		Token:         s.cfg.InternalToken,
+		AdminToken:    s.cfg.AdminToken,
+		TenantID:      s.cfg.AdminTenantID,
+		Snapshots:     s.snapshots,
+		Gate:          s.gate,
+		Revocations:   s.revocations,
+		Retention:     s.retention,
+		Logger:        s.logger,
 	})
 	mux.Handle("/internal/v1/", internalHandler)
 	mux.Handle("/internal/v1", internalHandler)

@@ -124,12 +124,12 @@ func newGatedServer(t *testing.T) (*fakeSnapshots, *fakeGate, *fakeRevocations, 
 	denyGate := newFakeGate()
 	revocations := newFakeRevocations()
 	handler := internalapi.NewHandler(internalapi.HandlerOptions{
-		Token: testToken, Snapshots: snapshots, Gate: denyGate, Revocations: revocations,
+		Token: testToken, TenantID: testTenantID, Snapshots: snapshots, Gate: denyGate, Revocations: revocations,
 	})
 	server := newServerFromHandler(t, handler)
 	resolve := func(token string) (int, map[string]any) {
 		return call(t, server, testToken, http.MethodPost, "/internal/v1/audiences:resolve",
-			`{"namespace":"publisher-account-v1","provider_id":"dmp-provider-01","subject_token":"`+token+`"}`)
+			`{"tenant_id":"`+testTenantID+`","namespace":"publisher-account-v1","provider_id":"dmp-provider-01","subject_token":"`+token+`"}`)
 	}
 	return snapshots, denyGate, revocations, server, resolve
 }

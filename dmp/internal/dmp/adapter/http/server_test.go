@@ -164,6 +164,7 @@ func TestInternalAPIHasItsOwnBudget(t *testing.T) {
 		Port:           8082,
 		RequestTimeout: time.Millisecond,
 		InternalToken:  "dmp-internal-token-0123456789abcdef",
+		AdminTenantID:  "00000000-0000-0000-0000-000000000001",
 		AdminActor:     "sandbox-operator",
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -189,7 +190,7 @@ func TestInternalAPIHasItsOwnBudget(t *testing.T) {
 	// Audience resolution also reads ClickHouse, so it must not inherit the
 	// bid-path deadline either.
 	resolveRequest, err := http.NewRequest(http.MethodPost, ts.URL+"/internal/v1/audiences:resolve",
-		strings.NewReader(`{"namespace":"publisher-account-v1","provider_id":"dmp-provider-01","subject_token":"`+strings.Repeat("ab", 32)+`"}`))
+		strings.NewReader(`{"tenant_id":"00000000-0000-0000-0000-000000000001","namespace":"publisher-account-v1","provider_id":"dmp-provider-01","subject_token":"`+strings.Repeat("ab", 32)+`"}`))
 	if err != nil {
 		t.Fatal(err)
 	}

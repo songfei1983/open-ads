@@ -11,6 +11,7 @@ set -uo pipefail
 COMPOSE=(docker compose -f deployments/docker-compose.yml)
 DMP=http://127.0.0.1:8082
 INTERNAL_TOKEN=dmp-internal-token-0123456789abcdef
+# Drills read gate keys directly, so the tenant must be the real identifier.
 TENANT=00000000-0000-0000-0000-000000000001
 NAMESPACE=publisher-account-v1
 PROVIDER=dmp-provider-01
@@ -26,7 +27,7 @@ ready_code() { curl -s -o /dev/null -w '%{http_code}' "$DMP/readyz"; }
 resolve_status() {
   curl -s -o /tmp/drill_resolve.json -w '%{http_code}' -X POST "$DMP/internal/v1/audiences:resolve" \
     -H 'Content-Type: application/json' \
-    -d "{\"namespace\":\"$NAMESPACE\",\"provider_id\":\"$PROVIDER\",\"subject_token\":\"$1\"}"
+    -d "{\"tenant_id\":\"$TENANT\",\"namespace\":\"$NAMESPACE\",\"provider_id\":\"$PROVIDER\",\"subject_token\":\"$1\"}"
 }
 
 resolve_segments() {

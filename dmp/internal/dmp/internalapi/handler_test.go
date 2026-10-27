@@ -13,12 +13,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/authn"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/internalapi"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/observability"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/snapshot"
 )
 
 const testToken = "dmp-internal-token-0123456789abcdef"
+
+// testTenantID mirrors the single tenant the sandbox data plane serves.
+const testTenantID = "00000000-0000-0000-0000-000000000001"
 
 // fakeSnapshots models the import lifecycle closely enough to assert the HTTP
 // contract: raw identity tokens never reach storage, and verification decides
@@ -240,7 +244,7 @@ func (f *fakeSnapshots) Resolve(_ context.Context, in snapshot.ResolveInput) (sn
 
 func newServer(t *testing.T, token string, snapshots internalapi.SnapshotService) *httptest.Server {
 	t.Helper()
-	return newServerFromHandler(t, internalapi.NewHandler(internalapi.HandlerOptions{Token: token, Snapshots: snapshots}))
+	return newServerFromHandler(t, internalapi.NewHandler(internalapi.HandlerOptions{Token: token, TenantID: testTenantID, Snapshots: snapshots}))
 }
 
 func newServerFromHandler(t *testing.T, handler http.Handler) *httptest.Server {
@@ -448,7 +452,7 @@ func TestPublishRequiresVerificationAndPinsTheSnapshot(t *testing.T) {
 	}
 
 	status, payload = call(t, ts, "", http.MethodPost, "/internal/v1/audiences:resolve",
-		`{"namespace":"publisher-account-v1","provider_id":"dmp-provider-01","subject_token":"`+token+`","max_segments":1}`)
+		`{"tenant_id":"`+testTenantID+`","namespace":"publisher-account-v1","provider_id":"dmp-provider-01","subject_token":"`+token+`","max_segments":1}`)
 	if status != http.StatusOK {
 		t.Fatalf("resolve must work without the adapter token (sandbox profile): %d %v", status, payload)
 	}
@@ -479,13 +483,13 @@ func TestResolveIgnoresUnpublishedSnapshots(t *testing.T) {
 	call(t, ts, testToken, http.MethodPost, "/internal/v1/snapshots/"+id+"/verify", "")
 
 	status, payload = call(t, ts, testToken, http.MethodPost, "/internal/v1/audiences:resolve",
-		`{"namespace":"publisher-account-v1","provider_id":"dmp-provider-01","subject_token":"`+token+`"}`)
+		`{"tenant_id":"`+testTenantID+`","namespace":"publisher-account-v1","provider_id":"dmp-provider-01","subject_token":"`+token+`"}`)
 	if status != http.StatusServiceUnavailable || payload["code"] != "no_published_snapshot" {
 		t.Fatalf("verified but unpublished snapshot must not resolve, got %d %v", status, payload)
 	}
 
 	status, payload = call(t, ts, testToken, http.MethodPost, "/internal/v1/audiences:resolve",
-		`{"namespace":"publisher-account-v1","provider_id":"dmp-provider-01","subject_token":"`+token+`","snapshot_id":"`+id+`"}`)
+		`{"tenant_id":"`+testTenantID+`","namespace":"publisher-account-v1","provider_id":"dmp-provider-01","subject_token":"`+token+`","snapshot_id":"`+id+`"}`)
 	if status != http.StatusServiceUnavailable || payload["code"] != "no_published_snapshot" {
 		t.Fatalf("pinned lookup of an unpublished snapshot must not resolve, got %d %v", status, payload)
 	}
@@ -494,8 +498,80 @@ func TestResolveIgnoresUnpublishedSnapshots(t *testing.T) {
 func TestResolveRejectsRawIdentity(t *testing.T) {
 	ts := newServer(t, testToken, newFakeSnapshots())
 	status, payload := call(t, ts, "", http.MethodPost, "/internal/v1/audiences:resolve",
-		`{"namespace":"publisher-account-v1","provider_id":"dmp-provider-01","subject_token":"alice@example.com"}`)
+		`{"tenant_id":"`+testTenantID+`","namespace":"publisher-account-v1","provider_id":"dmp-provider-01","subject_token":"alice@example.com"}`)
 	if status != http.StatusBadRequest || payload["code"] != "invalid_request" {
 		t.Fatalf("raw identity must be rejected, got %d %v", status, payload)
+	}
+}
+
+func TestResolveRequiresABoundTenant(t *testing.T) {
+	ts := newServer(t, testToken, newFakeSnapshots())
+	token := strings.Repeat("ab", 32)
+
+	// A caller that omits the tenant cannot receive an audience.
+	status, payload := call(t, ts, "", http.MethodPost, "/internal/v1/audiences:resolve",
+		`{"namespace":"publisher-account-v1","provider_id":"dmp-provider-01","subject_token":"`+token+`"}`)
+	if status != http.StatusBadRequest || payload["code"] != "tenant_required" {
+		t.Fatalf("missing tenant_id must be 400, got %d %v", status, payload)
+	}
+
+	// Another tenant's identifier is refused before any storage lookup.
+	status, payload = call(t, ts, "", http.MethodPost, "/internal/v1/audiences:resolve",
+		`{"tenant_id":"00000000-0000-0000-0000-000000000099","namespace":"publisher-account-v1","provider_id":"dmp-provider-01","subject_token":"`+token+`"}`)
+	if status != http.StatusForbidden || payload["code"] != "tenant_mismatch" {
+		t.Fatalf("cross-tenant resolve must be 403, got %d %v", status, payload)
+	}
+
+	// The sandbox SSP alias still resolves inside the bound tenant.
+	status, payload = call(t, ts, "", http.MethodPost, "/internal/v1/audiences:resolve",
+		`{"tenant_id":"tenant-default","namespace":"publisher-account-v1","provider_id":"dmp-provider-01","subject_token":"`+token+`"}`)
+	if status != http.StatusServiceUnavailable || payload["code"] != "no_published_snapshot" {
+		t.Fatalf("legacy tenant alias must reach the resolver, got %d %v", status, payload)
+	}
+}
+
+func TestInternalAPIAuthorisesScopes(t *testing.T) {
+	readOnly := internalapi.NewHandler(internalapi.HandlerOptions{
+		TenantID: testTenantID,
+		Authenticator: authn.NewBearerAuth(authn.Credential{
+			Token: testToken, Caller: "auditor", Tenant: testTenantID,
+			Scopes: []authn.Scope{authn.ScopeSnapshotsRead},
+		}),
+		Snapshots: newFakeSnapshots(),
+	})
+	ts := newServerFromHandler(t, readOnly)
+
+	request, err := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/snapshots", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	response, err := ts.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("read scope must list snapshots, got %d", response.StatusCode)
+	}
+	status, payload := call(t, ts, testToken, http.MethodPost, "/internal/v1/snapshots",
+		`{"provider_id":"dmp-provider-01","namespace":"publisher-account-v1","schema_version":1,"source_version":"feed-scope","expected_rows":1}`)
+	if status != http.StatusForbidden || payload["code"] != "insufficient_scope" {
+		t.Fatalf("write without the write scope must be 403, got %d %v", status, payload)
+	}
+
+	// A credential bound to another tenant never reaches the routes.
+	foreign := internalapi.NewHandler(internalapi.HandlerOptions{
+		TenantID: testTenantID,
+		Authenticator: authn.NewBearerAuth(authn.Credential{
+			Token: testToken, Caller: "foreign", Tenant: "00000000-0000-0000-0000-000000000099",
+			Scopes: []authn.Scope{authn.ScopeSnapshotsRead},
+		}),
+		Snapshots: newFakeSnapshots(),
+	})
+	foreignTS := newServerFromHandler(t, foreign)
+	status, payload = call(t, foreignTS, testToken, http.MethodGet, "/internal/v1/snapshots", "")
+	if status != http.StatusForbidden || payload["code"] != "tenant_mismatch" {
+		t.Fatalf("cross-tenant credential must be 403, got %d %v", status, payload)
 	}
 }

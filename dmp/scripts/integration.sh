@@ -11,6 +11,8 @@ INTERNAL_TOKEN=dmp-internal-token-0123456789abcdef
 ADMIN_TOKEN=dmp-admin-token-0123456789abcdef
 NAMESPACE=publisher-account-v1
 PROVIDER=dmp-provider-01
+# Resolution must name its tenant; the sandbox alias maps to the DMP tenant.
+TENANT=${DMP_TENANT_ID:-tenant-default}
 FAILURES=0
 
 pass() { echo "  PASS: $1"; }
@@ -64,13 +66,22 @@ code=$(internal POST "/snapshots/$SNAPSHOT/publish")
 [ "$code" = "200" ] && [ "$(json '["status"]')" = "published" ] && pass "snapshot published" || fail "publish: $code $(cat /tmp/integration.json)"
 
 code=$(curl -s -o /tmp/integration.json -w '%{http_code}' -X POST "$DMP/internal/v1/audiences:resolve" \
-  -H 'Content-Type: application/json' -d "{\"namespace\":\"$NAMESPACE\",\"provider_id\":\"$PROVIDER\",\"subject_token\":\"$TOKEN_A\"}")
+  -H 'Content-Type: application/json' -d "{\"tenant_id\":\"$TENANT\",\"namespace\":\"$NAMESPACE\",\"provider_id\":\"$PROVIDER\",\"subject_token\":\"$TOKEN_A\"}")
 [ "$code" = "200" ] && [ "$(segments_count)" = "1" ] && pass "audience resolved from the published snapshot" || fail "resolve: $code $(cat /tmp/integration.json)"
 python3 - "$TOKEN_A" <<'PY' && pass "resolve response carries no token" || fail "resolve response echoed the token"
 import json, sys
 body = open("/tmp/integration.json").read()
 sys.exit(1 if sys.argv[1] in body else 0)
 PY
+
+echo "== tenant binding"
+code=$(curl -s -o /tmp/integration.json -w '%{http_code}' -X POST "$DMP/internal/v1/audiences:resolve" \
+  -H 'Content-Type: application/json' -d "{\"namespace\":\"$NAMESPACE\",\"provider_id\":\"$PROVIDER\",\"subject_token\":\"$TOKEN_B\"}")
+[ "$code" = "400" ] && [ "$(json '["code"]')" = "tenant_required" ] && pass "resolve without a tenant is refused" || fail "missing tenant: $code $(cat /tmp/integration.json)"
+
+code=$(curl -s -o /tmp/integration.json -w '%{http_code}' -X POST "$DMP/internal/v1/audiences:resolve" \
+  -H 'Content-Type: application/json' -d "{\"tenant_id\":\"tenant-other\",\"namespace\":\"$NAMESPACE\",\"provider_id\":\"$PROVIDER\",\"subject_token\":\"$TOKEN_B\"}")
+[ "$code" = "403" ] && [ "$(json '["code"]')" = "tenant_mismatch" ] && pass "cross-tenant resolve is refused" || fail "cross tenant: $code $(cat /tmp/integration.json)"
 
 echo "== revocation"
 code=$(internal POST /identity:revoke "{\"namespace\":\"$NAMESPACE\",\"subject_tokens\":[{\"token\":\"$TOKEN_A\",\"key_version\":1}]}")
@@ -80,7 +91,7 @@ status=$(json '["status"]')
 [ "$status" = "completed" ] || [ "$status" = "pending" ] && pass "revocation status reported ($status)" || fail "unexpected revocation status: $status"
 
 code=$(curl -s -o /tmp/integration.json -w '%{http_code}' -X POST "$DMP/internal/v1/audiences:resolve" \
-  -H 'Content-Type: application/json' -d "{\"namespace\":\"$NAMESPACE\",\"provider_id\":\"$PROVIDER\",\"subject_token\":\"$TOKEN_A\"}")
+  -H 'Content-Type: application/json' -d "{\"tenant_id\":\"$TENANT\",\"namespace\":\"$NAMESPACE\",\"provider_id\":\"$PROVIDER\",\"subject_token\":\"$TOKEN_A\"}")
 [ "$code" = "200" ] && [ "$(segments_count)" = "0" ] && pass "revoked subject no longer resolves" || fail "revoked subject still resolved: $code $(cat /tmp/integration.json)"
 
 code=$(internal GET "/identity-revocations/$REVOCATION")

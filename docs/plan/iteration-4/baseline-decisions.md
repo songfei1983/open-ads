@@ -78,7 +78,7 @@ I4-08 实测（浏览器）：控制台各页无 console/page error；代理白�
 3. D-10 未关闭：精确 subject 查询与物理删除的拓扑级目标仍待 I4-07 POC 复测。
 4. 管理面认证仍是共享 bearer token（sandbox）。生产态需按 D-01 切换为 mTLS workload identity + 按调用方授权。
 5. I4-02 起必须在写入前拒绝原始身份；当前控制面只接受定义元数据，不接触 subject token。
-6. sandbox 阶段单租户：`audiences:resolve` 不使用请求中的 `tenant_id`，解析固定落在 DMP 配置租户；SSP 调用不带 workload 身份。D-01 关闭前必须换成 mTLS 调用方授权与按调用方租户绑定。
+6. sandbox 阶段单租户：`audiences:resolve` 现在强制 `tenant_id` 且必须是数据面绑定租户（`tenant-default` 为过渡别名），但调用方身份仍未认证；D-01 关闭前必须换成 mTLS 调用方授权，让租户来自凭据而非请求体。
 
 ## 7. 风险收敛提案与进度
 
@@ -93,6 +93,8 @@ I4-08 实测（浏览器）：控制台各页无 console/page error；代理白�
 | R5 | 抽出共享 `identity.TokenPolicy` + 负例 fixture 集 + 疑似原始身份指标 | 待办 |
 | R3 | 负载/POC 参数化并归档报告，D-01 后按生产拓扑复测 | 待办 |
 | R10 | DMP OpenAPI 3.1 契约工件 + import/revoke 幂等键 | 待办 |
+
+R4+R6 验收（2026-10-27）：新增 `internal/dmp/authn`：`Principal{Caller,Tenant,Scopes}`、`Authenticator`、常量时间 `BearerAuth`（空 token 环境变量不会成为凭据）、预留 `MTLS`（按已校验链的 CN 映射身份）。内部 API 每个路由显式要求 scope（`snapshots:read|write`、`identity:revoke`、`retention:run`），缺 scope 返回 `403 insufficient_scope`，凭据与数据面租户不符返回 `403 tenant_mismatch`；resolve 必须携带 `tenant_id`（缺失 `400 tenant_required`、跨租户 `403 tenant_mismatch`），过渡期 `tenant-default` 解析到数据面租户，未绑定租户的数据面直接 `503 internal_api_unconfigured`。live 验证：缺 tenant 400 / 跨租户 403 / 别名 200，integration.sh 与 gate-drills.sh 全 PASS，POC 200 请求 0 错误。
 
 R8 验收（2026-10-27）：worker 通过 `retention.Locker` 在 sweep 前 `SET NX PX` 取租约（`dmp:<tenant>:retention:lease`，10 分钟），未取到返回 `ErrLeaderHeld` → `409 retention_in_progress`；释放用 compare-and-del Lua，过期旧持有者不会误删新租约；手工占住租约时 live sweep 返回 409 且租约值保持不变，释放后 200。单测覆盖串行化与陈旧释放，Valkey 集成测试覆盖互斥/陈旧释放/复用。
 

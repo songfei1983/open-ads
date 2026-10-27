@@ -5,10 +5,9 @@ package internalapi
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/authn"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/gate"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/observability"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/retention"
@@ -61,8 +61,14 @@ type RetentionService interface {
 
 // HandlerOptions carries the trusted-adapter dependency set.
 type HandlerOptions struct {
-	Token       string
-	AdminToken  string
+	// Authenticator identifies trusted callers. Token/AdminToken build the
+	// default sandbox credential set when it is nil.
+	Authenticator authn.Authenticator
+	Token         string
+	AdminToken    string
+	// TenantID is the single tenant this data plane serves; every authenticated
+	// principal must match it and resolve requests are bound to it.
+	TenantID    string
 	Snapshots   SnapshotService
 	Gate        DenyGate
 	Revocations Revocations
@@ -78,19 +84,35 @@ func NewHandler(opts HandlerOptions) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	h := &handler{token: opts.Token, adminToken: opts.AdminToken, snapshots: opts.Snapshots, gate: opts.Gate, revocations: opts.Revocations,
-		retention: opts.Retention, logger: logger}
+	authenticator := opts.Authenticator
+	if authenticator == nil {
+		authenticator = sandboxAuthenticator(opts.Token, opts.AdminToken)
+	}
+	h := &handler{authenticator: authenticator, tenantID: opts.TenantID, snapshots: opts.Snapshots, gate: opts.Gate,
+		revocations: opts.Revocations, retention: opts.Retention, logger: logger,
+		configured: opts.Authenticator != nil || opts.Token != "" || opts.AdminToken != ""}
 	return h.authenticate(h)
 }
 
+// sandboxAuthenticator keeps the shared-token profile working while scopes stay
+// explicit; D-01 replaces it with mTLS workload identities.
+func sandboxAuthenticator(token, adminToken string) authn.Authenticator {
+	all := []authn.Scope{authn.ScopeSnapshotsRead, authn.ScopeSnapshotsWrite, authn.ScopeIdentityRevoke, authn.ScopeRetentionRun}
+	return authn.NewBearerAuth(
+		authn.Credential{Token: token, Caller: "trusted-adapter", Scopes: all},
+		authn.Credential{Token: adminToken, Caller: "operator", Scopes: all},
+	)
+}
+
 type handler struct {
-	token       string
-	adminToken  string
-	snapshots   SnapshotService
-	gate        DenyGate
-	revocations Revocations
-	retention   RetentionService
-	logger      *slog.Logger
+	authenticator authn.Authenticator
+	tenantID      string
+	configured    bool
+	snapshots     SnapshotService
+	gate          DenyGate
+	revocations   Revocations
+	retention     RetentionService
+	logger        *slog.Logger
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -100,16 +122,22 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case path == "snapshots":
 		switch r.Method {
 		case http.MethodGet:
-			h.listSnapshots(w, r)
+			if h.requireScope(w, r, authn.ScopeSnapshotsRead) {
+				h.listSnapshots(w, r)
+			}
 		case http.MethodPost:
-			h.createSnapshot(w, r)
+			if h.requireScope(w, r, authn.ScopeSnapshotsWrite) {
+				h.createSnapshot(w, r)
+			}
 		default:
 			methodNotAllowed(w, r, http.MethodGet, http.MethodPost)
 		}
 	case len(parts) == 2 && parts[0] == "snapshots":
 		switch {
 		case r.Method == http.MethodGet:
-			h.getSnapshot(w, r, parts[1])
+			if h.requireScope(w, r, authn.ScopeSnapshotsRead) {
+				h.getSnapshot(w, r, parts[1])
+			}
 		default:
 			methodNotAllowed(w, r, http.MethodGet)
 		}
@@ -118,31 +146,41 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			methodNotAllowed(w, r, http.MethodPost)
 			return
 		}
-		h.appendRows(w, r, parts[1])
+		if h.requireScope(w, r, authn.ScopeSnapshotsWrite) {
+			h.appendRows(w, r, parts[1])
+		}
 	case len(parts) == 3 && parts[0] == "snapshots" && parts[2] == "verify":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, r, http.MethodPost)
 			return
 		}
-		h.verifySnapshot(w, r, parts[1])
+		if h.requireScope(w, r, authn.ScopeSnapshotsWrite) {
+			h.verifySnapshot(w, r, parts[1])
+		}
 	case len(parts) == 3 && parts[0] == "snapshots" && parts[2] == "delete":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, r, http.MethodPost)
 			return
 		}
-		h.deleteSnapshot(w, r, parts[1])
+		if h.requireScope(w, r, authn.ScopeSnapshotsWrite) {
+			h.deleteSnapshot(w, r, parts[1])
+		}
 	case len(parts) == 3 && parts[0] == "snapshots" && parts[2] == "publish":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, r, http.MethodPost)
 			return
 		}
-		h.publishSnapshot(w, r, parts[1])
+		if h.requireScope(w, r, authn.ScopeSnapshotsWrite) {
+			h.publishSnapshot(w, r, parts[1])
+		}
 	case path == "publications":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, r, http.MethodGet)
 			return
 		}
-		h.listPublications(w, r)
+		if h.requireScope(w, r, authn.ScopeSnapshotsRead) {
+			h.listPublications(w, r)
+		}
 	case path == "audiences:resolve":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, r, http.MethodPost)
@@ -154,31 +192,41 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			methodNotAllowed(w, r, http.MethodPost)
 			return
 		}
-		h.revokeIdentity(w, r)
+		if h.requireScope(w, r, authn.ScopeIdentityRevoke) {
+			h.revokeIdentity(w, r)
+		}
 	case len(parts) == 2 && parts[0] == "identity-revocations":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, r, http.MethodGet)
 			return
 		}
-		h.getRevocation(w, r, parts[1])
+		if h.requireScope(w, r, authn.ScopeSnapshotsRead) {
+			h.getRevocation(w, r, parts[1])
+		}
 	case path == "identity-revocations":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, r, http.MethodGet)
 			return
 		}
-		h.listRevocations(w, r)
+		if h.requireScope(w, r, authn.ScopeSnapshotsRead) {
+			h.listRevocations(w, r)
+		}
 	case path == "retention:run":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, r, http.MethodPost)
 			return
 		}
-		h.runRetention(w, r)
+		if h.requireScope(w, r, authn.ScopeRetentionRun) {
+			h.runRetention(w, r)
+		}
 	case path == "retention:policy":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, r, http.MethodGet)
 			return
 		}
-		h.retentionPolicy(w, r)
+		if h.requireScope(w, r, authn.ScopeSnapshotsRead) {
+			h.retentionPolicy(w, r)
+		}
 	default:
 		notFound(w, r)
 	}
@@ -187,38 +235,49 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *handler) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID := observability.RequestIDFromContext(r.Context())
-		if h.snapshots == nil || (h.token == "" && !isResolvePath(r.URL.Path)) {
+		if h.snapshots == nil || !h.configured {
 			writeError(w, requestID, http.StatusServiceUnavailable, "internal_api_unconfigured", "DMP internal API is not configured")
 			return
 		}
 		if isResolvePath(r.URL.Path) {
-			// Sandbox profile: the resolve path is called by SSP without a
-			// workload identity. D-01 replaces this with mTLS authorization.
+			// Sandbox profile: SSP calls resolve without a workload identity, so
+			// the request is bound to this data plane's tenant instead. D-01
+			// replaces this with mTLS caller authorization.
 			next.ServeHTTP(w, r)
 			return
 		}
-		authorization := r.Header.Get("Authorization")
-		if !strings.HasPrefix(authorization, "Bearer ") {
+		principal, err := h.authenticatePrincipal(r)
+		if err != nil {
 			writeError(w, requestID, http.StatusUnauthorized, "unauthenticated", "valid bearer token required")
 			return
 		}
-		provided := sha256.Sum256([]byte(strings.TrimPrefix(authorization, "Bearer ")))
-		expected := sha256.Sum256([]byte(h.token))
-		if subtle.ConstantTimeCompare(provided[:], expected[:]) != 1 {
-			// The sandbox operator token may also drive import/publish/revoke so
-			// the console never needs the trusted-adapter credential.
-			if h.adminToken == "" {
-				writeError(w, requestID, http.StatusUnauthorized, "unauthenticated", "valid bearer token required")
-				return
-			}
-			adminExpected := sha256.Sum256([]byte(h.adminToken))
-			if subtle.ConstantTimeCompare(provided[:], adminExpected[:]) != 1 {
-				writeError(w, requestID, http.StatusUnauthorized, "unauthenticated", "valid bearer token required")
-				return
-			}
+		if h.tenantID != "" && principal.Tenant != "" && principal.Tenant != h.tenantID {
+			writeError(w, requestID, http.StatusForbidden, "tenant_mismatch", "credential is not bound to this tenant")
+			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(authn.WithPrincipal(r.Context(), principal)))
 	})
+}
+
+func (h *handler) authenticatePrincipal(r *http.Request) (authn.Principal, error) {
+	if h.authenticator == nil {
+		return authn.Principal{}, fmt.Errorf("%w: DMP internal API is not configured", authn.ErrUnauthenticated)
+	}
+	return h.authenticator.Authenticate(r)
+}
+
+// requireScope enforces the route scope for authenticated callers.
+func (h *handler) requireScope(w http.ResponseWriter, r *http.Request, scope authn.Scope) bool {
+	principal, ok := authn.PrincipalFromContext(r.Context())
+	if !ok {
+		return true
+	}
+	if err := principal.Authorize(scope); err != nil {
+		writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusForbidden, "insufficient_scope",
+			fmt.Sprintf("caller %q lacks scope %s", principal.Caller, scope))
+		return false
+	}
+	return true
 }
 
 func isResolvePath(path string) bool {
@@ -340,6 +399,9 @@ func (h *handler) resolveAudience(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
+	if !h.bindResolveTenant(w, r, &input) {
+		return
+	}
 
 	leaseID, err := revocation.NewID()
 	if err != nil {
@@ -386,6 +448,33 @@ func (h *handler) resolveAudience(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+// legacyTenantAlias is the symbolic tenant the sandbox SSP sends. It resolves to
+// this data plane's tenant until D-01 binds tenants to workload identities.
+const legacyTenantAlias = "tenant-default"
+
+// bindResolveTenant requires an explicit tenant and refuses cross-tenant
+// lookups, so a caller can never read another tenant's audience.
+func (h *handler) bindResolveTenant(w http.ResponseWriter, r *http.Request, input *snapshot.ResolveInput) bool {
+	if h.tenantID == "" {
+		writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusServiceUnavailable, "internal_api_unconfigured", "no tenant is bound to this data plane")
+		return false
+	}
+	tenant := strings.TrimSpace(input.TenantID)
+	if tenant == "" {
+		writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusBadRequest, "tenant_required", "tenant_id is required for audience resolution")
+		return false
+	}
+	if tenant == legacyTenantAlias {
+		tenant = h.tenantID
+	}
+	if tenant != h.tenantID {
+		writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusForbidden, "tenant_mismatch", "tenant_id does not match the tenant bound to this data plane")
+		return false
+	}
+	input.TenantID = tenant
+	return true
 }
 
 func (h *handler) gateUnavailable(w http.ResponseWriter, r *http.Request, err error) {

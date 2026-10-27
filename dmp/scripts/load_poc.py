@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import http.client
 import json
+import os
 import random
 import statistics
 import sys
@@ -26,6 +27,8 @@ BASE = "http://127.0.0.1:8082/internal/v1"
 TOKEN = "dmp-internal-token-0123456789abcdef"
 NAMESPACE = "publisher-account-v1"
 PROVIDER = "dmp-provider-01"
+# The sandbox tenant alias; resolution must always name a tenant.
+TENANT = os.environ.get("DMP_TENANT_ID", "tenant-default")
 SEGMENT = "seg-tech-enthusiasts"
 RESOLVE_P95_TARGET_MS = 50.0
 DELETE_TARGET_SECONDS = 60.0
@@ -95,7 +98,7 @@ def resolve_latencies(tokens: list[str], requests: int, concurrency: int) -> tup
         local_status: list[int] = []
         for _ in range(count):
             token = random.choice(tokens)
-            payload = json.dumps({"namespace": NAMESPACE, "provider_id": PROVIDER, "subject_token": token})
+            payload = json.dumps({"tenant_id": TENANT, "namespace": NAMESPACE, "provider_id": PROVIDER, "subject_token": token})
             started = time.perf_counter()
             try:
                 connection.request("POST", "/internal/v1/audiences:resolve", payload,
@@ -158,7 +161,7 @@ def main() -> int:
     print(f"  delete {args.rows} rows: status={status} rows={deleted.get('deleted_rows')} in {delete_seconds:.2f}s")
 
     status, resolved = call("POST", "/audiences:resolve", {
-        "namespace": NAMESPACE, "provider_id": PROVIDER, "subject_token": token_for(0)})
+        "tenant_id": TENANT, "namespace": NAMESPACE, "provider_id": PROVIDER, "subject_token": token_for(0)})
     served = len(resolved.get("segments") or [])
     print(f"  serving snapshot still resolves after the deletion: status={status} segments={served}")
 
