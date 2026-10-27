@@ -149,6 +149,15 @@ services:
       - clickhouse
     environment:
       DMP_PORT: "8082"
+      CLICKHOUSE_ADDR: "clickhouse:9000"
+      CLICKHOUSE_USER: "dmp_user"
+      CLICKHOUSE_PASSWORD: "dmp_clickhouse_password"
+      CLICKHOUSE_DATABASE: "dmp"
+      # The management API is tenant scoped: the token is bound to exactly one
+      # tenant, so a browser or operator credential can never cross tenants.
+      DMP_ADMIN_TENANT_ID: "00000000-0000-0000-0000-000000000001"
+      DMP_ADMIN_TOKEN: "dmp-admin-token-0123456789abcdef"
+      DMP_ADMIN_ACTOR: "sandbox-dmp-operator"
     ports:
       - "127.0.0.1:8082:8082"
     volumes:

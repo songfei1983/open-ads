@@ -40,6 +40,8 @@ migration-check:
 	@test -s dsp/migrations/000001_init_dsp_schema.down.sql
 	@test -s dmp/migrations/000001_init_dmp_schema.up.sql
 	@test -s dmp/migrations/000001_init_dmp_schema.down.sql
+	@test -s dmp/migrations/000002_dmp_control_plane.up.sql
+	@test -s dmp/migrations/000002_dmp_control_plane.down.sql
 	@echo "==> Migration files and compose wiring are valid"
 
 run-ssp:

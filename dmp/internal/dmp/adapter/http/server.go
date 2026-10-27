@@ -14,9 +14,14 @@ import (
 	"time"
 
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/config"
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/control"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/domain"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/observability"
 )
+
+// adminRequestTimeout bounds management API requests, which write to ClickHouse
+// and therefore cannot use the bid-path deadline.
+const adminRequestTimeout = 10 * time.Second
 
 // Server wraps the standard library http.Server for DMP.
 type Server struct {
@@ -25,14 +30,27 @@ type Server struct {
 	cfg     *config.Config
 	metrics *observability.Metrics
 	isReady atomic.Bool
+	control control.Store
+}
+
+// Option customizes the server at construction time.
+type Option func(*Server)
+
+// WithControlStore attaches the tenant-scoped definition store that backs the
+// management API. Without it the admin surface answers 503.
+func WithControlStore(store control.Store) Option {
+	return func(s *Server) { s.control = store }
 }
 
 // NewServer initializes the HTTP server with router, middlewares, and probes.
-func NewServer(cfg *config.Config, logger *slog.Logger) *Server {
+func NewServer(cfg *config.Config, logger *slog.Logger, opts ...Option) *Server {
 	s := &Server{
 		logger:  logger,
 		cfg:     cfg,
 		metrics: &observability.Metrics{},
+	}
+	for _, opt := range opts {
+		opt(s)
 	}
 
 	mux := http.NewServeMux()
@@ -70,6 +88,15 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /metrics", s.metrics.Handler)
 	mux.HandleFunc("POST /internal/v1/audiences:resolve", s.handleAudienceResolve)
 	mux.HandleFunc("POST /internal/v1/identity:revoke", s.handleIdentityRevoke)
+
+	controlHandler := control.NewHandler(control.HandlerOptions{
+		Store:  s.control,
+		Token:  s.cfg.AdminToken,
+		Actor:  s.cfg.AdminActor,
+		Logger: s.logger,
+	})
+	mux.Handle("/admin/v1/", controlHandler)
+	mux.Handle("/admin/v1", controlHandler)
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -207,7 +234,13 @@ func (s *Server) requestIDMiddleware(next http.Handler) http.Handler {
 
 func (s *Server) requestDeadlineMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout)
+		// The bid-path deadline is far too tight for ClickHouse writes on the
+		// management API, so admin requests get their own budget.
+		timeout := s.cfg.RequestTimeout
+		if strings.HasPrefix(r.URL.Path, "/admin/") {
+			timeout = adminRequestTimeout
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})

@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/domain"
 )
 
 // Config holds runtime configuration for the DMP service.
@@ -26,6 +28,11 @@ type Config struct {
 	ValkeyAddr     string
 	ValkeyUser     string
 	ValkeyPassword string
+
+	// Control plane (management API) configuration
+	AdminToken    string
+	AdminTenantID string
+	AdminActor    string
 
 	// Observability
 	LogLevel string
@@ -54,6 +61,9 @@ func Load() (*Config, error) {
 		ValkeyUser:         getEnv("DMP_VALKEY_USER", "dmp"),
 		ValkeyPassword:     getEnv("DMP_VALKEY_PASSWORD", "dmp_valkey_password"),
 		RequestTimeout:     time.Duration(requestTimeout) * time.Millisecond,
+		AdminToken:         strings.TrimSpace(getEnv("DMP_ADMIN_TOKEN", "")),
+		AdminTenantID:      strings.TrimSpace(getEnv("DMP_ADMIN_TENANT_ID", "")),
+		AdminActor:         getEnv("DMP_ADMIN_ACTOR", "dmp-admin"),
 		LogLevel:           getEnv("LOG_LEVEL", "INFO"),
 	}
 	if !validLogLevel(cfg.LogLevel) {
@@ -65,6 +75,20 @@ func Load() (*Config, error) {
 	}
 	if cfg.RequestTimeout <= 0 {
 		return nil, fmt.Errorf("request timeout must be positive")
+	}
+	if (cfg.AdminToken == "") != (cfg.AdminTenantID == "") {
+		return nil, fmt.Errorf("DMP_ADMIN_TOKEN and DMP_ADMIN_TENANT_ID must be configured together")
+	}
+	if cfg.AdminToken != "" && len(cfg.AdminToken) < 32 {
+		return nil, fmt.Errorf("DMP_ADMIN_TOKEN must be at least 32 characters")
+	}
+	if cfg.AdminTenantID != "" {
+		if err := domain.ValidateUUID32(strings.ReplaceAll(cfg.AdminTenantID, "-", "")); err != nil {
+			return nil, fmt.Errorf("invalid DMP_ADMIN_TENANT_ID: %w", err)
+		}
+	}
+	if cfg.AdminActor == "" {
+		return nil, fmt.Errorf("DMP_ADMIN_ACTOR must not be empty")
 	}
 
 	return cfg, nil

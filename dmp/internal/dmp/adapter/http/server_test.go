@@ -1,6 +1,7 @@
 package http_test
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -8,9 +9,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	adapterHTTP "github.com/songfei1983/open-ads/dmp/internal/dmp/adapter/http"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/config"
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/control"
 )
 
 func newTestServer() *adapterHTTP.Server {
@@ -122,5 +125,80 @@ func TestIdentityRevokeEndpoint(t *testing.T) {
 
 	if resp.StatusCode != http.StatusNotImplemented {
 		t.Errorf("expected 501 Not Implemented, got %d", resp.StatusCode)
+	}
+}
+
+// slowListStore proves the admin route is not bound by the bid-path deadline,
+// which defaults to a few milliseconds and would cancel any ClickHouse write.
+type slowListStore struct {
+	control.Store
+	delay time.Duration
+}
+
+func (s slowListStore) ListNamespaces(ctx context.Context) ([]control.Namespace, error) {
+	select {
+	case <-time.After(s.delay):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return []control.Namespace{}, nil
+}
+
+func TestAdminSurfaceIsWiredWithItsOwnBudget(t *testing.T) {
+	cfg := &config.Config{
+		ServiceName:    "test-dmp",
+		Port:           8082,
+		RequestTimeout: time.Millisecond,
+		AdminToken:     "dmp-admin-token-0123456789abcdef",
+		AdminTenantID:  "00000000000000000000000000000001",
+		AdminActor:     "sandbox-operator",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := adapterHTTP.NewServer(cfg, logger, adapterHTTP.WithControlStore(slowListStore{delay: 30 * time.Millisecond}))
+	srv.SetReady(true)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	unauthorized, err := http.Get(ts.URL + "/admin/v1/namespaces")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("missing token should be 401, got %d", unauthorized.StatusCode)
+	}
+
+	request, err := http.NewRequest(http.MethodGet, ts.URL+"/admin/v1/namespaces", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+cfg.AdminToken)
+	response, err := ts.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("admin request should outlive the bid-path deadline, got %d", response.StatusCode)
+	}
+}
+
+func TestAdminSurfaceDisabledWithoutToken(t *testing.T) {
+	srv := newTestServer()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	request, err := http.NewRequest(http.MethodGet, ts.URL+"/admin/v1/namespaces", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer any-token-any-token-any-token-1")
+	response, err := ts.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("unconfigured admin surface should be 503, got %d", response.StatusCode)
 	}
 }
