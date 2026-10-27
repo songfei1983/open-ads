@@ -294,8 +294,8 @@ DMP 在线撤回使用独立 Valkey ACL/keyspace 的共享 deny gate，ClickHous
 | Method / path | 调用方 | 请求/响应 | 语义 |
 |---|---|---|---|
 | `POST /internal/v1/audience:resolve` | SSP | namespace、伪名 token、tenant、purpose/consent、max segments → snapshot/provider/segments | 只读已发布快照；无匹配返回空集合；拒绝授权不返回受众；deny gate 不可用返回 `503 policy_state_unavailable` |
-| `POST /internal/v1/identity:revoke` | SSP | namespace、`subject_tokens: [{key_version, token}]`、revocation ID、effective time | 原子拒绝所有版本 admission，持久化每个 token-version tombstone 并 drain 旧 in-flight lease；返回 `202 pending` 或 `completed`；completed 要求所有有效 key version 已 deny、tombstone 已持久、gate epoch 对齐且 drain 完成 |
-| `GET /internal/v1/identity-revocations/{revocation_id}` | SSP | revocation ID → online status、gate epoch、drained lookup count、physical deletion status | 用于恢复异步撤回状态；`completed` 表示 admission 已关闭且旧 lookup 已 drain，不代表历史快照物理删除完成 |
+| `POST /internal/v1/identity:revoke` | SSP | namespace、`subject_tokens: [{key_version, token}]`、revocation ID、effective time | 原子拒绝该主体 admission（主体级 deny key，覆盖所有 key version），持久化每个 token-version tombstone 并等待旧 in-flight lease（≤1s）drain；返回 `202` 且 `status` 为 `pending` 或 `completed`；`completed` 表示在线抑制与 drain 完成，不代表历史快照物理删除完成；tombstone 落库失败仍保留 deny 并返回 `pending`；gate 状态不确定返回 `503 policy_state_unavailable` |
+| `GET /internal/v1/identity-revocations/{revocation_id}` | SSP / 控制台 | revocation ID → `online_status`、`status_version`、`gate_epoch`、`drained_lookup_count`、`physical_delete_status`、`covered_key_versions`；`GET /internal/v1/identity-revocations` 返回按更新时间的列表 | 用于恢复异步撤回状态；`completed` 表示 admission 已关闭且旧 lookup 已 drain，不代表历史快照物理删除完成 |
 | `POST /internal/v1/events:batch` | SSP/授权事件生产方 | `batch_id`、schema version、events[] → accepted/rejected counts | 有界批量写 ClickHouse；至少一次投递，不承诺写入时唯一去重；分析按 event ID 去重 |
 | `POST /internal/v1/snapshots` | 数据导入控制器 | provider、namespace、schema、source version、预期行数/checksum → snapshot/job ID | 创建不可变导入版本 |
 | `POST /internal/v1/snapshots/{id}/members:batch` | 数据导入控制器 | batch ID、membership rows[] → accepted count | 批量导入，幂等重放；不直接对在线读取可见 |

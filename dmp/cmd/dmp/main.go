@@ -16,8 +16,11 @@ import (
 
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/config"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/control"
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/gate"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/observability"
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/revocation"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/snapshot"
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/valkey"
 )
 
 func main() {
@@ -90,9 +93,35 @@ func controlPlaneOptions(cfg *config.Config, logger *slog.Logger) ([]adapterHTTP
 	}
 	controlStore := control.NewClickHouseStore(conn, tenantID)
 	snapshotStore := snapshot.NewStore(conn, controlStore, tenantID)
+	revocationStore := revocation.NewStore(conn, tenantID)
 	options := []adapterHTTP.Option{
 		adapterHTTP.WithControlStore(controlStore),
 		adapterHTTP.WithSnapshotStore(snapshotStore),
+		adapterHTTP.WithRevocationStore(revocationStore),
+	}
+
+	if cfg.InternalToken != "" {
+		gateClient := &valkey.Client{Address: cfg.ValkeyAddr, Username: cfg.ValkeyUser, Password: cfg.ValkeyPassword, Timeout: 2 * time.Second}
+		denyGate := gate.New(gateClient, tenantID.String())
+		tombstones, tombstoneErr := revocationStore.Tombstones(ctx)
+		if tombstoneErr != nil {
+			logger.Warn("deny gate rebuild could not read tombstones; lookups fail closed",
+				slog.Any("error", tombstoneErr))
+		}
+		entries := make([]gate.DenyEntry, 0, len(tombstones))
+		for _, tombstone := range tombstones {
+			entries = append(entries, gate.DenyEntry{Namespace: tombstone.Namespace, Token: tombstone.Token, ReasonCode: tombstone.ReasonCode})
+		}
+		epoch, gateErr := denyGate.EnsureEpoch(ctx, entries)
+		if gateErr != nil {
+			logger.Warn("deny gate is not ready; audience lookups fail closed",
+				slog.String("valkey_addr", cfg.ValkeyAddr), slog.Any("error", gateErr))
+		} else {
+			logger.Info("deny gate ready",
+				slog.String("valkey_addr", cfg.ValkeyAddr), slog.Uint64("epoch", epoch),
+				slog.Int("tombstones", len(entries)))
+		}
+		options = append(options, adapterHTTP.WithDenyGate(denyGate))
 	}
 	return options, func() { _ = controlStore.Close() }, nil
 }

@@ -1,6 +1,6 @@
 # Iteration 4 基线决策与架构映射记录
 
-状态：I4-01~I4-03 完成；I4-04~I4-08 未开始
+状态：I4-01~I4-04 完成；I4-05~I4-08 未开始
 适用分支：`feat/iteration-4`
 关联文档：[Iteration 3 基线决策](../iteration-3/baseline-decisions.md) | [首期开发计划](../implementation-plan.md) | [API](../../design/API.md) | [LLD](../../design/LLD.md)
 
@@ -34,7 +34,7 @@ Iteration 4 聚焦 DMP 独立子系统与隐私门禁：先把 Provider/namespac
 | I4-01 | ✅ 完成（已验收） | — | 已实现 `GET/POST /admin/v1/namespaces`、`/providers`、`/segments` 与对应 `PUT`，以及 `GET /admin/v1/audit`。每次写入追加不可变版本行（`dmp_namespace_version`、`dmp_provider_version`、`dmp_segment_definition_version` 增加 `revision_id`/`description`），`version` 不匹配返回 `409 version_conflict`，重复创建返回 `409 resource_conflict`，引用非 active 或缺失返回 `422 invalid_definition`，不可变字段变更返回 `422 immutable_field`。bearer token 绑定单租户，请求体携带 `tenant_id` 被 400 拒绝。所有变更尝试（含校验拒绝，带尝试的资源 ID）写 `dmp_control_audit`。未知路径/不支持方法返回 JSON `404 not_found` / `405 method_not_allowed`；存储不可用返回 `503 control_plane_unavailable`。 |
 | I4-02 | ✅ 完成 | — | 新增 `POST/GET /internal/v1/snapshots`、`POST /internal/v1/snapshots/{id}/rows`、`POST /internal/v1/snapshots/{id}/verify`（`DMP_INTERNAL_TOKEN` 保护，未配置 503）。导入只接受 64 位小写 hex 的伪名 token，邮箱/手机号/设备 ID 等原始身份在写入前即被拒绝；segment 必须是该 provider 的 active 定义；批次内重复计为 duplicate、已存在行按幂等跳过；`Verify` 重算 distinct 行数、规范 SHA-256 checksum 与重复率（≤5%），任一不符则 job 置 `failed` 并停止接收行，已发布快照不受影响。批次计数写入独立 batch 表，避免并发追加丢计数。 |
 | I4-03 | ✅ 完成 | — | 新增 `POST /internal/v1/snapshots/{id}/publish` 与真实 `POST /internal/v1/audiences:resolve`。发布前重新校验 stored rows 与 checksum（与 verify 结果一致才写入 `dmp_snapshot_publication`），重复发布幂等，并能在"marker 已写但状态追加失败"时自动对账；当前发布指针按 `published_at` 取最新。解析默认只查当前发布快照，携带 `snapshot_id` 时仅当该快照已发布才可命中（verified 但未发布 → 503 `no_published_snapshot`），结果按 `max_segments`（默认 10、上限 100）截断，只返回 segment ID，不回显 token。 |
-| I4-04 | 未开始 | Valkey deny gate、epoch、in-flight admission/finalize、tombstone、状态 API | 撤回阻止新 admission；在途响应复核；不确定状态 fail-closed |
+| I4-04 | ✅ 完成 | — | 新增独立 Valkey deny gate（`dmp:<tenant>:gate:*`，仅 `dmp:*` ACL）：epoch 校验 + Lua 原子 admission 登记有界 in-flight lease（2s TTL）、`finalize` 复核后再释放、`deny` 原子写入主体级 deny key 并返回当时在途数；解析在 admission 前阻断已撤回主体（返回空受众、不查存储），finalize 复核失败时丢弃已解析 segments，gate 不可用/epoch 丢失返回 `503 policy_state_unavailable`。新增 `POST /internal/v1/identity:revoke`（tombstone 写 `dmp_identity_revocation`，状态追加 `dmp_identity_revocation_status`，等待 ≤1s drain 后返回 `completed`/`pending`，tombstone 失败仍保留 gate 并返回 pending）与 `GET /internal/v1/identity-revocations/{id}`、`GET /internal/v1/identity-revocations`。启动时若 epoch 缺失，从 ClickHouse tombstone 重建 deny key 后才发布 epoch（重建期间 admission 一律 fail-closed）。 |
 | I4-05 | 未开始 | gate 重建、ClickHouse 故障、节点重启与撤回恢复演练 | 重建一致前不 ready；恢复期间无越权受众响应 |
 | I4-06 | 未开始 | 保留策略、物理删除与备份到期自动化 | 期限合规；单 snapshot 删除不误删共享分区数据 |
 | I4-07 | 未开始 | DMP 独立集成、负载与物理删除 POC 复测 | D-10 结论 |
@@ -49,6 +49,8 @@ Iteration 4 聚焦 DMP 独立子系统与隐私门禁：先把 Provider/namespac
 I4-02 实测：无 token 401；创建 job 201；`alice@example.com` 被 400 拒绝；两行三会员 append 存 3 行；重复投递 `stored_rows=0, idempotent_rows=2`；verify 200 `verified`（3 行、重复率 0）；错误 checksum 的 job verify 422 `verification_failed` 且 `job.status=failed`，此后追加 409；列表同时展示 verified/failed 状态。
 
 I4-03 实测：verified 未发布快照的固定 ID 查询 503；publish 200 且 job 转 `published`；当前解析返回该快照与 segment；已发布快照固定 ID 仍可解析；未知主体返回空数组；`max_segments=101` 400；SSP 形状请求（含 `tenant_id`/`consent_context`）200 且响应不含 token。
+
+I4-04 实测：revoke 202 `completed`（`drained_lookup_count` 反映在途数，注入 1 个 live lease 时报告 1，lease 过期后归零）；撤回后同一主体解析返回空、其他主体不受影响；Valkey 停机 → 503 `policy_state_unavailable`；epoch 丢失 → 503，重启后从 tombstone 重建，已撤回主体仍空、未撤回主体正常；未认证 revoke 401，原始身份 token 400。gate 单测（真实 Valkey）覆盖 admit/deny/finalize/重建/epoch 丢失。
 
 运行中服务验收（`/admin/v1`，沙箱租户）：
 - 认证：无 token / 错误 token → `401 unauthenticated`。

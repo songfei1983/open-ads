@@ -147,6 +147,7 @@ services:
     container_name: open-ads-dmp
     depends_on:
       - clickhouse
+      - valkey
     environment:
       DMP_PORT: "8082"
       CLICKHOUSE_ADDR: "clickhouse:9000"
@@ -160,6 +161,10 @@ services:
       DMP_ADMIN_ACTOR: "sandbox-dmp-operator"
       # Trusted tokenization/import adapters use this token; browsers never see it.
       DMP_INTERNAL_TOKEN: "dmp-internal-token-0123456789abcdef"
+      # Isolated deny-gate keyspace/ACL (dmp:* only).
+      VALKEY_ADDR: "valkey:6379"
+      DMP_VALKEY_USER: "dmp"
+      DMP_VALKEY_PASSWORD: "dmp_valkey_password"
     ports:
       - "127.0.0.1:8082:8082"
     volumes:

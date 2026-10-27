@@ -30,6 +30,7 @@ type fakeSnapshots struct {
 	rows         map[string][]snapshot.MemberKey
 	publications map[string]snapshot.Publication
 	published    map[string]snapshot.Publication
+	resolveCalls int
 }
 
 type fakeJob struct {
@@ -189,6 +190,7 @@ func (f *fakeSnapshots) Resolve(_ context.Context, in snapshot.ResolveInput) (sn
 	if !ok {
 		return snapshot.ResolveResult{}, snapshot.ErrNoPublication
 	}
+	f.resolveCalls++
 	result := snapshot.ResolveResult{
 		RequestID: in.RequestID, SnapshotID: publication.SnapshotID,
 		ProviderID: publication.ProviderID, Segments: []snapshot.SegmentRef{}, ResolvedAt: time.Unix(2, 0).UTC(),
@@ -212,7 +214,11 @@ func (f *fakeSnapshots) Resolve(_ context.Context, in snapshot.ResolveInput) (sn
 
 func newServer(t *testing.T, token string, snapshots internalapi.SnapshotService) *httptest.Server {
 	t.Helper()
-	handler := internalapi.NewHandler(internalapi.HandlerOptions{Token: token, Snapshots: snapshots})
+	return newServerFromHandler(t, internalapi.NewHandler(internalapi.HandlerOptions{Token: token, Snapshots: snapshots}))
+}
+
+func newServerFromHandler(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handler.ServeHTTP(w, r.WithContext(observability.WithRequestID(r.Context(), "req-internal-1")))
 	}))

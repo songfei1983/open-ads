@@ -13,6 +13,7 @@ import (
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/config"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/control"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/domain"
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/gate"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/internalapi"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/observability"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/snapshot"
@@ -24,13 +25,15 @@ const managementRequestTimeout = 10 * time.Second
 
 // Server wraps the standard library http.Server for DMP.
 type Server struct {
-	server    *http.Server
-	logger    *slog.Logger
-	cfg       *config.Config
-	metrics   *observability.Metrics
-	isReady   atomic.Bool
-	control   control.Store
-	snapshots internalapi.SnapshotService
+	server      *http.Server
+	logger      *slog.Logger
+	cfg         *config.Config
+	metrics     *observability.Metrics
+	isReady     atomic.Bool
+	control     control.Store
+	snapshots   internalapi.SnapshotService
+	gate        internalapi.DenyGate
+	revocations internalapi.Revocations
 }
 
 // Option customizes the server at construction time.
@@ -55,6 +58,24 @@ func WithSnapshotStore(store *snapshot.Store) Option {
 // by alternative store implementations.
 func WithSnapshotService(service internalapi.SnapshotService) Option {
 	return func(s *Server) { s.snapshots = service }
+}
+
+// WithDenyGate attaches the Valkey deny gate used to admit audience lookups.
+func WithDenyGate(g *gate.Gate) Option {
+	return func(s *Server) {
+		if g != nil {
+			s.gate = g
+		}
+	}
+}
+
+// WithRevocationStore attaches the tombstone/status store.
+func WithRevocationStore(store internalapi.Revocations) Option {
+	return func(s *Server) {
+		if store != nil {
+			s.revocations = store
+		}
+	}
 }
 
 // NewServer initializes the HTTP server with router, middlewares, and probes.
@@ -103,9 +124,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /metrics", s.metrics.Handler)
 
 	internalHandler := internalapi.NewHandler(internalapi.HandlerOptions{
-		Token:     s.cfg.InternalToken,
-		Snapshots: s.snapshots,
-		Logger:    s.logger,
+		Token:       s.cfg.InternalToken,
+		Snapshots:   s.snapshots,
+		Gate:        s.gate,
+		Revocations: s.revocations,
+		Logger:      s.logger,
 	})
 	mux.Handle("/internal/v1/", internalHandler)
 	mux.Handle("/internal/v1", internalHandler)
