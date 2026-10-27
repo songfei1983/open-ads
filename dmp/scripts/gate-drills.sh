@@ -64,8 +64,27 @@ wait_ready() { # expected_code timeout_seconds
 
 valkey() { "${COMPOSE[@]}" exec -T valkey valkey-cli --user dmp --pass dmp_valkey_password "$@" 2>/dev/null; }
 
+echo "== Seeding a dedicated snapshot for the drills"
+wait_ready 200 60 || fail "readyz is not 200"
+checksum=$(python3 -c "import hashlib;rows=[('$REVOKED',1,'seg-tech-enthusiasts'),('$ALLOWED',1,'seg-tech-enthusiasts')];print(hashlib.sha256(''.join(sorted(f'{t}\t{v}\t{s}\n' for t,v,s in rows)).encode()).hexdigest())")
+seed_status=$(curl -s -o /tmp/drill_seed.json -w '%{http_code}' -X POST "$DMP/internal/v1/snapshots" \
+  -H "Authorization: Bearer $INTERNAL_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"provider_id\":\"$PROVIDER\",\"namespace\":\"$NAMESPACE\",\"schema_version\":1,\"source_version\":\"drill-$$\",\"expected_rows\":2,\"expected_checksum\":\"$checksum\"}")
+[ "$seed_status" = "201" ] || fail "drill snapshot registration: $seed_status $(cat /tmp/drill_seed.json)"
+SEED=$(python3 -c 'import json;print(json.load(open("/tmp/drill_seed.json"))["snapshot_id"])')
+curl -s -o /dev/null -X POST "$DMP/internal/v1/snapshots/$SEED/rows" -H "Authorization: Bearer $INTERNAL_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"rows\":[{\"subject_token\":\"$REVOKED\",\"subject_key_version\":1,\"segment_ids\":[\"seg-tech-enthusiasts\"]},{\"subject_token\":\"$ALLOWED\",\"subject_key_version\":1,\"segment_ids\":[\"seg-tech-enthusiasts\"]}]}"
+curl -s -o /dev/null -X POST "$DMP/internal/v1/snapshots/$SEED/verify" -H "Authorization: Bearer $INTERNAL_TOKEN"
+publish_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$DMP/internal/v1/snapshots/$SEED/publish" -H "Authorization: Bearer $INTERNAL_TOKEN")
+[ "$publish_status" = "200" ] && pass "drill snapshot published" || fail "drill snapshot publish: $publish_status"
+revoke_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$DMP/internal/v1/identity:revoke" \
+  -H "Authorization: Bearer $INTERNAL_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"namespace\":\"$NAMESPACE\",\"subject_tokens\":[{\"token\":\"$REVOKED\",\"key_version\":1}]}")
+[ "$revoke_status" = "202" ] && pass "drill subject revoked" || fail "drill subject revoke: $revoke_status"
+sleep 1
+
 echo "== Drill 0: baseline"
-wait_ready 200 30 || fail "readyz is not 200"
 expect_resolve "revoked subject resolves empty" "$REVOKED" 200 0
 expect_resolve "allowed subject resolves one segment" "$ALLOWED" 200 1
 

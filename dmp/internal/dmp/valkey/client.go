@@ -1,4 +1,6 @@
-// Package valkey contains the small RESP client used by the DMP deny gate.
+// Package valkey contains the small RESP client used by the DMP deny gate. It
+// keeps a bounded pool of authenticated connections so a hot resolve path does
+// not pay a dial+auth round trip per command.
 package valkey
 
 import (
@@ -11,17 +13,26 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
+// Client is a minimal, connection-reusing RESP client.
 type Client struct {
 	Address  string
 	Username string
 	Password string
 	TLS      bool
 	Timeout  time.Duration
+
+	mu     sync.Mutex
+	idle   []net.Conn
+	closed bool
 }
 
+const maxIdleConnections = 8
+
+// Do sends one command and returns the decoded reply.
 func (c *Client) Do(ctx context.Context, args ...string) (any, error) {
 	if len(args) == 0 || c.Address == "" {
 		return nil, errors.New("valkey address and command are required")
@@ -30,13 +41,67 @@ func (c *Client) Do(ctx context.Context, args ...string) (any, error) {
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
+	conn, reused, err := c.acquire(ctx, timeout)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(timeout)
+	if requestDeadline, ok := ctx.Deadline(); ok && requestDeadline.Before(deadline) {
+		deadline = requestDeadline
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		c.discard(conn)
+		return nil, fmt.Errorf("set valkey deadline: %w", err)
+	}
+	reader := bufio.NewReader(conn)
+	if !reused && (c.Password != "" || c.Username != "") {
+		auth := []string{"AUTH", c.Username, c.Password}
+		if c.Username == "" {
+			auth = []string{"AUTH", c.Password}
+		}
+		if err := writeCommand(conn, auth); err != nil {
+			c.discard(conn)
+			return nil, err
+		}
+		if _, err := readValue(reader); err != nil {
+			c.discard(conn)
+			return nil, fmt.Errorf("authenticate to valkey: %w", err)
+		}
+	}
+	if err := writeCommand(conn, args); err != nil {
+		c.discard(conn)
+		return nil, err
+	}
+	value, err := readValue(reader)
+	if err != nil {
+		c.discard(conn)
+		return nil, err
+	}
+	c.release(conn)
+	return value, nil
+}
+
+func (c *Client) acquire(ctx context.Context, timeout time.Duration) (net.Conn, bool, error) {
+	c.mu.Lock()
+	if count := len(c.idle); count > 0 {
+		conn := c.idle[count-1]
+		c.idle = c.idle[:count-1]
+		c.mu.Unlock()
+		return conn, true, nil
+	}
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return nil, false, errors.New("valkey client is closed")
+	}
+
 	dialer := net.Dialer{Timeout: timeout}
 	var conn net.Conn
 	var err error
 	if c.TLS {
 		host, _, splitErr := net.SplitHostPort(c.Address)
 		if splitErr != nil {
-			return nil, fmt.Errorf("split valkey address: %w", splitErr)
+			return nil, false, fmt.Errorf("split valkey address: %w", splitErr)
 		}
 		tlsDialer := tls.Dialer{NetDialer: &dialer, Config: &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host}}
 		conn, err = tlsDialer.DialContext(ctx, "tcp", c.Address)
@@ -44,33 +109,36 @@ func (c *Client) Do(ctx context.Context, args ...string) (any, error) {
 		conn, err = dialer.DialContext(ctx, "tcp", c.Address)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("connect to valkey: %w", err)
+		return nil, false, fmt.Errorf("connect to valkey: %w", err)
 	}
-	defer conn.Close()
-	deadline := time.Now().Add(timeout)
-	if requestDeadline, ok := ctx.Deadline(); ok && requestDeadline.Before(deadline) {
-		deadline = requestDeadline
+	return conn, false, nil
+}
+
+func (c *Client) release(conn net.Conn) {
+	c.mu.Lock()
+	if c.closed || len(c.idle) >= maxIdleConnections {
+		c.mu.Unlock()
+		_ = conn.Close()
+		return
 	}
-	if err := conn.SetDeadline(deadline); err != nil {
-		return nil, fmt.Errorf("set valkey deadline: %w", err)
+	c.idle = append(c.idle, conn)
+	c.mu.Unlock()
+}
+
+func (c *Client) discard(conn net.Conn) {
+	_ = conn.Close()
+}
+
+// Close drops every idle connection.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed = true
+	for _, conn := range c.idle {
+		_ = conn.Close()
 	}
-	reader := bufio.NewReader(conn)
-	if c.Password != "" || c.Username != "" {
-		auth := []string{"AUTH", c.Username, c.Password}
-		if c.Username == "" {
-			auth = []string{"AUTH", c.Password}
-		}
-		if err := writeCommand(conn, auth); err != nil {
-			return nil, err
-		}
-		if _, err := readValue(reader); err != nil {
-			return nil, fmt.Errorf("authenticate to valkey: %w", err)
-		}
-	}
-	if err := writeCommand(conn, args); err != nil {
-		return nil, err
-	}
-	return readValue(reader)
+	c.idle = nil
+	return nil
 }
 
 func writeCommand(w io.Writer, args []string) error {
@@ -138,6 +206,6 @@ func readValue(r *bufio.Reader) (any, error) {
 		}
 		return values, nil
 	default:
-		return nil, fmt.Errorf("unsupported valkey response prefix %q", prefix)
+		return nil, fmt.Errorf("unexpected valkey response prefix %q", prefix)
 	}
 }

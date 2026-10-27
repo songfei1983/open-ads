@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/valkey"
@@ -90,15 +91,23 @@ return redis.call('ZCARD', KEYS[1])
 
 // Gate is the Valkey-backed deny barrier for one tenant.
 type Gate struct {
-	client *valkey.Client
-	tenant string
-	now    func() time.Time
+	client    *valkey.Client
+	tenant    string
+	now       func() time.Time
+	epochMu   sync.Mutex
+	epoch     uint64
+	epochRead time.Time
 }
 
 // New builds a gate for a single tenant; tenant scoping is part of every key.
 func New(client *valkey.Client, tenantID string) *Gate {
 	return &Gate{client: client, tenant: tenantID, now: func() time.Time { return time.Now().UTC() }}
 }
+
+// epochCacheTTL bounds how long a resolved epoch is reused. A rebuild changes
+// the epoch, and a stale value makes the next admission fail closed, so a short
+// cache is safe and removes a round trip from the hot path.
+const epochCacheTTL = time.Second
 
 func (g *Gate) epochKey() string { return "dmp:" + g.tenant + ":gate:epoch" }
 func (g *Gate) inflightKey(ns, token string) string {
@@ -177,6 +186,7 @@ func (g *Gate) EnsureEpoch(ctx context.Context, tombstones []DenyEntry) (uint64,
 	if _, err := g.client.Do(ctx, "SET", g.epochKey(), "1", "NX"); err != nil {
 		return 0, fmt.Errorf("%w: publish epoch: %v", ErrUnavailable, err)
 	}
+	g.invalidateEpoch()
 	epoch, err := g.Epoch(ctx)
 	if err != nil {
 		return 0, err
@@ -184,8 +194,36 @@ func (g *Gate) EnsureEpoch(ctx context.Context, tombstones []DenyEntry) (uint64,
 	return epoch, nil
 }
 
-// Epoch returns the current gate epoch.
+// Epoch returns the current gate epoch, reusing a recent read.
 func (g *Gate) Epoch(ctx context.Context) (uint64, error) {
+	g.epochMu.Lock()
+	if !g.epochRead.IsZero() && g.now().Sub(g.epochRead) < epochCacheTTL {
+		cached := g.epoch
+		g.epochMu.Unlock()
+		if cached != 0 {
+			return cached, nil
+		}
+	}
+	g.epochMu.Unlock()
+	epoch, err := g.readEpoch(ctx)
+	if err != nil {
+		return 0, err
+	}
+	g.epochMu.Lock()
+	g.epoch = epoch
+	g.epochRead = g.now()
+	g.epochMu.Unlock()
+	return epoch, nil
+}
+
+func (g *Gate) invalidateEpoch() {
+	g.epochMu.Lock()
+	g.epochRead = time.Time{}
+	g.epochMu.Unlock()
+}
+
+// readEpoch performs the uncached epoch read.
+func (g *Gate) readEpoch(ctx context.Context) (uint64, error) {
 	value, err := g.client.Do(ctx, "GET", g.epochKey())
 	if err != nil {
 		return 0, fmt.Errorf("%w: read epoch: %v", ErrUnavailable, err)
@@ -221,6 +259,7 @@ func (g *Gate) Admit(ctx context.Context, namespace, token, leaseID string) erro
 	case 0:
 		return ErrSubjectDenied
 	case -2:
+		g.invalidateEpoch()
 		return fmt.Errorf("%w: %s", ErrEpochMismatch, epochText(reply))
 	default:
 		return fmt.Errorf("%w: gate epoch is not initialised", ErrNotReady)
