@@ -308,14 +308,20 @@ Membership 导入只接收已由受信身份 tokenization adapter 转换的 `{su
 
 ### 4.2 DMP 管理 API
 
+管理 API 使用 bearer token，且 token 在服务端绑定单一 tenant；请求体不接受 `tenant_id`，出现未声明字段即拒绝。
+
 | Method / path | 用途 | 主要数据 |
 |---|---|---|
-| `GET/POST /admin/v1/providers`、`PUT /admin/v1/providers/{id}` | 数据提供方和 namespace 管理 | provider ID、namespace、许可/状态版本 |
-| `GET/POST /admin/v1/segments`、`PUT /admin/v1/segments/{id}` | Segment 定义版本 | segment ID/name、provider、状态、valid_from |
+| `GET/POST /admin/v1/namespaces`、`PUT /admin/v1/namespaces/{id}` | Identity namespace 定义版本 | namespace ID、显示名、hashing algorithm（仅 `hmac-sha256`）、subject key version、保留月数（≤ 3）、状态 |
+| `GET/POST /admin/v1/providers`、`PUT /admin/v1/providers/{id}` | 数据提供方定义版本 | provider ID、显示名、所属 namespace、许可版本、状态 |
+| `GET/POST /admin/v1/segments`、`PUT /admin/v1/segments/{id}` | Segment 定义版本 | segment ID/name、provider、描述、状态、valid_from |
+| `GET /admin/v1/audit` | 控制面审计查询 | `resource_type`、`resource_id`、`limit`（≤ 200）→ actor、action、版本、request_id、outcome |
 | `GET /admin/v1/snapshots` | 快照管理/审计 | snapshot ID、状态、行数、校验和、发布时间 |
 | `GET /healthz` / `GET /readyz` | 运维探针 | API 存活、ClickHouse 可用和当前发布快照版本 |
 
-DMP 管理变更写入不可变版本；不把 ClickHouse 当作任意行级事务数据库。删除/撤回要求通过新版本、失效标记及受控清理流程执行。
+DMP 管理变更写入不可变版本；不把 ClickHouse 当作任意行级事务数据库。每个 `PUT` 必须提交当前 `version`，不匹配返回 `409 version_conflict`，重复创建返回 `409 resource_conflict`；字段或引用无效返回 `422 invalid_definition`，`provider.namespace` 与 `segment.provider_id` 变更返回 `422 immutable_field`；未配置 token 或 store 返回 `503 control_plane_unavailable`。删除/撤回要求通过新版本、失效标记及受控清理流程执行。
+
+每次变更尝试（accepted/conflict/not_found/rejected）都追加一条审计记录，只包含配置的操作者标识、资源标识、版本和 request ID，不记录 bearer token、subject token 或原始身份。
 
 ### 4.3 契约工件
 

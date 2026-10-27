@@ -1746,6 +1746,65 @@ TTL event_date + INTERVAL 12 MONTH DELETE;
 
 DMP 在线撤回 gate 使用独立 Valkey ACL/keyspace，key 为 tenant/namespace/token HMAC，不存原始身份；deny/admission/in-flight lease 使用相同 token hash slot，由 Lua 保证 admission、deny 和 response finalize 的原子顺序。写 gate 后追加 ClickHouse tombstone；即使 tombstone 写失败也保留 gate 并返回 `202 pending`。Valkey 丢失/epoch 不一致时，所有 DMP 节点暂停身份解析并 drain 当前请求；从 ClickHouse tombstone 重建 gate、恢复一致 epoch 后才 ready。ClickHouse 不可用时不得清空或绕过已有 gate。SSP 必须在响应使用前重新检查本地持久撤回状态，避免已 admission 的迟到解析结果进入 DSP bid request。
 
+#### 4.2.1 控制面定义与审计（Iteration 4）
+
+DMP 控制面不引入 MariaDB：namespace、provider、segment 定义与审计都存放在 ClickHouse，并以追加写表达版本。每张定义表带 `version` 与 `revision_id`，当前定义为 `ORDER BY version DESC, revision_id ASC LIMIT 1`，因此同版本并发写入始终解析出唯一胜者。
+
+```sql
+CREATE TABLE dmp_namespace_version
+(
+  tenant_id UUID,
+  namespace LowCardinality(String),
+  version UInt64,
+  revision_id UUID,
+  display_name String,
+  hashing_algorithm LowCardinality(String),
+  subject_key_version UInt16,
+  retention_months UInt8,
+  status LowCardinality(String),
+  written_at DateTime64(3, 'UTC')
+)
+ENGINE = MergeTree
+ORDER BY (tenant_id, namespace, version);
+
+CREATE TABLE dmp_provider_version
+(
+  tenant_id UUID,
+  provider_id String,
+  version UInt64,
+  revision_id UUID,
+  display_name String,
+  namespace LowCardinality(String),
+  license_version String,
+  status LowCardinality(String),
+  written_at DateTime64(3, 'UTC')
+)
+ENGINE = MergeTree
+ORDER BY (tenant_id, provider_id, version);
+
+CREATE TABLE dmp_control_audit
+(
+  tenant_id UUID,
+  audit_id UUID,
+  occurred_at DateTime64(3, 'UTC'),
+  actor String,
+  action LowCardinality(String),
+  resource_type LowCardinality(String),
+  resource_id String,
+  resource_version UInt64,
+  request_id String,
+  outcome LowCardinality(String),
+  detail String
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(occurred_at)
+ORDER BY (tenant_id, occurred_at, audit_id);
+```
+
+`dmp_segment_definition_version` 复用 000001 的表，并增加 `revision_id`、`description`。管理 API 的乐观锁语义：客户端提交当前 `version`，服务端追加 `version + 1` 后回读校验；若回读到的胜者不是本次 `revision_id`，返回 `409 version_conflict`，落败行保留为审计事实但不覆盖胜者。ClickHouse 不提供多语句事务，因此版本行与审计行不是原子写：审计写失败时接口报错，已写入的版本行保留，重试将以 409 暴露给调用方。
+
+约束：token 在服务端绑定单一 tenant，请求体不携带 `tenant_id`；引用只允许指向 active 定义；`provider.namespace` 与 `segment.provider_id` 创建后不可变；`retention_months` 上限 3；管理面请求使用独立超时预算（10 s），不套用 bid 热路径 deadline。
+
 ### 4.3 DMP HTTP 契约
 
 | Endpoint | 用途 | 写入/响应规则 |
@@ -1754,6 +1813,8 @@ DMP 在线撤回 gate 使用独立 Valkey ACL/keyspace，key 为 tenant/namespac
 | `POST /internal/v1/identity:revoke` | 登记某 namespace subject 的撤回 | 原子阻止新 admission、持久化 tombstone 并 drain 旧 lookup；返回 `202 pending` 或 `completed`；completed 表示在线抑制生效，不代表历史快照物理删除完成 |
 | `GET /internal/v1/identity-revocations/{revocation_id}` | 查询撤回处理状态 | revocation ID | 从状态追加表按 `status_version` 取最新记录，返回 `online_status`、`gate_epoch`、`drained_lookup_count` 和 `physical_delete_status`；仅原请求租户可查询 |
 | `POST /internal/v1/events:batch` | 批量写入去敏事件 | 有界批量；成功仅在 ClickHouse insert 达到约定持久化确认后返回；允许重复投递 |
+| `GET/POST /admin/v1/namespaces`、`/providers`、`/segments` | 控制面定义（见 4.2.1） | 追加不可变版本；`PUT` 需提交当前 `version`，冲突 409，引用无效 422 |
+| `GET /admin/v1/audit` | 控制面审计查询 | 按 `resource_type`/`resource_id` 过滤；只含操作者标识、资源与 request ID |
 | `POST /internal/v1/snapshots` | 创建/登记导入任务（仅在控制面开放时） | 版本化；不可直接发布未校验快照 |
 | `POST /internal/v1/snapshots/{id}:publish` | 校验完成后发布 | 校验租户/provider/namespace/行数/校验和后追加 publication marker |
 
