@@ -96,11 +96,17 @@ services:
       dockerfile: Dockerfile
     image: open-ads-console:dev
     container_name: open-ads-console
+    depends_on:
+      - dsp
+      - dmp
     environment:
       # Console proxies the browser to the DSP management API and injects
       # the admin bearer token server side; the UI holds no credentials.
       DSP_ADMIN_URL: "http://dsp:8081"
       DSP_ADMIN_TOKEN: "supersecrettoken1234567890abcdEF"
+      # Same pattern for DMP: the operator token stays in the console process.
+      DMP_ADMIN_URL: "http://dmp:8082"
+      DMP_ADMIN_TOKEN: "dmp-admin-token-0123456789abcdef"
     ports:
       - "127.0.0.1:8083:8083"
     volumes:

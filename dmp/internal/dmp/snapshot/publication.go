@@ -307,3 +307,29 @@ func (s *Store) CreatedBefore(ctx context.Context, snapshotID string, cutoff tim
 	}
 	return job.CreatedAt.Before(cutoff), nil
 }
+
+// ListCurrentPublications returns the snapshot serving each provider/namespace.
+func (s *Store) ListCurrentPublications(ctx context.Context) ([]Publication, error) {
+	rows, err := s.conn.Query(ctx, `SELECT provider_id, namespace, snapshot_id, expected_rows, checksum, created_at, published_at
+		FROM dmp_snapshot_publication
+		WHERE tenant_id = ? AND (provider_id, namespace, published_at) IN (
+			SELECT provider_id, namespace, max(published_at) FROM dmp_snapshot_publication
+			WHERE tenant_id = ? GROUP BY provider_id, namespace)
+		ORDER BY published_at DESC`, s.tenant, s.tenant)
+	if err != nil {
+		return nil, fmt.Errorf("%w: list publications: %v", ErrStoreUnavailable, err)
+	}
+	defer rows.Close()
+	var publications []Publication
+	for rows.Next() {
+		publication, err := scanPublication(rows)
+		if err != nil {
+			return nil, err
+		}
+		publications = append(publications, publication)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: list publications: %v", ErrStoreUnavailable, err)
+	}
+	return publications, nil
+}

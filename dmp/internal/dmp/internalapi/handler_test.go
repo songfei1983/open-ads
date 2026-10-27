@@ -153,6 +153,16 @@ func (f *fakeSnapshots) Verify(_ context.Context, id string) (snapshot.Job, erro
 	return job.job, nil
 }
 
+func (f *fakeSnapshots) ListCurrentPublications(context.Context) ([]snapshot.Publication, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	publications := make([]snapshot.Publication, 0, len(f.publications))
+	for _, publication := range f.publications {
+		publications = append(publications, publication)
+	}
+	return publications, nil
+}
+
 func (f *fakeSnapshots) DeleteSnapshot(_ context.Context, id string) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

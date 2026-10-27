@@ -136,6 +136,10 @@ func (s slowSnapshotService) DeleteSnapshot(context.Context, string) (uint64, er
 	return 0, errors.New("not used")
 }
 
+func (s slowSnapshotService) ListCurrentPublications(context.Context) ([]snapshot.Publication, error) {
+	return nil, errors.New("not used")
+}
+
 func (s slowSnapshotService) Resolve(ctx context.Context, _ snapshot.ResolveInput) (snapshot.ResolveResult, error) {
 	select {
 	case <-time.After(s.delay):

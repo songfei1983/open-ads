@@ -32,6 +32,7 @@ type SnapshotService interface {
 	Verify(ctx context.Context, snapshotID string) (snapshot.Job, error)
 	Publish(ctx context.Context, snapshotID string) (snapshot.Job, error)
 	DeleteSnapshot(ctx context.Context, snapshotID string) (uint64, error)
+	ListCurrentPublications(ctx context.Context) ([]snapshot.Publication, error)
 	Resolve(ctx context.Context, input snapshot.ResolveInput) (snapshot.ResolveResult, error)
 }
 
@@ -61,6 +62,7 @@ type RetentionService interface {
 // HandlerOptions carries the trusted-adapter dependency set.
 type HandlerOptions struct {
 	Token       string
+	AdminToken  string
 	Snapshots   SnapshotService
 	Gate        DenyGate
 	Revocations Revocations
@@ -76,13 +78,14 @@ func NewHandler(opts HandlerOptions) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	h := &handler{token: opts.Token, snapshots: opts.Snapshots, gate: opts.Gate, revocations: opts.Revocations,
+	h := &handler{token: opts.Token, adminToken: opts.AdminToken, snapshots: opts.Snapshots, gate: opts.Gate, revocations: opts.Revocations,
 		retention: opts.Retention, logger: logger}
 	return h.authenticate(h)
 }
 
 type handler struct {
 	token       string
+	adminToken  string
 	snapshots   SnapshotService
 	gate        DenyGate
 	revocations Revocations
@@ -134,6 +137,12 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.publishSnapshot(w, r, parts[1])
+	case path == "publications":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, r, http.MethodGet)
+			return
+		}
+		h.listPublications(w, r)
 	case path == "audiences:resolve":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, r, http.MethodPost)
@@ -196,8 +205,17 @@ func (h *handler) authenticate(next http.Handler) http.Handler {
 		provided := sha256.Sum256([]byte(strings.TrimPrefix(authorization, "Bearer ")))
 		expected := sha256.Sum256([]byte(h.token))
 		if subtle.ConstantTimeCompare(provided[:], expected[:]) != 1 {
-			writeError(w, requestID, http.StatusUnauthorized, "unauthenticated", "valid bearer token required")
-			return
+			// The sandbox operator token may also drive import/publish/revoke so
+			// the console never needs the trusted-adapter credential.
+			if h.adminToken == "" {
+				writeError(w, requestID, http.StatusUnauthorized, "unauthenticated", "valid bearer token required")
+				return
+			}
+			adminExpected := sha256.Sum256([]byte(h.adminToken))
+			if subtle.ConstantTimeCompare(provided[:], adminExpected[:]) != 1 {
+				writeError(w, requestID, http.StatusUnauthorized, "unauthenticated", "valid bearer token required")
+				return
+			}
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -285,6 +303,18 @@ func (h *handler) publishSnapshot(w http.ResponseWriter, r *http.Request, id str
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+func (h *handler) listPublications(w http.ResponseWriter, r *http.Request) {
+	publications, err := h.snapshots.ListCurrentPublications(r.Context())
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	if publications == nil {
+		publications = []snapshot.Publication{}
+	}
+	writeJSON(w, http.StatusOK, publications)
 }
 
 func (h *handler) deleteSnapshot(w http.ResponseWriter, r *http.Request, id string) {

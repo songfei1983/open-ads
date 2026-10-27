@@ -165,6 +165,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	internalHandler := internalapi.NewHandler(internalapi.HandlerOptions{
 		Token:       s.cfg.InternalToken,
+		AdminToken:  s.cfg.AdminToken,
 		Snapshots:   s.snapshots,
 		Gate:        s.gate,
 		Revocations: s.revocations,

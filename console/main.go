@@ -104,6 +104,7 @@ func NewServer(webDir string) http.Handler {
 		writeJSON(w, map[string]any{"revision": revision, "files": files})
 	})
 	mux.Handle("/api/dsp/", newDSPAdminProxy())
+	mux.Handle("/api/dmp/", newDMPAdminProxy())
 	mux.Handle("/", &staticHandler{webDir: webDir})
 	return mux
 }
@@ -166,6 +167,81 @@ func newDSPAdminProxy() http.Handler {
 			writeAPIError(w, http.StatusNotFound, "not_found", "仅 /admin/v1/* 可通过代理访问")
 			return
 		}
+		request.Host = upstream.Host
+		request.Header.Set("Authorization", "Bearer "+token)
+		request.Header.Del("Cookie")
+		proxy.ServeHTTP(w, request)
+	})
+}
+
+// dmpAdminProxyPrefixes are the only DMP paths the console may reach. The
+// management API serves definition CRUD; the internal paths are the operator
+// actions (snapshot lifecycle, revocation, retention) that the admin token is
+// allowed to drive in the sandbox.
+var dmpAdminProxyPrefixes = []string{
+	"/admin/v1/",
+	"/internal/v1/snapshots",
+	"/internal/v1/identity",
+	"/internal/v1/retention",
+	"/internal/v1/publications",
+}
+
+// newDMPAdminProxy bridges the browser to the DMP API. The token stays server
+// side and the browser can only reach the allowlisted operator paths.
+func newDMPAdminProxy() http.Handler {
+	logger := slog.Default()
+	target := strings.TrimRight(os.Getenv("DMP_ADMIN_URL"), "/")
+	if target == "" {
+		target = "http://127.0.0.1:8082"
+	}
+	upstream, err := url.Parse(target)
+	if err != nil || upstream.Scheme == "" || upstream.Host == "" {
+		logger.Error("DMP_ADMIN_URL is not a valid admin upstream URL", slog.String("target", target), slog.Any("error", err))
+	}
+	proxy := httputil.NewSingleHostReverseProxy(upstream)
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, proxyErr error) {
+		logger.Warn("DMP upstream failed", slog.String("upstream", target), slog.Any("error", proxyErr))
+		writeAPIError(w, http.StatusBadGateway, "dmp_unreachable", "DMP 服务不可达，请确认 DMP 在运行")
+	}
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		resp.Header.Set("Cache-Control", "no-store")
+		return nil
+	}
+	token := ""
+	if value := os.Getenv("DMP_ADMIN_TOKEN"); strings.TrimSpace(value) != "" {
+		token = strings.TrimSpace(value)
+	}
+	proxy.Transport = &http.Transport{
+		MaxIdleConns:        4,
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     30 * time.Second,
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if token == "" {
+			writeAPIError(w, http.StatusServiceUnavailable, "dmp_unconfigured", "DMP token 未配置（DMP_ADMIN_TOKEN）")
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodPut {
+			writeAPIError(w, http.StatusMethodNotAllowed, "invalid_request", "console 仅转发 GET/POST/PUT 到 DMP")
+			return
+		}
+		upstreamPath := strings.TrimPrefix(r.URL.Path, "/api/dmp")
+		allowed := false
+		for _, prefix := range dmpAdminProxyPrefixes {
+			if strings.HasPrefix(upstreamPath, prefix) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			writeAPIError(w, http.StatusNotFound, "not_found", "该 DMP 路径不允许通过 console 访问")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), dspAdminProxyTimeout)
+		defer cancel()
+		request := r.Clone(ctx)
+		request.URL.Path = upstreamPath
 		request.Host = upstream.Host
 		request.Header.Set("Authorization", "Bearer "+token)
 		request.Header.Del("Cookie")
