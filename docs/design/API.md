@@ -319,7 +319,7 @@ Membership 导入只接收已由受信身份 tokenization adapter 转换的 `{su
 | `GET /admin/v1/snapshots` | 快照管理/审计 | snapshot ID、状态、行数、校验和、发布时间 |
 | `GET /healthz` / `GET /readyz` | 运维探针 | API 存活、ClickHouse 可用和当前发布快照版本 |
 
-DMP 管理变更写入不可变版本；不把 ClickHouse 当作任意行级事务数据库。每个 `PUT` 必须提交当前 `version`，不匹配返回 `409 version_conflict`，重复创建返回 `409 resource_conflict`；字段或引用无效返回 `422 invalid_definition`，`provider.namespace` 与 `segment.provider_id` 变更返回 `422 immutable_field`；未配置 token 或 store 返回 `503 control_plane_unavailable`。删除/撤回要求通过新版本、失效标记及受控清理流程执行。
+DMP 管理变更写入不可变版本；不把 ClickHouse 当作任意行级事务数据库。每个 `PUT` 必须提交当前 `version`，不匹配返回 `409 version_conflict`，重复创建返回 `409 resource_conflict`；字段或引用无效返回 `422 invalid_definition`，`provider.namespace` 与 `segment.provider_id` 变更返回 `422 immutable_field`；未配置 token/store 或存储不可用返回 `503 control_plane_unavailable`。未知路径返回 `404 not_found`，不支持的方法返回 `405 method_not_allowed`（附 `Allow`），两者都使用标准 JSON 错误信封。并发写同一 `version` 时只有一个请求成功，其余返回 `409`；落败版本行保留为审计事实但不影响当前定义。删除/撤回要求通过新版本、失效标记及受控清理流程执行。
 
 每次变更尝试（accepted/conflict/not_found/rejected）都追加一条审计记录，只包含配置的操作者标识、资源标识、版本和 request ID，不记录 bearer token、subject token 或原始身份。
 

@@ -99,7 +99,7 @@ func (s *ClickHouseStore) listNamespaces(ctx context.Context, id string) ([]Name
 
 	rows, err := s.conn.Query(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list namespaces: %w", err)
+		return nil, fmt.Errorf("%w: list namespaces: %v", ErrStoreUnavailable, err)
 	}
 	defer rows.Close()
 
@@ -109,12 +109,12 @@ func (s *ClickHouseStore) listNamespaces(ctx context.Context, id string) ([]Name
 		if err := rows.Scan(&item.ID, &item.Version, &item.revisionID, &item.DisplayName,
 			&item.HashingAlgorithm, &item.SubjectKeyVersion, &item.RetentionMonths,
 			&item.Status, &item.WrittenAt); err != nil {
-			return nil, fmt.Errorf("scan namespace: %w", err)
+			return nil, fmt.Errorf("%w: scan namespace: %v", ErrStoreUnavailable, err)
 		}
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list namespaces: %w", err)
+		return nil, fmt.Errorf("%w: list namespaces: %v", ErrStoreUnavailable, err)
 	}
 	current := make([]Namespace, 0, len(items))
 	for _, item := range items {
@@ -230,7 +230,7 @@ func (s *ClickHouseStore) listProviders(ctx context.Context, id string) ([]Provi
 
 	rows, err := s.conn.Query(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list providers: %w", err)
+		return nil, fmt.Errorf("%w: list providers: %v", ErrStoreUnavailable, err)
 	}
 	defer rows.Close()
 
@@ -239,12 +239,12 @@ func (s *ClickHouseStore) listProviders(ctx context.Context, id string) ([]Provi
 		var item Provider
 		if err := rows.Scan(&item.ID, &item.Version, &item.revisionID, &item.DisplayName,
 			&item.Namespace, &item.LicenseVersion, &item.Status, &item.WrittenAt); err != nil {
-			return nil, fmt.Errorf("scan provider: %w", err)
+			return nil, fmt.Errorf("%w: scan provider: %v", ErrStoreUnavailable, err)
 		}
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list providers: %w", err)
+		return nil, fmt.Errorf("%w: list providers: %v", ErrStoreUnavailable, err)
 	}
 	current := make([]Provider, 0, len(items))
 	for _, item := range items {
@@ -369,7 +369,7 @@ func (s *ClickHouseStore) listSegments(ctx context.Context, id string) ([]Segmen
 
 	rows, err := s.conn.Query(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list segments: %w", err)
+		return nil, fmt.Errorf("%w: list segments: %v", ErrStoreUnavailable, err)
 	}
 	defer rows.Close()
 
@@ -378,12 +378,12 @@ func (s *ClickHouseStore) listSegments(ctx context.Context, id string) ([]Segmen
 		var item Segment
 		if err := rows.Scan(&item.ID, &item.Version, &item.revisionID, &item.ProviderID, &item.Name,
 			&item.Description, &item.Status, &item.ValidFrom, &item.WrittenAt); err != nil {
-			return nil, fmt.Errorf("scan segment: %w", err)
+			return nil, fmt.Errorf("%w: scan segment: %v", ErrStoreUnavailable, err)
 		}
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list segments: %w", err)
+		return nil, fmt.Errorf("%w: list segments: %v", ErrStoreUnavailable, err)
 	}
 	current := make([]Segment, 0, len(items))
 	for _, item := range items {
@@ -502,7 +502,7 @@ func (s *ClickHouseStore) ListAudit(ctx context.Context, query AuditQuery) ([]Au
 
 	rows, err := s.conn.Query(ctx, sql, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list audit: %w", err)
+		return nil, fmt.Errorf("%w: list audit: %v", ErrStoreUnavailable, err)
 	}
 	defer rows.Close()
 
@@ -512,12 +512,12 @@ func (s *ClickHouseStore) ListAudit(ctx context.Context, query AuditQuery) ([]Au
 		if err := rows.Scan(&entry.AuditID, &entry.Actor, &entry.Action, &entry.ResourceType,
 			&entry.ResourceID, &entry.ResourceVersion, &entry.RequestID, &entry.Outcome,
 			&entry.Detail, &entry.OccurredAt); err != nil {
-			return nil, fmt.Errorf("scan audit: %w", err)
+			return nil, fmt.Errorf("%w: scan audit: %v", ErrStoreUnavailable, err)
 		}
 		entries = append(entries, entry)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list audit: %w", err)
+		return nil, fmt.Errorf("%w: list audit: %v", ErrStoreUnavailable, err)
 	}
 	return entries, nil
 }
@@ -530,14 +530,14 @@ func (s *ClickHouseStore) RecordRejected(ctx context.Context, meta Mutation, act
 func (s *ClickHouseStore) insert(ctx context.Context, table string, columns []string, values []any) error {
 	batch, err := s.conn.PrepareBatch(ctx, "INSERT INTO "+table+" ("+strings.Join(columns, ", ")+")")
 	if err != nil {
-		return fmt.Errorf("prepare %s insert: %w", table, err)
+		return fmt.Errorf("%w: prepare %s insert: %v", ErrStoreUnavailable, table, err)
 	}
 	if err := batch.Append(values...); err != nil {
 		_ = batch.Abort()
-		return fmt.Errorf("append %s row: %w", table, err)
+		return fmt.Errorf("%w: append %s row: %v", ErrStoreUnavailable, table, err)
 	}
 	if err := batch.Send(); err != nil {
-		return fmt.Errorf("insert %s row: %w", table, err)
+		return fmt.Errorf("%w: insert %s row: %v", ErrStoreUnavailable, table, err)
 	}
 	return nil
 }
@@ -556,7 +556,9 @@ func (s *ClickHouseStore) newRevision() (uuid.UUID, time.Time, error) {
 
 func (s *ClickHouseStore) auditFailure(ctx context.Context, meta Mutation, action, resourceType, resourceID string, version uint64, outcome, detail string, cause error) error {
 	if err := s.recordAudit(ctx, meta, action, resourceType, resourceID, version, outcome, detail); err != nil {
-		return fmt.Errorf("%w (audit record failed: %v)", cause, err)
+		// The audit trail is part of the contract: an attempt that cannot be
+		// recorded must not be reported with a logical outcome.
+		return fmt.Errorf("record audit for %s %q: %w", resourceType, resourceID, err)
 	}
 	return cause
 }

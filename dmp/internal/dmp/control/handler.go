@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/observability"
 )
+
+const adminPrefix = "/admin/v1"
 
 // HandlerOptions binds the admin surface to one tenant and one bearer token.
 type HandlerOptions struct {
@@ -24,26 +27,16 @@ type HandlerOptions struct {
 
 // NewHandler returns the DMP management API: versioned definitions behind a
 // tenant-scoped bearer token. An unconfigured token disables the whole surface
-// rather than exposing unauthenticated writes.
+// rather than exposing unauthenticated writes. Routing is explicit so unknown
+// paths and unsupported methods answer with the same JSON error envelope as the
+// rest of the API instead of net/http's plain-text defaults.
 func NewHandler(opts HandlerOptions) http.Handler {
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 	h := &handler{store: opts.Store, token: opts.Token, actor: opts.Actor, logger: logger}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /admin/v1/namespaces", h.listNamespaces)
-	mux.HandleFunc("POST /admin/v1/namespaces", h.createNamespace)
-	mux.HandleFunc("PUT /admin/v1/namespaces/{id}", h.updateNamespace)
-	mux.HandleFunc("GET /admin/v1/providers", h.listProviders)
-	mux.HandleFunc("POST /admin/v1/providers", h.createProvider)
-	mux.HandleFunc("PUT /admin/v1/providers/{id}", h.updateProvider)
-	mux.HandleFunc("GET /admin/v1/segments", h.listSegments)
-	mux.HandleFunc("POST /admin/v1/segments", h.createSegment)
-	mux.HandleFunc("PUT /admin/v1/segments/{id}", h.updateSegment)
-	mux.HandleFunc("GET /admin/v1/audit", h.listAudit)
-	return h.authenticate(mux)
+	return h.authenticate(h)
 }
 
 type handler struct {
@@ -51,6 +44,47 @@ type handler struct {
 	token  string
 	actor  string
 	logger *slog.Logger
+}
+
+func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, adminPrefix), "/")
+	if path == "audit" {
+		if r.Method != http.MethodGet {
+			h.methodNotAllowed(w, r, http.MethodGet)
+			return
+		}
+		h.listAudit(w, r)
+		return
+	}
+
+	parts := strings.Split(path, "/")
+	if path == "" || parts[0] == "" || len(parts) > 2 || (len(parts) == 2 && parts[1] == "") {
+		h.notFound(w, r)
+		return
+	}
+	collection := parts[0]
+	if collection != "namespaces" && collection != "providers" && collection != "segments" {
+		h.notFound(w, r)
+		return
+	}
+
+	if len(parts) == 1 {
+		switch r.Method {
+		case http.MethodGet:
+			h.list(w, r, collection)
+		case http.MethodPost:
+			h.create(w, r, collection)
+		default:
+			h.methodNotAllowed(w, r, http.MethodGet, http.MethodPost)
+		}
+		return
+	}
+
+	if r.Method != http.MethodPut {
+		h.methodNotAllowed(w, r, http.MethodPut)
+		return
+	}
+	h.update(w, r, collection, parts[1])
 }
 
 func (h *handler) authenticate(next http.Handler) http.Handler {
@@ -75,157 +109,135 @@ func (h *handler) authenticate(next http.Handler) http.Handler {
 	})
 }
 
-func (h *handler) listNamespaces(w http.ResponseWriter, r *http.Request) {
-	items, err := h.store.ListNamespaces(r.Context())
-	if err != nil {
-		h.fail(w, r, err)
-		return
+func (h *handler) list(w http.ResponseWriter, r *http.Request, collection string) {
+	switch collection {
+	case "namespaces":
+		namespaces, err := h.store.ListNamespaces(r.Context())
+		if err != nil {
+			h.fail(w, r, "namespace", "", err)
+			return
+		}
+		if namespaces == nil {
+			namespaces = []Namespace{}
+		}
+		writeJSON(w, http.StatusOK, namespaces)
+	case "providers":
+		providers, err := h.store.ListProviders(r.Context())
+		if err != nil {
+			h.fail(w, r, "provider", "", err)
+			return
+		}
+		if providers == nil {
+			providers = []Provider{}
+		}
+		writeJSON(w, http.StatusOK, providers)
+	case "segments":
+		segments, err := h.store.ListSegments(r.Context())
+		if err != nil {
+			h.fail(w, r, "segment", "", err)
+			return
+		}
+		if segments == nil {
+			segments = []Segment{}
+		}
+		writeJSON(w, http.StatusOK, segments)
 	}
-	if items == nil {
-		items = []Namespace{}
-	}
-	writeJSON(w, http.StatusOK, items)
 }
 
-func (h *handler) createNamespace(w http.ResponseWriter, r *http.Request) {
-	var input NamespaceInput
-	if !decode(w, r, &input) {
-		return
+func (h *handler) create(w http.ResponseWriter, r *http.Request, collection string) {
+	switch collection {
+	case "namespaces":
+		var input NamespaceInput
+		if !decode(w, r, &input) {
+			return
+		}
+		if err := input.Validate(); err != nil {
+			h.reject(w, r, ActionCreate, "namespace", input.ID, err)
+			return
+		}
+		created, err := h.store.CreateNamespace(r.Context(), input, h.mutation(r))
+		h.respond(w, r, "namespace", input.ID, http.StatusCreated, created, err)
+	case "providers":
+		var input ProviderInput
+		if !decode(w, r, &input) {
+			return
+		}
+		if err := input.Validate(); err != nil {
+			h.reject(w, r, ActionCreate, "provider", input.ID, err)
+			return
+		}
+		created, err := h.store.CreateProvider(r.Context(), input, h.mutation(r))
+		h.respond(w, r, "provider", input.ID, http.StatusCreated, created, err)
+	case "segments":
+		var input SegmentInput
+		if !decode(w, r, &input) {
+			return
+		}
+		if err := input.Validate(); err != nil {
+			h.reject(w, r, ActionCreate, "segment", input.ID, err)
+			return
+		}
+		created, err := h.store.CreateSegment(r.Context(), input, h.mutation(r))
+		h.respond(w, r, "segment", input.ID, http.StatusCreated, created, err)
 	}
-	if err := input.Validate(); err != nil {
-		h.reject(w, r, err)
-		return
-	}
-	created, err := h.store.CreateNamespace(r.Context(), input, h.mutation(r))
-	if err != nil {
-		h.fail(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, created)
 }
 
-func (h *handler) updateNamespace(w http.ResponseWriter, r *http.Request) {
-	var input NamespaceInput
-	if !decode(w, r, &input) {
-		return
+func (h *handler) update(w http.ResponseWriter, r *http.Request, collection, id string) {
+	switch collection {
+	case "namespaces":
+		var input NamespaceInput
+		if !decode(w, r, &input) {
+			return
+		}
+		input.ID = id
+		if !h.checkVersion(w, r, ActionUpdate, "namespace", id, input.Version) {
+			return
+		}
+		if err := input.Validate(); err != nil {
+			h.reject(w, r, ActionUpdate, "namespace", id, err)
+			return
+		}
+		updated, err := h.store.UpdateNamespace(r.Context(), id, input, h.mutation(r))
+		h.respond(w, r, "namespace", id, http.StatusOK, updated, err)
+	case "providers":
+		var input ProviderInput
+		if !decode(w, r, &input) {
+			return
+		}
+		input.ID = id
+		if !h.checkVersion(w, r, ActionUpdate, "provider", id, input.Version) {
+			return
+		}
+		if err := input.Validate(); err != nil {
+			h.reject(w, r, ActionUpdate, "provider", id, err)
+			return
+		}
+		updated, err := h.store.UpdateProvider(r.Context(), id, input, h.mutation(r))
+		h.respond(w, r, "provider", id, http.StatusOK, updated, err)
+	case "segments":
+		var input SegmentInput
+		if !decode(w, r, &input) {
+			return
+		}
+		input.ID = id
+		if !h.checkVersion(w, r, ActionUpdate, "segment", id, input.Version) {
+			return
+		}
+		if err := input.Validate(); err != nil {
+			h.reject(w, r, ActionUpdate, "segment", id, err)
+			return
+		}
+		updated, err := h.store.UpdateSegment(r.Context(), id, input, h.mutation(r))
+		h.respond(w, r, "segment", id, http.StatusOK, updated, err)
 	}
-	input.ID = r.PathValue("id")
-	if input.Version == 0 {
-		h.reject(w, r, errors.New("version is required"))
-		return
-	}
-	if err := input.Validate(); err != nil {
-		h.reject(w, r, err)
-		return
-	}
-	updated, err := h.store.UpdateNamespace(r.Context(), input.ID, input, h.mutation(r))
-	if err != nil {
-		h.fail(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, updated)
 }
 
-func (h *handler) listProviders(w http.ResponseWriter, r *http.Request) {
-	items, err := h.store.ListProviders(r.Context())
-	if err != nil {
-		h.fail(w, r, err)
-		return
+func (h *handler) checkVersion(w http.ResponseWriter, r *http.Request, action, resourceType, resourceID string, version uint64) bool {
+	if version != 0 {
+		return true
 	}
-	if items == nil {
-		items = []Provider{}
-	}
-	writeJSON(w, http.StatusOK, items)
-}
-
-func (h *handler) createProvider(w http.ResponseWriter, r *http.Request) {
-	var input ProviderInput
-	if !decode(w, r, &input) {
-		return
-	}
-	if err := input.Validate(); err != nil {
-		h.reject(w, r, err)
-		return
-	}
-	created, err := h.store.CreateProvider(r.Context(), input, h.mutation(r))
-	if err != nil {
-		h.fail(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, created)
-}
-
-func (h *handler) updateProvider(w http.ResponseWriter, r *http.Request) {
-	var input ProviderInput
-	if !decode(w, r, &input) {
-		return
-	}
-	input.ID = r.PathValue("id")
-	if input.Version == 0 {
-		h.reject(w, r, errors.New("version is required"))
-		return
-	}
-	if err := input.Validate(); err != nil {
-		h.reject(w, r, err)
-		return
-	}
-	updated, err := h.store.UpdateProvider(r.Context(), input.ID, input, h.mutation(r))
-	if err != nil {
-		h.fail(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, updated)
-}
-
-func (h *handler) listSegments(w http.ResponseWriter, r *http.Request) {
-	items, err := h.store.ListSegments(r.Context())
-	if err != nil {
-		h.fail(w, r, err)
-		return
-	}
-	if items == nil {
-		items = []Segment{}
-	}
-	writeJSON(w, http.StatusOK, items)
-}
-
-func (h *handler) createSegment(w http.ResponseWriter, r *http.Request) {
-	var input SegmentInput
-	if !decode(w, r, &input) {
-		return
-	}
-	if err := input.Validate(); err != nil {
-		h.reject(w, r, err)
-		return
-	}
-	created, err := h.store.CreateSegment(r.Context(), input, h.mutation(r))
-	if err != nil {
-		h.fail(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, created)
-}
-
-func (h *handler) updateSegment(w http.ResponseWriter, r *http.Request) {
-	var input SegmentInput
-	if !decode(w, r, &input) {
-		return
-	}
-	input.ID = r.PathValue("id")
-	if input.Version == 0 {
-		h.reject(w, r, errors.New("version is required"))
-		return
-	}
-	if err := input.Validate(); err != nil {
-		h.reject(w, r, err)
-		return
-	}
-	updated, err := h.store.UpdateSegment(r.Context(), input.ID, input, h.mutation(r))
-	if err != nil {
-		h.fail(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, updated)
+	h.reject(w, r, action, resourceType, resourceID, errors.New("version is required"))
+	return false
 }
 
 func (h *handler) listAudit(w http.ResponseWriter, r *http.Request) {
@@ -244,7 +256,7 @@ func (h *handler) listAudit(w http.ResponseWriter, r *http.Request) {
 		Limit:        limit,
 	})
 	if err != nil {
-		h.fail(w, r, err)
+		h.fail(w, r, "audit", "", err)
 		return
 	}
 	if entries == nil {
@@ -253,15 +265,23 @@ func (h *handler) listAudit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, entries)
 }
 
+func (h *handler) respond(w http.ResponseWriter, r *http.Request, resourceType, resourceID string, status int, value any, err error) {
+	if err != nil {
+		h.fail(w, r, resourceType, resourceID, err)
+		return
+	}
+	writeJSON(w, status, value)
+}
+
 func (h *handler) mutation(r *http.Request) Mutation {
 	return Mutation{Actor: h.actor, RequestID: observability.RequestIDFromContext(r.Context())}
 }
 
-func (h *handler) reject(w http.ResponseWriter, r *http.Request, err error) {
+func (h *handler) reject(w http.ResponseWriter, r *http.Request, action, resourceType, resourceID string, err error) {
 	if !errors.Is(err, ErrInvalidDefinition) {
-		err = errors.Join(ErrInvalidDefinition, err)
+		err = fmt.Errorf("%w: %s", ErrInvalidDefinition, err)
 	}
-	if auditErr := h.store.RecordRejected(r.Context(), h.mutation(r), actionFor(r.Method), resourceTypeFor(r.URL.Path), r.PathValue("id"), err.Error()); auditErr != nil {
+	if auditErr := h.store.RecordRejected(r.Context(), h.mutation(r), action, resourceType, resourceID, err.Error()); auditErr != nil {
 		h.logger.Warn("DMP control plane rejection could not be audited",
 			slog.String("request_id", observability.RequestIDFromContext(r.Context())),
 			slog.Any("error", auditErr))
@@ -269,25 +289,7 @@ func (h *handler) reject(w http.ResponseWriter, r *http.Request, err error) {
 	writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusUnprocessableEntity, "invalid_definition", err.Error())
 }
 
-func actionFor(method string) string {
-	if method == http.MethodPost {
-		return ActionCreate
-	}
-	return ActionUpdate
-}
-
-func resourceTypeFor(path string) string {
-	switch {
-	case strings.Contains(path, "/namespaces"):
-		return "namespace"
-	case strings.Contains(path, "/providers"):
-		return "provider"
-	default:
-		return "segment"
-	}
-}
-
-func (h *handler) fail(w http.ResponseWriter, r *http.Request, err error) {
+func (h *handler) fail(w http.ResponseWriter, r *http.Request, resourceType, resourceID string, err error) {
 	requestID := observability.RequestIDFromContext(r.Context())
 	switch {
 	case errors.Is(err, ErrVersionConflict):
@@ -300,6 +302,13 @@ func (h *handler) fail(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, requestID, http.StatusUnprocessableEntity, "immutable_field", err.Error())
 	case errors.Is(err, ErrInvalidDefinition):
 		writeError(w, requestID, http.StatusUnprocessableEntity, "invalid_definition", err.Error())
+	case errors.Is(err, ErrStoreUnavailable):
+		h.logger.Error("DMP control plane store unavailable",
+			slog.String("request_id", requestID),
+			slog.String("resource_type", resourceType),
+			slog.String("resource_id", resourceID),
+			slog.Any("error", err))
+		writeError(w, requestID, http.StatusServiceUnavailable, "control_plane_unavailable", "DMP definition store is unavailable")
 	default:
 		h.logger.Error("DMP control plane request failed",
 			slog.String("request_id", requestID),
@@ -307,6 +316,15 @@ func (h *handler) fail(w http.ResponseWriter, r *http.Request, err error) {
 			slog.Any("error", err))
 		writeError(w, requestID, http.StatusInternalServerError, "internal_error", "request could not be completed")
 	}
+}
+
+func (h *handler) notFound(w http.ResponseWriter, r *http.Request) {
+	writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusNotFound, "not_found", "unknown management API path")
+}
+
+func (h *handler) methodNotAllowed(w http.ResponseWriter, r *http.Request, allowed ...string) {
+	w.Header().Set("Allow", strings.Join(allowed, ", "))
+	writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusMethodNotAllowed, "method_not_allowed", "management API method is not supported")
 }
 
 func decode(w http.ResponseWriter, r *http.Request, destination any) bool {

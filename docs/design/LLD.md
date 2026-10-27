@@ -1801,7 +1801,9 @@ PARTITION BY toYYYYMM(occurred_at)
 ORDER BY (tenant_id, occurred_at, audit_id);
 ```
 
-`dmp_segment_definition_version` 复用 000001 的表，并增加 `revision_id`、`description`。管理 API 的乐观锁语义：客户端提交当前 `version`，服务端追加 `version + 1` 后回读校验；若回读到的胜者不是本次 `revision_id`，返回 `409 version_conflict`，落败行保留为审计事实但不覆盖胜者。ClickHouse 不提供多语句事务，因此版本行与审计行不是原子写：审计写失败时接口报错，已写入的版本行保留，重试将以 409 暴露给调用方。
+`dmp_segment_definition_version` 复用 000001 的表，并增加 `revision_id`、`description`。管理 API 的乐观锁语义：客户端提交当前 `version`，服务端追加 `version + 1` 后回读校验；若回读到的胜者不是本次 `revision_id`，返回 `409 version_conflict`，落败行保留为审计事实但不覆盖胜者（同一版本可能留下多行，读到的最低 `revision_id` 恒为胜者）。ClickHouse 不提供多语句事务，因此版本行与审计行不是原子写：审计写失败时接口返回 `503 control_plane_unavailable`，已写入的版本行保留，重试将以 409 暴露给调用方；拒绝路径的审计失败只记录告警日志并保留 422 响应。
+
+存储不可用（连接失败、服务端异常或查询失败）统一映射为 `503 control_plane_unavailable`，不降级为"定义不存在"，避免调用方把故障当成可继续的默认状态。
 
 约束：token 在服务端绑定单一 tenant，请求体不携带 `tenant_id`；引用只允许指向 active 定义；`provider.namespace` 与 `segment.provider_id` 创建后不可变；`retention_months` 上限 3；管理面请求使用独立超时预算（10 s），不套用 bid 热路径 deadline。
 

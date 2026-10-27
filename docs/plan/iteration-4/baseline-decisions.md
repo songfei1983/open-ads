@@ -31,7 +31,7 @@ Iteration 4 聚焦 DMP 独立子系统与隐私门禁：先把 Provider/namespac
 
 | 任务 | 完成 | 下一步交付物 | 验收重点 |
 |---|---|---|---|
-| I4-01 | ✅ 完成 | — | 已实现 `GET/POST /admin/v1/namespaces`、`/providers`、`/segments` 与对应 `PUT`，以及 `GET /admin/v1/audit`。每次写入追加不可变版本行（`dmp_namespace_version`、`dmp_provider_version`、`dmp_segment_definition_version` 增加 `revision_id`/`description`），`version` 不匹配返回 `409 version_conflict`，重复创建返回 `409 resource_conflict`，引用非 active 或缺失返回 `422 invalid_definition`，不可变字段变更返回 `422 immutable_field`。bearer token 绑定单租户，请求体携带 `tenant_id` 被 400 拒绝。所有变更尝试写 `dmp_control_audit`。 |
+| I4-01 | ✅ 完成（已验收） | — | 已实现 `GET/POST /admin/v1/namespaces`、`/providers`、`/segments` 与对应 `PUT`，以及 `GET /admin/v1/audit`。每次写入追加不可变版本行（`dmp_namespace_version`、`dmp_provider_version`、`dmp_segment_definition_version` 增加 `revision_id`/`description`），`version` 不匹配返回 `409 version_conflict`，重复创建返回 `409 resource_conflict`，引用非 active 或缺失返回 `422 invalid_definition`，不可变字段变更返回 `422 immutable_field`。bearer token 绑定单租户，请求体携带 `tenant_id` 被 400 拒绝。所有变更尝试（含校验拒绝，带尝试的资源 ID）写 `dmp_control_audit`。未知路径/不支持方法返回 JSON `404 not_found` / `405 method_not_allowed`；存储不可用返回 `503 control_plane_unavailable`。 |
 | I4-02 | 未开始 | Snapshot 导入任务 + tokenization adapter + 完整性核验 | 拒绝原始身份输入；行数/checksum/重复率失败不替换旧版本；重跑幂等 |
 | I4-03 | 未开始 | Snapshot 发布指针 + Audience Resolve 精确键查询 | 未发布 snapshot 不可解析；固定 snapshot ID；结果数上限且不回显 token |
 | I4-04 | 未开始 | Valkey deny gate、epoch、in-flight admission/finalize、tombstone、状态 API | 撤回阻止新 admission；在途响应复核；不确定状态 fail-closed |
@@ -42,14 +42,25 @@ Iteration 4 聚焦 DMP 独立子系统与隐私门禁：先把 Provider/namespac
 
 ## 5. 验收证据（2026-10-27）
 
-- `cd dmp && go build ./... && go vet ./... && go test -race ./...` 通过。
-- ClickHouse 集成测试（`DMP_CLICKHOUSE_TEST_ADDR=127.0.0.1:9000`）覆盖：创建 → 重复创建冲突 → 引用缺失拒绝 → 不可变字段拒绝 → 乐观锁冲突 → 当前版本读取 → 审计内容与顺序。
-- 运行中的服务实测：无 token 401；创建 namespace/provider/segment 201；请求体携带 `tenant_id` 400；陈旧 `version` 409 `version_conflict`；`namespace` 变更 422 `immutable_field`；已 retired namespace 下新建 provider 422；`/admin/v1/audit` 返回 accepted 与 conflict 记录且 `request_id` 对齐。
-- 数据核对：ClickHouse 行按 `tenant_id` 隔离，审计表只保存配置的操作者标识与资源标识，未出现 bearer token 或 subject token。
+构建与自动化测试：
+- `cd dmp && gofmt -l . && go vet ./... && go test -race ./...` 通过；`console`、`ssp`、`dsp` 未受影响（build/test 通过）。
+- ClickHouse 集成测试（`DMP_CLICKHOUSE_TEST_ADDR=127.0.0.1:9000`）覆盖创建、重复创建、引用缺失、不可变字段、乐观锁冲突、当前版本读取与审计内容/顺序。
+
+运行中服务验收（`/admin/v1`，沙箱租户）：
+- 认证：无 token / 错误 token → `401 unauthenticated`。
+- 正向链路：创建 namespace → provider → segment（`valid_from` 自动填充）→ 三次 `PUT` 递增版本，均 `201/200`。
+- 契约拒绝：大写 ID、`retention_months=4`、`hashing_algorithm=sha1` → `422 invalid_definition`；请求体注入 `tenant_id`、非法 JSON、未知字段 → `400 invalid_request`；缺失 `version` → `422` 且消息单行（`invalid definition: version is required`）；`limit=999` → `400`。
+- 锁与不可变：陈旧 `version` → `409 version_conflict`；`provider.namespace` / `segment.provider_id` 变更 → `422 immutable_field`；未知资源 → `404 not_found`。
+- 并发：同版本 8 个并发 `PUT` → 恰好 1 个 `200`、7 个 `409`，当前定义为胜者内容；ClickHouse 中该版本保留 8 行，读路径按 `revision_id` 最小值稳定选中胜者。
+- 引用 fail-closed：retired provider 下新建 segment、retired namespace 下新建 provider 均 `422`。
+- 路由信封：`/admin/v1`、`/admin/v1/`、未知集合 → JSON `404`；`DELETE` 集合/成员 → JSON `405` + `Allow`。
+- 存储故障：停止 ClickHouse 后读写均 `503 control_plane_unavailable`；恢复 ClickHouse 后无需重启服务即回到 `200/201`。
+- 审计：accepted/conflict/not_found/rejected 全部入库，`request_id` 与响应一致；校验拒绝记录携带尝试的资源 ID；ClickHouse 与容器日志中均无 bearer token（grep 计数为 0）。
 
 ## 6. 风险与未决
 
-1. ClickHouse 无事务：版本行与审计行不是原子写。审计写失败时接口返回 500，已写入的版本行保留；重试会得到 409，需要按审计缺失人工核对。
-2. D-10 未关闭：精确 subject 查询与物理删除的拓扑级目标仍待 I4-07 POC 复测。
-3. 管理面认证仍是共享 bearer token（sandbox）。生产态需按 D-01 切换为 mTLS workload identity + 按调用方授权。
-4. I4-02 起必须在写入前拒绝原始身份；当前控制面只接受定义元数据，不接触 subject token。
+1. ClickHouse 无事务：版本行与审计行不是原子写。变更路径的审计写失败映射为 `503`，已写入的版本行保留，重试会得到 409，需要按审计缺失人工核对；校验拒绝路径的审计失败只记录告警并保留 422，存在少量未审计的拒绝记录。
+2. 同版本并发写会保留多行（只有 `revision_id` 最小者为胜者），版本表会积累落败行；需要时可后续以受控 mutation 清理同一版本的落败行。
+3. D-10 未关闭：精确 subject 查询与物理删除的拓扑级目标仍待 I4-07 POC 复测。
+4. 管理面认证仍是共享 bearer token（sandbox）。生产态需按 D-01 切换为 mTLS workload identity + 按调用方授权。
+5. I4-02 起必须在写入前拒绝原始身份；当前控制面只接受定义元数据，不接触 subject token。

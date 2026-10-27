@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -35,6 +36,11 @@ const (
 	OutcomeRejected = "rejected"
 	OutcomeNotFound = "not_found"
 )
+
+// ErrStoreUnavailable reports that the definition store could not serve the
+// request. Callers must treat it as a temporary outage, not as "resource
+// missing", and never fall back to unvalidated defaults.
+var ErrStoreUnavailable = errors.New("definition store unavailable")
 
 // AuditQuery filters the audit trail to one resource when set.
 type AuditQuery struct {

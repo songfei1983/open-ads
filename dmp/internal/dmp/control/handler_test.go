@@ -592,3 +592,67 @@ func TestListReturnsEmptyArrays(t *testing.T) {
 }
 
 var _ control.Store = (*memoryStore)(nil)
+
+func TestRejectedAttemptAuditsTheAttemptedResource(t *testing.T) {
+	ts, store := newTestServer(t, newMemoryStore())
+
+	status, payload := call(t, ts, http.MethodPost, "/admin/v1/namespaces",
+		`{"id":"ns-retention","display_name":"x","hashing_algorithm":"hmac-sha256","subject_key_version":1,"retention_months":4}`)
+	if status != http.StatusUnprocessableEntity || payload["code"] != "invalid_definition" {
+		t.Fatalf("expected validation failure, got %d %v", status, payload)
+	}
+	if message, _ := payload["message"].(string); strings.Contains(message, "\n") {
+		t.Fatalf("validation message must stay on one line: %q", message)
+	}
+
+	var rejected *control.AuditEntry
+	for i := range store.auditEntries() {
+		entry := store.auditEntries()[i]
+		if entry.Outcome == control.OutcomeRejected {
+			rejected = &entry
+		}
+	}
+	if rejected == nil {
+		t.Fatal("validation rejection was not audited")
+	}
+	if rejected.ResourceID != "ns-retention" || rejected.ResourceType != "namespace" || rejected.Action != control.ActionCreate {
+		t.Fatalf("rejected attempt lost its resource binding: %+v", rejected)
+	}
+}
+
+func TestAdminRoutingUsesTheErrorEnvelope(t *testing.T) {
+	ts, _ := newTestServer(t, newMemoryStore())
+
+	status, payload := call(t, ts, http.MethodGet, "/admin/v1/unknown", "")
+	if status != http.StatusNotFound || payload["code"] != "not_found" {
+		t.Fatalf("unknown path should be 404 not_found, got %d %v", status, payload)
+	}
+
+	status, payload = call(t, ts, http.MethodDelete, "/admin/v1/namespaces/ns-1", "")
+	if status != http.StatusMethodNotAllowed || payload["code"] != "method_not_allowed" {
+		t.Fatalf("unsupported method should be 405 method_not_allowed, got %d %v", status, payload)
+	}
+
+	status, payload = call(t, ts, http.MethodGet, "/admin/v1", "")
+	if status != http.StatusNotFound || payload["code"] != "not_found" {
+		t.Fatalf("collection root should be 404, got %d %v", status, payload)
+	}
+}
+
+// unavailableStore fails every call the way the ClickHouse store does when the
+// database is unreachable.
+type unavailableStore struct {
+	control.Store
+}
+
+func (unavailableStore) ListNamespaces(context.Context) ([]control.Namespace, error) {
+	return nil, fmt.Errorf("%w: connection refused", control.ErrStoreUnavailable)
+}
+
+func TestStoreOutageIsReportedAsUnavailable(t *testing.T) {
+	ts, _ := newTestServer(t, unavailableStore{})
+	status, payload := call(t, ts, http.MethodGet, "/admin/v1/namespaces", "")
+	if status != http.StatusServiceUnavailable || payload["code"] != "control_plane_unavailable" {
+		t.Fatalf("store outage should be 503 control_plane_unavailable, got %d %v", status, payload)
+	}
+}
