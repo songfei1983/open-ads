@@ -25,6 +25,8 @@ type SnapshotService interface {
 	GetJob(ctx context.Context, snapshotID string) (snapshot.Job, error)
 	AppendRows(ctx context.Context, snapshotID string, rows []snapshot.MemberRow) (snapshot.AppendResult, error)
 	Verify(ctx context.Context, snapshotID string) (snapshot.Job, error)
+	Publish(ctx context.Context, snapshotID string) (snapshot.Job, error)
+	Resolve(ctx context.Context, input snapshot.ResolveInput) (snapshot.ResolveResult, error)
 }
 
 // HandlerOptions carries the trusted-adapter dependency set.
@@ -84,6 +86,18 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.verifySnapshot(w, r, parts[1])
+	case len(parts) == 3 && parts[0] == "snapshots" && parts[2] == "publish":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, r, http.MethodPost)
+			return
+		}
+		h.publishSnapshot(w, r, parts[1])
+	case path == "audiences:resolve":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, r, http.MethodPost)
+			return
+		}
+		h.resolveAudience(w, r)
 	default:
 		notFound(w, r)
 	}
@@ -92,8 +106,14 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *handler) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID := observability.RequestIDFromContext(r.Context())
-		if h.token == "" || h.snapshots == nil {
+		if h.snapshots == nil || (h.token == "" && !isResolvePath(r.URL.Path)) {
 			writeError(w, requestID, http.StatusServiceUnavailable, "internal_api_unconfigured", "DMP internal API is not configured")
+			return
+		}
+		if isResolvePath(r.URL.Path) {
+			// Sandbox profile: the resolve path is called by SSP without a
+			// workload identity. D-01 replaces this with mTLS authorization.
+			next.ServeHTTP(w, r)
 			return
 		}
 		authorization := r.Header.Get("Authorization")
@@ -109,6 +129,10 @@ func (h *handler) authenticate(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isResolvePath(path string) bool {
+	return strings.Trim(strings.TrimPrefix(path, "/internal/v1"), "/") == "audiences:resolve"
 }
 
 func (h *handler) createSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -178,6 +202,37 @@ func (h *handler) verifySnapshot(w http.ResponseWriter, r *http.Request, id stri
 	writeJSON(w, http.StatusOK, job)
 }
 
+func (h *handler) publishSnapshot(w http.ResponseWriter, r *http.Request, id string) {
+	job, err := h.snapshots.Publish(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, snapshot.ErrVerification) {
+			writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusUnprocessableEntity, "verification_failed", err.Error())
+			return
+		}
+		h.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
+}
+
+func (h *handler) resolveAudience(w http.ResponseWriter, r *http.Request) {
+	var input snapshot.ResolveInput
+	if !decode(w, r, &input) {
+		return
+	}
+	input.RequestID = observability.RequestIDFromContext(r.Context())
+	result, err := h.snapshots.Resolve(r.Context(), input)
+	if err != nil {
+		if errors.Is(err, snapshot.ErrNoPublication) {
+			writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusServiceUnavailable, "no_published_snapshot", "no published snapshot serves this provider/namespace")
+			return
+		}
+		h.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 func (h *handler) fail(w http.ResponseWriter, r *http.Request, err error) {
 	requestID := observability.RequestIDFromContext(r.Context())
 	switch {
@@ -186,6 +241,8 @@ func (h *handler) fail(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, snapshot.ErrJobNotFound):
 		writeError(w, requestID, http.StatusNotFound, "not_found", "snapshot import job not found")
 	case errors.Is(err, snapshot.ErrJobState):
+		writeError(w, requestID, http.StatusConflict, "invalid_state", err.Error())
+	case errors.Is(err, snapshot.ErrNotVerified):
 		writeError(w, requestID, http.StatusConflict, "invalid_state", err.Error())
 	case errors.Is(err, snapshot.ErrNoPublication):
 		writeError(w, requestID, http.StatusNotFound, "not_found", "no published snapshot for this provider/namespace")

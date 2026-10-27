@@ -3,6 +3,7 @@ package http_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,7 +14,7 @@ import (
 
 	adapterHTTP "github.com/songfei1983/open-ads/dmp/internal/dmp/adapter/http"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/config"
-	"github.com/songfei1983/open-ads/dmp/internal/dmp/control"
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/snapshot"
 )
 
 func newTestServer() *adapterHTTP.Server {
@@ -78,127 +79,96 @@ func TestReadyz(t *testing.T) {
 	}
 }
 
-func TestAudienceResolveEndpoint(t *testing.T) {
+func TestInternalAPIIsDelegatedToTheInternalHandler(t *testing.T) {
 	srv := newTestServer()
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	body := strings.NewReader(`{"namespace":"publisher-account-v1","subject_token":"tok-123"}`)
-	req, _ := http.NewRequest("POST", ts.URL+"/internal/v1/audiences:resolve", body)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Request-ID", "018f7a3b2c9d7e1fa3b4c5d6e7f89070")
-
-	resp, err := http.DefaultClient.Do(req)
+	// Without a configured internal token or snapshot store the internal API
+	// answers 503 instead of pretending to resolve audiences.
+	resp, err := http.Post(ts.URL+"/internal/v1/audiences:resolve", "application/json",
+		strings.NewReader(`{"namespace":"publisher-account-v1","subject_token":"`+strings.Repeat("ab", 32)+`"}`))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("expected 200 OK, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("unconfigured internal API should be 503, got %d", resp.StatusCode)
 	}
-
-	var res map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		t.Fatalf("failed to decode json: %v", err)
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
 	}
-	if res["request_id"] != "018f7a3b2c9d7e1fa3b4c5d6e7f89070" {
-		t.Errorf("expected request_id to be echoed, got %v", res["request_id"])
-	}
-}
-
-func TestIdentityRevokeEndpoint(t *testing.T) {
-	srv := newTestServer()
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-
-	body := strings.NewReader(`{"namespace":"publisher-account-v1"}`)
-	req, _ := http.NewRequest("POST", ts.URL+"/internal/v1/identity:revoke", body)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Request-ID", "018f7a3b2c9d7e1fa3b4c5d6e7f89071")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Errorf("expected 501 Not Implemented, got %d", resp.StatusCode)
+	if body["code"] != "internal_api_unconfigured" {
+		t.Fatalf("unexpected error code: %v", body)
 	}
 }
 
-// slowListStore proves the admin route is not bound by the bid-path deadline,
-// which defaults to a few milliseconds and would cancel any ClickHouse write.
-type slowListStore struct {
-	control.Store
+// slowSnapshotService proves internal API routes are not bound by the bid-path
+// deadline, which is a few milliseconds and would cancel any ClickHouse read.
+type slowSnapshotService struct {
 	delay time.Duration
 }
 
-func (s slowListStore) ListNamespaces(ctx context.Context) ([]control.Namespace, error) {
+func (s slowSnapshotService) CreateJob(context.Context, snapshot.CreateJobInput) (snapshot.Job, error) {
+	return snapshot.Job{}, errors.New("not used")
+}
+
+func (s slowSnapshotService) GetJob(context.Context, string) (snapshot.Job, error) {
+	return snapshot.Job{}, errors.New("not used")
+}
+
+func (s slowSnapshotService) AppendRows(context.Context, string, []snapshot.MemberRow) (snapshot.AppendResult, error) {
+	return snapshot.AppendResult{}, errors.New("not used")
+}
+
+func (s slowSnapshotService) Verify(context.Context, string) (snapshot.Job, error) {
+	return snapshot.Job{}, errors.New("not used")
+}
+
+func (s slowSnapshotService) Publish(context.Context, string) (snapshot.Job, error) {
+	return snapshot.Job{}, errors.New("not used")
+}
+
+func (s slowSnapshotService) Resolve(context.Context, snapshot.ResolveInput) (snapshot.ResolveResult, error) {
+	return snapshot.ResolveResult{}, errors.New("not used")
+}
+
+func (s slowSnapshotService) ListJobs(ctx context.Context) ([]snapshot.Job, error) {
 	select {
 	case <-time.After(s.delay):
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	return []control.Namespace{}, nil
+	return []snapshot.Job{}, nil
 }
 
-func TestAdminSurfaceIsWiredWithItsOwnBudget(t *testing.T) {
+func TestInternalAPIHasItsOwnBudget(t *testing.T) {
 	cfg := &config.Config{
 		ServiceName:    "test-dmp",
 		Port:           8082,
 		RequestTimeout: time.Millisecond,
-		AdminToken:     "dmp-admin-token-0123456789abcdef",
-		AdminTenantID:  "00000000000000000000000000000001",
+		InternalToken:  "dmp-internal-token-0123456789abcdef",
 		AdminActor:     "sandbox-operator",
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := adapterHTTP.NewServer(cfg, logger, adapterHTTP.WithControlStore(slowListStore{delay: 30 * time.Millisecond}))
+	srv := adapterHTTP.NewServer(cfg, logger, adapterHTTP.WithSnapshotService(slowSnapshotService{delay: 30 * time.Millisecond}))
 	srv.SetReady(true)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	unauthorized, err := http.Get(ts.URL + "/admin/v1/namespaces")
+	request, err := http.NewRequest(http.MethodGet, ts.URL+"/internal/v1/snapshots", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	unauthorized.Body.Close()
-	if unauthorized.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("missing token should be 401, got %d", unauthorized.StatusCode)
-	}
-
-	request, err := http.NewRequest(http.MethodGet, ts.URL+"/admin/v1/namespaces", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Header.Set("Authorization", "Bearer "+cfg.AdminToken)
+	request.Header.Set("Authorization", "Bearer "+cfg.InternalToken)
 	response, err := ts.Client().Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		t.Fatalf("admin request should outlive the bid-path deadline, got %d", response.StatusCode)
-	}
-}
-
-func TestAdminSurfaceDisabledWithoutToken(t *testing.T) {
-	srv := newTestServer()
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-
-	request, err := http.NewRequest(http.MethodGet, ts.URL+"/admin/v1/namespaces", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Header.Set("Authorization", "Bearer any-token-any-token-any-token-1")
-	response, err := ts.Client().Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("unconfigured admin surface should be 503, got %d", response.StatusCode)
+		t.Fatalf("internal API request should outlive the bid-path deadline, got %d", response.StatusCode)
 	}
 }

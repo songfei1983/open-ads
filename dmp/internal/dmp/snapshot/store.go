@@ -59,7 +59,7 @@ func (s *Store) CreateJob(ctx context.Context, input CreateJobInput) (Job, error
 		return Job{}, err
 	}
 	job := Job{
-		SnapshotID:       raw,
+		SnapshotID:       snapshotID.String(),
 		ProviderID:       input.ProviderID,
 		Namespace:        input.Namespace,
 		SchemaVersion:    input.SchemaVersion,

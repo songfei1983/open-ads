@@ -2,11 +2,8 @@ package http
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -21,9 +18,9 @@ import (
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/snapshot"
 )
 
-// adminRequestTimeout bounds management API requests, which write to ClickHouse
-// and therefore cannot use the bid-path deadline.
-const adminRequestTimeout = 10 * time.Second
+// managementRequestTimeout bounds management and internal API requests, which
+// read or write ClickHouse and therefore cannot use the bid-path deadline.
+const managementRequestTimeout = 10 * time.Second
 
 // Server wraps the standard library http.Server for DMP.
 type Server struct {
@@ -33,7 +30,7 @@ type Server struct {
 	metrics   *observability.Metrics
 	isReady   atomic.Bool
 	control   control.Store
-	snapshots *snapshot.Store
+	snapshots internalapi.SnapshotService
 }
 
 // Option customizes the server at construction time.
@@ -47,7 +44,17 @@ func WithControlStore(store control.Store) Option {
 
 // WithSnapshotStore attaches the snapshot import/verification store.
 func WithSnapshotStore(store *snapshot.Store) Option {
-	return func(s *Server) { s.snapshots = store }
+	return func(s *Server) {
+		if store != nil {
+			s.snapshots = store
+		}
+	}
+}
+
+// WithSnapshotService attaches an arbitrary snapshot service, used by tests and
+// by alternative store implementations.
+func WithSnapshotService(service internalapi.SnapshotService) Option {
+	return func(s *Server) { s.snapshots = service }
 }
 
 // NewServer initializes the HTTP server with router, middlewares, and probes.
@@ -94,16 +101,14 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.HandleFunc("GET /metrics", s.metrics.Handler)
-	mux.HandleFunc("POST /internal/v1/audiences:resolve", s.handleAudienceResolve)
-	mux.HandleFunc("POST /internal/v1/identity:revoke", s.handleIdentityRevoke)
 
 	internalHandler := internalapi.NewHandler(internalapi.HandlerOptions{
 		Token:     s.cfg.InternalToken,
 		Snapshots: s.snapshots,
 		Logger:    s.logger,
 	})
-	mux.Handle("/internal/v1/snapshots", internalHandler)
-	mux.Handle("/internal/v1/snapshots/", internalHandler)
+	mux.Handle("/internal/v1/", internalHandler)
+	mux.Handle("/internal/v1", internalHandler)
 
 	controlHandler := control.NewHandler(control.HandlerOptions{
 		Store:  s.control,
@@ -134,82 +139,6 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		"status":         "ready",
 		"service":        s.cfg.ServiceName,
 		"config_version": s.cfg.ConfigVersion,
-	})
-}
-
-// audienceResolveMessage mirrors the internal resolve API request; only
-// server-declared fields are accepted (fail-closed decoding).
-type audienceResolveMessage struct {
-	RequestID    string   `json:"request_id"`
-	TenantID     string   `json:"tenant_id"`
-	ProviderID   string   `json:"provider_id"`
-	Namespace    string   `json:"namespace"`
-	SubjectToken string   `json:"subject_token"`
-	Purposes     []string `json:"purposes"`
-	MaxSegments  int      `json:"max_segments"`
-}
-
-// sandboxResolvedSegment is a documented demo-only interest segment returned
-// for the well-known sandbox consent token. Production resolution must come
-// from membership snapshots, never from this stub path.
-type sandboxResolvedSegment struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-}
-
-// sandboxFixtureSubjectToken is the token the console UI sends when the user
-// opts in; other tokens resolve no segments.
-const sandboxFixtureSubjectToken = "sandbox-consent-demo-01"
-
-func (s *Server) handleAudienceResolve(w http.ResponseWriter, r *http.Request) {
-	reqID := observability.RequestIDFromContext(r.Context())
-	var req audienceResolveMessage
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
-	if err != nil || len(body) == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "invalid_request", "message": "invalid audience resolve request", "request_id": reqID})
-		return
-	}
-	dec := json.NewDecoder(strings.NewReader(string(body)))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "invalid_request", "message": "invalid audience resolve request", "request_id": reqID})
-		return
-	}
-
-	// Audit without ever persisting the raw subject token.
-	digest := sha256.Sum256([]byte(req.SubjectToken))
-	subjectHash := hex.EncodeToString(digest[:8])
-	segments := []sandboxResolvedSegment{}
-	if req.SubjectToken == sandboxFixtureSubjectToken {
-		segments = []sandboxResolvedSegment{
-			{ID: "seg-demo-sports", Name: "演示 · 运动爱好者"},
-			{ID: "seg-demo-tech", Name: "演示 · 数码科技"},
-		}
-	}
-	if req.MaxSegments > 0 && len(segments) > req.MaxSegments {
-		segments = segments[:req.MaxSegments]
-	}
-	s.logger.Info("audience resolve", slog.String("request_id", reqID),
-		slog.String("subject_hash", subjectHash), slog.Int("segments", len(segments)))
-
-	// Standard resolve response matching API.md
-	writeJSON(w, http.StatusOK, map[string]any{
-		"request_id":  reqID,
-		"snapshot_id": "snap-sandbox-fixture",
-		"provider_id": req.ProviderID,
-		"segments":    segments,
-		"resolved_at": time.Now().UTC().Format(time.RFC3339),
-	})
-}
-
-func (s *Server) handleIdentityRevoke(w http.ResponseWriter, r *http.Request) {
-	reqID := observability.RequestIDFromContext(r.Context())
-
-	// Never report completion until the persistent tombstone and deny gate exist.
-	writeJSON(w, http.StatusNotImplemented, map[string]any{
-		"code":       "not_implemented",
-		"message":    "identity revocation is not available",
-		"request_id": reqID,
 	})
 }
 
@@ -250,11 +179,12 @@ func (s *Server) requestIDMiddleware(next http.Handler) http.Handler {
 
 func (s *Server) requestDeadlineMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The bid-path deadline is far too tight for ClickHouse writes on the
-		// management API, so admin requests get their own budget.
+		// The bid-path deadline is far too tight for ClickHouse reads/writes on
+		// the management and internal APIs, so they get their own budget.
 		timeout := s.cfg.RequestTimeout
-		if strings.HasPrefix(r.URL.Path, "/admin/") {
-			timeout = adminRequestTimeout
+		if strings.HasPrefix(r.URL.Path, "/admin/") || strings.HasPrefix(r.URL.Path, "/internal/v1/snapshots") ||
+			strings.HasPrefix(r.URL.Path, "/internal/v1/identity") {
+			timeout = managementRequestTimeout
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()

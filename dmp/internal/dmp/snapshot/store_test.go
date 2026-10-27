@@ -226,3 +226,120 @@ func TestSnapshotVerificationFailures(t *testing.T) {
 		}
 	})
 }
+
+func TestSnapshotPublishAndResolve(t *testing.T) {
+	store, defs, _ := newIntegrationStore(t)
+	seedDefinitions(t, defs)
+	ctx := context.Background()
+	token := "5555555555555555555555555555555555555555555555555555555555555555"
+
+	job, err := store.CreateJob(ctx, snapshot.CreateJobInput{
+		ProviderID: "dmp-provider-01", Namespace: "publisher-account-v1",
+		SchemaVersion: 1, SourceVersion: "feed-publish", ExpectedRows: 2,
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if _, err := store.AppendRows(ctx, job.SnapshotID, []snapshot.MemberRow{
+		{SubjectToken: token, SubjectKeyVersion: 1, SegmentIDs: []string{"seg-tech-enthusiasts", "seg-sports-fans"}},
+	}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if _, err := store.Verify(ctx, job.SnapshotID); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+
+	// A verified but unpublished snapshot must not resolve.
+	if _, err := store.Resolve(ctx, snapshot.ResolveInput{
+		Namespace: "publisher-account-v1", ProviderID: "dmp-provider-01", SubjectToken: token,
+	}); !errors.Is(err, snapshot.ErrNoPublication) {
+		t.Fatalf("unpublished snapshot must not resolve, got %v", err)
+	}
+
+	published, err := store.Publish(ctx, job.SnapshotID)
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if published.Status != snapshot.StatusPublished {
+		t.Fatalf("unexpected publish state: %+v", published)
+	}
+	if again, err := store.Publish(ctx, job.SnapshotID); err != nil || again.Status != snapshot.StatusPublished {
+		t.Fatalf("publish must be idempotent: %v %+v", err, again)
+	}
+
+	result, err := store.Resolve(ctx, snapshot.ResolveInput{
+		RequestID: "req-resolve-1", Namespace: "publisher-account-v1", ProviderID: "dmp-provider-01",
+		SubjectToken: token, MaxSegments: 1,
+	})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if result.SnapshotID != job.SnapshotID || len(result.Segments) != 1 {
+		t.Fatalf("unexpected resolve result: %+v", result)
+	}
+
+	// An unknown subject resolves to an empty segment list, not an error.
+	other := "6666666666666666666666666666666666666666666666666666666666666666"
+	empty, err := store.Resolve(ctx, snapshot.ResolveInput{
+		Namespace: "publisher-account-v1", ProviderID: "dmp-provider-01", SubjectToken: other,
+	})
+	if err != nil || len(empty.Segments) != 0 {
+		t.Fatalf("unknown subject must resolve empty: %v %+v", err, empty)
+	}
+
+	// A newer publication becomes the serving snapshot.
+	second, err := store.CreateJob(ctx, snapshot.CreateJobInput{
+		ProviderID: "dmp-provider-01", Namespace: "publisher-account-v1",
+		SchemaVersion: 1, SourceVersion: "feed-publish-2", ExpectedRows: 1,
+	})
+	if err != nil {
+		t.Fatalf("create second job: %v", err)
+	}
+	if _, err := store.AppendRows(ctx, second.SnapshotID, []snapshot.MemberRow{
+		{SubjectToken: other, SubjectKeyVersion: 1, SegmentIDs: []string{"seg-tech-enthusiasts"}},
+	}); err != nil {
+		t.Fatalf("append second: %v", err)
+	}
+	if _, err := store.Verify(ctx, second.SnapshotID); err != nil {
+		t.Fatalf("verify second: %v", err)
+	}
+	if _, err := store.Publish(ctx, second.SnapshotID); err != nil {
+		t.Fatalf("publish second: %v", err)
+	}
+	current, err := store.CurrentPublication(ctx, "dmp-provider-01", "publisher-account-v1")
+	if err != nil || current.SnapshotID != second.SnapshotID {
+		t.Fatalf("current publication did not move: %v %+v", err, current)
+	}
+	moved, err := store.Resolve(ctx, snapshot.ResolveInput{
+		Namespace: "publisher-account-v1", ProviderID: "dmp-provider-01", SubjectToken: other,
+	})
+	if err != nil || len(moved.Segments) != 1 {
+		t.Fatalf("new publication must serve its rows: %v %+v", err, moved)
+	}
+
+	// The first snapshot is still pinned-resolvable because it stays published.
+	pinned, err := store.Resolve(ctx, snapshot.ResolveInput{
+		Namespace: "publisher-account-v1", ProviderID: "dmp-provider-01", SubjectToken: token,
+		SnapshotID: job.SnapshotID,
+	})
+	if err != nil || len(pinned.Segments) != 2 {
+		t.Fatalf("published snapshot must stay resolvable by id: %v %+v", err, pinned)
+	}
+}
+
+func TestSnapshotPublishRequiresVerification(t *testing.T) {
+	store, defs, _ := newIntegrationStore(t)
+	seedDefinitions(t, defs)
+	ctx := context.Background()
+
+	job, err := store.CreateJob(ctx, snapshot.CreateJobInput{
+		ProviderID: "dmp-provider-01", Namespace: "publisher-account-v1",
+		SchemaVersion: 1, SourceVersion: "feed-unverified-publish", ExpectedRows: 1,
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if _, err := store.Publish(ctx, job.SnapshotID); !errors.Is(err, snapshot.ErrNotVerified) {
+		t.Fatalf("unverified snapshot must not publish, got %v", err)
+	}
+}
