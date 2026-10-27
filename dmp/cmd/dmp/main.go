@@ -135,6 +135,8 @@ func controlPlaneOptions(cfg *config.Config, logger *slog.Logger) ([]adapterHTTP
 		PhysicalDeleteGrace: time.Duration(cfg.PhysicalDeleteGraceMins) * time.Minute,
 		PhysicalDeleteSLA:   time.Duration(cfg.PhysicalDeleteSLADays) * 24 * time.Hour,
 	}, logger)
+	retentionLocker := &valkey.Client{Address: cfg.ValkeyAddr, Username: cfg.ValkeyUser, Password: cfg.ValkeyPassword, Timeout: 2 * time.Second}
+	retentionWorker.WithLocker(retention.LockerValkey(retentionLocker), "dmp:"+tenantID.String()+":retention:lease")
 	options = append(options, adapterHTTP.WithRetentionService(retentionWorker))
 	go retentionWorker.Run(context.Background(), cfg.RetentionInterval)
 

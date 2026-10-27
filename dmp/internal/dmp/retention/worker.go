@@ -37,10 +37,20 @@ type Revocations interface {
 	AppendStatus(ctx context.Context, status revocation.Status) (revocation.Status, error)
 }
 
+// ErrLeaderHeld reports that another instance currently owns the sweep lease.
+var ErrLeaderHeld = errors.New("retention sweep is held by another instance")
+
+// Locker serialises sweeps across instances.
+type Locker interface {
+	TryAcquire(ctx context.Context, key string, ttl time.Duration) (token string, ok bool, err error)
+	Release(ctx context.Context, key, token string) error
+}
+
 // Report summarises one sweep.
 type Report struct {
 	StartedAt        time.Time `json:"started_at"`
 	FinishedAt       time.Time `json:"finished_at"`
+	Skipped          bool      `json:"skipped"`
 	ExpiredSnapshots []string  `json:"expired_snapshots"`
 	DeletedRows      uint64    `json:"deleted_rows"`
 	PurgedSubjects   int       `json:"purged_subjects"`
@@ -53,6 +63,8 @@ type Worker struct {
 	snapshots   Snapshots
 	revocations Revocations
 	policy      Policy
+	locker      Locker
+	lockKey     string
 	logger      *slog.Logger
 	now         func() time.Time
 }
@@ -66,6 +78,13 @@ func NewWorker(snapshots Snapshots, revocations Revocations, policy Policy, logg
 		now: func() time.Time { return time.Now().UTC() }}
 }
 
+// WithLocker serialises sweeps through a lease so replicas never sweep twice.
+func (w *Worker) WithLocker(locker Locker, key string) *Worker {
+	w.locker = locker
+	w.lockKey = key
+	return w
+}
+
 // SetClockForTest replaces the clock in tests.
 func (w *Worker) SetClockForTest(now func() time.Time) { w.now = now }
 
@@ -76,6 +95,24 @@ func (w *Worker) Policy() Policy { return w.policy }
 // deletions. A failure on one item never blocks the rest of the sweep.
 func (w *Worker) RunOnce(ctx context.Context) (Report, error) {
 	report := Report{StartedAt: w.now(), ExpiredSnapshots: []string{}}
+	if w.locker != nil {
+		token, ok, err := w.locker.TryAcquire(ctx, w.lockKey, 10*time.Minute)
+		if err != nil {
+			return report, fmt.Errorf("acquire retention lease: %w", err)
+		}
+		if !ok {
+			report.Skipped = true
+			report.FinishedAt = w.now()
+			return report, ErrLeaderHeld
+		}
+		defer func() {
+			releaseCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := w.locker.Release(releaseCtx, w.lockKey, token); err != nil {
+				w.logger.Warn("retention lease release failed", slog.Any("error", err))
+			}
+		}()
+	}
 
 	jobs, err := w.snapshots.ListJobs(ctx)
 	if err != nil {

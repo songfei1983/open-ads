@@ -164,3 +164,56 @@ func TestRetentionFlagsSLABreach(t *testing.T) {
 		t.Fatal("SLA breach must be reported")
 	}
 }
+
+type fakeLocker struct {
+	held   bool
+	tokens []string
+}
+
+func (f *fakeLocker) TryAcquire(_ context.Context, _ string, _ time.Duration) (string, bool, error) {
+	if f.held {
+		return "", false, nil
+	}
+	f.held = true
+	f.tokens = append(f.tokens, "lease")
+	return "lease", true, nil
+}
+
+func (f *fakeLocker) Release(_ context.Context, _, _ string) error {
+	f.held = false
+	return nil
+}
+
+func TestRetentionSweepIsSerialisedByLease(t *testing.T) {
+	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	revocations := &fakeRevocations{
+		statuses: []revocation.Status{{
+			RevocationID: "rev-lease", PhysicalDeleteStatus: revocation.DeletePending,
+			UpdatedAt: now.Add(-time.Hour),
+		}},
+		tokens: map[string][]revocation.Tombstone{"rev-lease": {{Namespace: "n", Token: "tok"}}},
+	}
+	locker := &fakeLocker{}
+	holder := newWorker(t, &fakeSnapshots{}, revocations, now).WithLocker(locker, "lease-key")
+	report, err := holder.RunOnce(context.Background())
+	if err != nil || report.Skipped {
+		t.Fatalf("the lease holder must sweep: %v %+v", err, report)
+	}
+	if report.PurgedSubjects != 1 {
+		t.Fatalf("expected the sweep to purge: %+v", report)
+	}
+
+	// While the lease is held, a second sweep is refused instead of running in
+	// parallel.
+	locker.held = true
+	other := newWorker(t, &fakeSnapshots{}, revocations, now).WithLocker(locker, "lease-key")
+	if _, err := other.RunOnce(context.Background()); !errors.Is(err, retention.ErrLeaderHeld) {
+		t.Fatalf("second instance must be refused, got %v", err)
+	}
+
+	// After release the other instance takes over.
+	locker.held = false
+	if _, err := other.RunOnce(context.Background()); err != nil {
+		t.Fatalf("lease handover failed: %v", err)
+	}
+}

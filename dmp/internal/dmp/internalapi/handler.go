@@ -559,6 +559,10 @@ func (h *handler) runRetention(w http.ResponseWriter, r *http.Request) {
 	}
 	report, err := h.retention.RunOnce(r.Context())
 	if err != nil {
+		if errors.Is(err, retention.ErrLeaderHeld) {
+			writeError(w, observability.RequestIDFromContext(r.Context()), http.StatusConflict, "retention_in_progress", "另一实例正在执行 retention sweep，请稍后重试")
+			return
+		}
 		h.fail(w, r, err)
 		return
 	}
