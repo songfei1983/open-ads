@@ -52,6 +52,26 @@ code=$(internal POST /snapshots "{\"provider_id\":\"$PROVIDER\",\"namespace\":\"
 [ "$code" = "201" ] && pass "snapshot registered" || fail "register snapshot: $code $(cat /tmp/integration.json)"
 SNAPSHOT=$(json '["snapshot_id"]')
 
+echo "== idempotency"
+IDEMPOTENCY_BODY="{\"provider_id\":\"$PROVIDER\",\"namespace\":\"$NAMESPACE\",\"schema_version\":1,\"source_version\":\"integration-idem-$$\",\"expected_rows\":1}"
+idempotency_post() {
+  curl -s -o "$2" -w '%{http_code}' -X POST "$DMP/internal/v1/snapshots" \
+    -H "Authorization: Bearer $INTERNAL_TOKEN" -H 'Content-Type: application/json' \
+    -H 'Idempotency-Key: integration-key-'"$$" -d "$1"
+}
+code=$(idempotency_post "$IDEMPOTENCY_BODY" /tmp/idem-first.json)
+first_id=$(python3 -c 'import json,sys;print(json.load(open("/tmp/idem-first.json"))["snapshot_id"])' 2>/dev/null)
+code_retry=$(idempotency_post "$IDEMPOTENCY_BODY" /tmp/idem-replay.json)
+retry_id=$(python3 -c 'import json,sys;print(json.load(open("/tmp/idem-replay.json"))["snapshot_id"])' 2>/dev/null)
+[ "$code" = "201" ] && [ "$code_retry" = "201" ] && [ "$first_id" = "$retry_id" ] \
+  && pass "repeated Idempotency-Key replayed the original snapshot" || fail "idempotent replay: $code/$code_retry $first_id/$retry_id"
+
+code=$(curl -s -o /tmp/idem-conflict.json -w '%{http_code}' -X POST "$DMP/internal/v1/snapshots" \
+  -H "Authorization: Bearer $INTERNAL_TOKEN" -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: integration-key-'"$$" \
+  -d "{\"provider_id\":\"$PROVIDER\",\"namespace\":\"$NAMESPACE\",\"schema_version\":1,\"source_version\":\"integration-idem-other-$$\",\"expected_rows\":1}")
+[ "$code" = "409" ] && pass "the same key with a different body is refused" || fail "key reuse: $code $(cat /tmp/idem-conflict.json)"
+
 code=$(internal POST "/snapshots/$SNAPSHOT/rows" "{\"rows\":[{\"subject_token\":\"$TOKEN_RAW\",\"subject_key_version\":1,\"segment_ids\":[\"seg-tech-enthusiasts\"]}]}")
 [ "$code" = "400" ] && pass "raw identity rejected" || fail "raw identity accepted: $code"
 

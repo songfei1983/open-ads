@@ -1,0 +1,849 @@
+openapi: 3.1.0
+info:
+  title: DMP API
+  version: "4.0.0"
+  summary: DMP 控制面（定义元数据、审计、维护）与内部数据面（快照导入、发布、受众解析、撤回、保留）
+  description: |
+    DMP 有两个面，认证方式不同：
+
+    - `/admin/v1/*` 控制面：只接收定义**元数据**，绝不接触 subject token；写入是 append-only 版本行。
+      每次写入先记录 `intent` 审计行，完成后记录同 `intent_id` 的 `outcome` 行，缺失 outcome 即"结果未知"。
+    - `/internal/v1/*` 内部数据面：只接受受信适配器与运营 token；`audiences:resolve` 是唯一免 bearer 的路径
+      （sandbox profile），但必须携带与数据面绑定的 `tenant_id`。
+
+    两条铁律：请求体只接受伪名 token（64 位小写 hex 摘要），原始身份（邮箱、手机号、UUID、设备 ID）一律
+    `400 invalid_request` 并计入 `dmp_raw_identity_rejected_total`；解析只返回 segment ID，不回显 token。
+servers:
+  - url: http://127.0.0.1:8082
+    description: 本地 sandbox 单节点
+tags:
+  - name: admin
+    description: 控制面（bearer 管理 token，绑单租户）
+  - name: internal
+    description: 内部数据面（受信适配器 token 或运营 token，按 scope 授权）
+  - name: probes
+    description: 探针与指标
+security:
+  - adminToken: []
+components:
+  securitySchemes:
+    adminToken:
+      type: http
+      scheme: bearer
+      description: DMP_ADMIN_TOKEN；调用方名与租户由凭据绑定，请求体不接受 tenant_id。
+    internalToken:
+      type: http
+      scheme: bearer
+      description: DMP_INTERNAL_TOKEN（受信 tokenization/导入适配器）或 DMP_ADMIN_TOKEN（运营）。
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        可选。同一 key + 同一路由 + 相同请求体重复提交时，返回首次成功响应并带 `Idempotency-Replayed: true`；
+        同一 key 配不同请求体返回 `409 idempotency_key_reuse`；只记录 2xx 响应，失败可重试。
+      schema:
+        type: string
+        maxLength: 128
+  schemas:
+    Error:
+      type: object
+      required: [code, message, request_id]
+      properties:
+        code:
+          type: string
+          examples: [invalid_request, unauthenticated, insufficient_scope, tenant_mismatch, not_found]
+        message:
+          type: string
+        request_id:
+          type: string
+    Namespace:
+      type: object
+      required: [id, version, status]
+      properties:
+        id: { type: string }
+        version: { type: integer, minimum: 1 }
+        display_name: { type: string }
+        hashing_algorithm: { type: string, examples: [hmac-sha256] }
+        subject_key_version: { type: integer, minimum: 1 }
+        retention_months: { type: integer, minimum: 1 }
+        status: { type: string, examples: [active, retired] }
+        written_at: { type: string, format: date-time }
+    NamespaceInput:
+      type: object
+      additionalProperties: false
+      required: [id, display_name, hashing_algorithm, subject_key_version, retention_months]
+      properties:
+        id: { type: string }
+        display_name: { type: string }
+        hashing_algorithm: { type: string }
+        subject_key_version: { type: integer, minimum: 1 }
+        retention_months: { type: integer, minimum: 1 }
+        status: { type: string }
+        version:
+          type: integer
+          description: PUT 时必填；必须等于当前版本，否则 409 version_conflict。
+    Provider:
+      type: object
+      properties:
+        id: { type: string }
+        version: { type: integer }
+        display_name: { type: string }
+        namespace: { type: string }
+        license_version: { type: string }
+        status: { type: string }
+        written_at: { type: string, format: date-time }
+    ProviderInput:
+      type: object
+      additionalProperties: false
+      required: [id, display_name, namespace, license_version]
+      properties:
+        id: { type: string }
+        display_name: { type: string }
+        namespace: { type: string }
+        license_version: { type: string }
+        status: { type: string }
+        version: { type: integer }
+    Segment:
+      type: object
+      properties:
+        id: { type: string }
+        version: { type: integer }
+        provider_id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        status: { type: string }
+        valid_from: { type: string, format: date-time }
+        written_at: { type: string, format: date-time }
+    SegmentInput:
+      type: object
+      additionalProperties: false
+      required: [id, provider_id, name]
+      properties:
+        id: { type: string }
+        provider_id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        status: { type: string }
+        version: { type: integer }
+    AuditEntry:
+      type: object
+      description: 一次尝试的审计行。`intent` 行先写，`outcome` 行后写，二者共享 `intent_id`。
+      required: [audit_id, phase, actor, action, resource_type, occurred_at]
+      properties:
+        audit_id: { type: string }
+        intent_id: { type: string }
+        phase: { type: string, enum: [intent, outcome] }
+        actor: { type: string }
+        action: { type: string, enum: [create, update] }
+        resource_type: { type: string, enum: [namespace, provider, segment] }
+        resource_id: { type: string }
+        resource_version: { type: integer }
+        request_id: { type: string }
+        outcome:
+          type: string
+          enum: ["", accepted, rejected, conflict, not_found]
+        detail: { type: string }
+        occurred_at: { type: string, format: date-time }
+    DuplicateVersion:
+      type: object
+      properties:
+        resource_type: { type: string, enum: [namespace, provider, segment] }
+        resource_id: { type: string }
+        version: { type: integer }
+        rows: { type: integer }
+        keeper_revision_id: { type: string, description: 保留的行（argMin(revision_id)） }
+    PruneReport:
+      type: object
+      properties:
+        dry_run: { type: boolean }
+        groups:
+          type: array
+          items: { $ref: "#/components/schemas/DuplicateVersion" }
+        rows_to_delete: { type: integer }
+        deleted_rows: { type: integer }
+        mutations_fired: { type: integer }
+    MemberRow:
+      type: object
+      additionalProperties: false
+      required: [subject_token, subject_key_version, segment_ids]
+      properties:
+        subject_token:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: 伪名摘要；原始身份会被拒绝。
+        subject_key_version: { type: integer, minimum: 1 }
+        segment_ids:
+          type: array
+          minItems: 1
+          items: { type: string }
+    SnapshotJob:
+      type: object
+      properties:
+        snapshot_id: { type: string, format: uuid }
+        provider_id: { type: string }
+        namespace: { type: string }
+        schema_version: { type: integer }
+        source_version: { type: string }
+        expected_rows: { type: integer }
+        expected_checksum: { type: string }
+        submitted_rows: { type: integer }
+        duplicate_rows: { type: integer }
+        stored_rows: { type: integer }
+        purged_rows:
+          type: integer
+          description: 因撤回物理删除而从该快照移除的行数；>0 即封版。
+        status:
+          type: string
+          enum: [registered, importing, verified, published, failed]
+        failure_reason: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ResolveRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, namespace, subject_token]
+      properties:
+        tenant_id:
+          type: string
+          description: 必填；必须等于数据面绑定租户。过渡期 `tenant-default` 解析为该租户。
+        provider_id: { type: string }
+        namespace: { type: string }
+        subject_token:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        snapshot_id:
+          type: string
+          format: uuid
+          description: 固定查询；仅当该快照已发布才命中。
+        purposes:
+          type: array
+          items: { type: string }
+        max_segments: { type: integer, minimum: 1, maximum: 100, default: 10 }
+    ResolveResponse:
+      type: object
+      properties:
+        request_id: { type: string }
+        snapshot_id: { type: string, format: uuid }
+        provider_id: { type: string }
+        segments:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+        resolved_at: { type: string, format: date-time }
+    RevokeRequest:
+      type: object
+      additionalProperties: false
+      required: [namespace, subject_tokens]
+      properties:
+        revocation_id: { type: string, format: uuid, description: 缺省由服务端生成；重复投递幂等。 }
+        namespace: { type: string }
+        subject_tokens:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            type: object
+            required: [token, key_version]
+            properties:
+              token: { type: string, pattern: "^[0-9a-f]{64}$" }
+              key_version: { type: integer, minimum: 1 }
+        reason_code: { type: string, examples: [user_request, consent_withdrawn] }
+    RevocationStatus:
+      type: object
+      properties:
+        revocation_id: { type: string, format: uuid }
+        status: { type: string, enum: [pending, completed, failed] }
+        status_version: { type: integer }
+        online_status: { type: string, enum: [denied, pending] }
+        physical_delete_status: { type: string, enum: [pending, completed] }
+        gate_epoch: { type: integer }
+        drained_lookup_count: { type: integer }
+        covered_key_versions: { type: array, items: { type: integer } }
+        updated_at: { type: string, format: date-time }
+    RetentionReport:
+      type: object
+      properties:
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        skipped: { type: boolean, description: 另一实例持有 sweep 租约。 }
+        expired_snapshots: { type: array, items: { type: string } }
+        deleted_rows: { type: integer }
+        purged_subjects: { type: integer }
+        pending_purges: { type: integer }
+        failures: { type: array, items: { type: string } }
+  responses:
+    ErrorResponse:
+      description: 统一错误信封
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+paths:
+  /healthz:
+    get:
+      tags: [probes]
+      security: []
+      summary: 存活探针
+      responses:
+        "200": { description: 进程存活 }
+  /readyz:
+    get:
+      tags: [probes]
+      security: []
+      summary: 就绪探针
+      description: ClickHouse 与 deny gate 均可用时 200；否则 503，绝不返回未经屏障校验的受众。
+      responses:
+        "200": { description: 就绪 }
+        "503": { description: 依赖不可用（包含 policy_state_unavailable 的成因） }
+  /metrics:
+    get:
+      tags: [probes]
+      security: []
+      summary: Prometheus 指标
+      description: 含 HTTP 指标与 DMP 业务指标（resolve 结果/时延、gate admission/epoch、导入/校验/发布、撤回主体数、保留删除、原始身份拒绝）。
+      responses:
+        "200":
+          description: Prometheus text format
+          content:
+            text/plain:
+              schema: { type: string }
+  /admin/v1/namespaces:
+    get:
+      tags: [admin]
+      summary: 列出 namespace 当前版本
+      responses:
+        "200":
+          description: 名称空间列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Namespace" }
+        "503": { $ref: "#/components/responses/ErrorResponse" }
+    post:
+      tags: [admin]
+      summary: 创建 namespace（版本 1）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NamespaceInput" }
+      responses:
+        "201":
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Namespace" }
+        "409": { $ref: "#/components/responses/ErrorResponse" }
+        "422": { $ref: "#/components/responses/ErrorResponse" }
+  /admin/v1/namespaces/{id}:
+    put:
+      tags: [admin]
+      summary: 追加 namespace 新版本（乐观锁）
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NamespaceInput" }
+      responses:
+        "200":
+          description: 已更新
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Namespace" }
+        "404": { $ref: "#/components/responses/ErrorResponse" }
+        "409": { $ref: "#/components/responses/ErrorResponse" }
+        "422": { $ref: "#/components/responses/ErrorResponse" }
+  /admin/v1/providers:
+    get:
+      tags: [admin]
+      summary: 列出 provider 当前版本
+      responses:
+        "200":
+          description: Provider 列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Provider" }
+    post:
+      tags: [admin]
+      summary: 创建 provider（必须引用 active namespace）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProviderInput" }
+      responses:
+        "201":
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Provider" }
+        "422": { $ref: "#/components/responses/ErrorResponse" }
+  /admin/v1/providers/{id}:
+    put:
+      tags: [admin]
+      summary: 追加 provider 新版本（namespace 不可变）
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProviderInput" }
+      responses:
+        "200":
+          description: 已更新
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Provider" }
+        "422": { $ref: "#/components/responses/ErrorResponse" }
+  /admin/v1/segments:
+    get:
+      tags: [admin]
+      summary: 列出 segment 当前版本
+      responses:
+        "200":
+          description: Segment 列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Segment" }
+    post:
+      tags: [admin]
+      summary: 创建 segment（必须引用 active provider）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SegmentInput" }
+      responses:
+        "201":
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Segment" }
+        "422": { $ref: "#/components/responses/ErrorResponse" }
+  /admin/v1/segments/{id}:
+    put:
+      tags: [admin]
+      summary: 追加 segment 新版本（provider 不可变）
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SegmentInput" }
+      responses:
+        "200":
+          description: 已更新
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Segment" }
+        "422": { $ref: "#/components/responses/ErrorResponse" }
+  /admin/v1/audit:
+    get:
+      tags: [admin]
+      summary: 审计流（intent 与 outcome 成对出现）
+      parameters:
+        - name: resource_type
+          in: query
+          schema: { type: string, enum: [namespace, provider, segment] }
+        - name: resource_id
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        "200":
+          description: 审计条目，最新在前
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/AuditEntry" }
+  /admin/v1/audit/unfinished:
+    get:
+      tags: [admin]
+      summary: 只有 intent 没有 outcome 的尝试（结果未知）
+      description: 超过 2 分钟宽限仍未记录 outcome 的 intent，需要运维对账。
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+      responses:
+        "200":
+          description: 结果未知的尝试
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/AuditEntry" }
+  /admin/v1/maintenance/duplicate-versions:
+    get:
+      tags: [admin]
+      summary: 巡检同版本落败行（只计数，不删除）
+      responses:
+        "200":
+          description: dry-run 报告
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PruneReport" }
+    post:
+      tags: [admin]
+      summary: 清理同版本落败行（默认 dry run）
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                dry_run:
+                  type: boolean
+                  default: true
+                  description: 只有显式 false 才真正删除；保留 argMin(revision_id)。
+      responses:
+        "200":
+          description: 清理报告
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PruneReport" }
+  /internal/v1/snapshots:
+    get:
+      tags: [internal]
+      security: [{ internalToken: [] }]
+      summary: 列出快照作业
+      responses:
+        "200":
+          description: 快照列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/SnapshotJob" }
+        "401": { $ref: "#/components/responses/ErrorResponse" }
+        "403": { $ref: "#/components/responses/ErrorResponse" }
+    post:
+      tags: [internal]
+      security: [{ internalToken: [] }]
+      summary: 注册快照导入作业
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [provider_id, namespace, schema_version, source_version, expected_rows]
+              properties:
+                provider_id: { type: string }
+                namespace: { type: string }
+                schema_version: { type: integer }
+                source_version: { type: string }
+                expected_rows: { type: integer, minimum: 1 }
+                expected_checksum: { type: string }
+      responses:
+        "201":
+          description: 已注册
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SnapshotJob" }
+        "400": { $ref: "#/components/responses/ErrorResponse" }
+        "409":
+          description: Idempotency-Key 被用于不同请求体
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /internal/v1/snapshots/{snapshot_id}:
+    get:
+      tags: [internal]
+      security: [{ internalToken: [] }]
+      summary: 快照作业状态
+      parameters:
+        - name: snapshot_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: 作业
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SnapshotJob" }
+        "404": { $ref: "#/components/responses/ErrorResponse" }
+  /internal/v1/snapshots/{snapshot_id}/rows:
+    post:
+      tags: [internal]
+      security: [{ internalToken: [] }]
+      summary: 追加 membership 行（只接受伪名 token）
+      parameters:
+        - name: snapshot_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [rows]
+              properties:
+                rows:
+                  type: array
+                  maxItems: 1000
+                  items: { $ref: "#/components/schemas/MemberRow" }
+      responses:
+        "200":
+          description: 批次结果（submitted/stored/idempotent/duplicate）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  submitted_rows: { type: integer }
+                  stored_rows: { type: integer }
+                  idempotent_rows: { type: integer }
+                  duplicate_rows: { type: integer }
+        "400": { $ref: "#/components/responses/ErrorResponse" }
+  /internal/v1/snapshots/{snapshot_id}/verify:
+    post:
+      tags: [internal]
+      security: [{ internalToken: [] }]
+      summary: 校验行数、checksum 与重复率
+      parameters:
+        - name: snapshot_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: 校验通过（status=verified）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SnapshotJob" }
+        "409":
+          description: 快照已发布（snapshot_sealed），校验不再适用
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: 校验失败（verification_failed）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /internal/v1/snapshots/{snapshot_id}/publish:
+    post:
+      tags: [internal]
+      security: [{ internalToken: [] }]
+      summary: 发布已校验快照（发布即封版，重复发布幂等）
+      parameters:
+        - name: snapshot_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: 已发布
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SnapshotJob" }
+        "422": { $ref: "#/components/responses/ErrorResponse" }
+  /internal/v1/snapshots/{snapshot_id}/delete:
+    post:
+      tags: [internal]
+      security: [{ internalToken: [] }]
+      summary: 物理删除快照（按 tenant + snapshot_id 精确执行）
+      parameters:
+        - name: snapshot_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: 删除行数
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted_rows: { type: integer }
+        "409":
+          description: 当前服务快照不可删除
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /internal/v1/publications:
+    get:
+      tags: [internal]
+      security: [{ internalToken: [] }]
+      summary: 当前发布指针
+      responses:
+        "200":
+          description: 发布列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    provider_id: { type: string }
+                    namespace: { type: string }
+                    snapshot_id: { type: string, format: uuid }
+                    published_at: { type: string, format: date-time }
+  /internal/v1/audiences:resolve:
+    post:
+      tags: [internal]
+      security: []
+      summary: 受众解析（sandbox profile 免 bearer，但绑定租户）
+      description: |
+        只读当前发布快照；`snapshot_id` 固定查询要求该快照已发布。先过 deny gate（fail-closed 503
+        `policy_state_unavailable`），再读 ClickHouse，最后 finalize 复核；期间被撤回则返回空 segments。
+        响应只含 segment ID，绝不含 token。
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ResolveRequest" }
+      responses:
+        "200":
+          description: 解析结果（segments 可能为空）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ResolveResponse" }
+        "400":
+          description: 缺少 tenant_id、原始身份或 token 格式错误
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          description: tenant_id 与数据面绑定租户不一致（tenant_mismatch）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: 无发布快照（no_published_snapshot）或 deny gate 不可用（policy_state_unavailable）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /internal/v1/identity:revoke:
+    post:
+      tags: [internal]
+      security: [{ internalToken: [] }]
+      summary: 登记撤回（先写 deny gate，再写 tombstone）
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RevokeRequest" }
+      responses:
+        "202":
+          description: 已受理并返回状态
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RevocationStatus" }
+        "400": { $ref: "#/components/responses/ErrorResponse" }
+        "409":
+          description: Idempotency-Key 被用于不同请求体
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: deny gate 不可用（拒绝谎报完成）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /internal/v1/identity-revocations:
+    get:
+      tags: [internal]
+      security: [{ internalToken: [] }]
+      summary: 撤回状态列表
+      responses:
+        "200":
+          description: 状态列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/RevocationStatus" }
+  /internal/v1/identity-revocations/{revocation_id}:
+    get:
+      tags: [internal]
+      security: [{ internalToken: [] }]
+      summary: 单个撤回状态
+      parameters:
+        - name: revocation_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: 状态
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RevocationStatus" }
+        "404": { $ref: "#/components/responses/ErrorResponse" }
+  /internal/v1/retention:run:
+    post:
+      tags: [internal]
+      security: [{ internalToken: [] }]
+      summary: 立即执行一次 retention sweep（租约选主）
+      responses:
+        "200":
+          description: sweep 报告
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RetentionReport" }
+        "409":
+          description: 另一实例正在 sweep（retention_in_progress）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /internal/v1/retention:policy:
+    get:
+      tags: [internal]
+      security: [{ internalToken: [] }]
+      summary: 生效的保留策略与上限
+      responses:
+        "200":
+          description: 策略
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  membership_retention_hours: { type: number }
+                  membership_retention_ceiling: { type: string }
+                  event_retention_hours: { type: number }
+                  event_retention_ceiling: { type: string }
+                  physical_delete_sla_hours: { type: number }
+                  physical_delete_sla_ceiling: { type: string }
+                  physical_delete_grace_hours: { type: number }

@@ -75,6 +75,9 @@ type HandlerOptions struct {
 	Gate        DenyGate
 	Revocations Revocations
 	Retention   RetentionService
+	// Idempotency replays a stored response for a repeated Idempotency-Key;
+	// when nil, requests carrying the header are refused.
+	Idempotency IdempotencyStoreAPI
 	// Metrics records the business signals; nil disables them.
 	Metrics *observability.DMPMetrics
 	Logger  *slog.Logger
@@ -92,7 +95,7 @@ func NewHandler(opts HandlerOptions) http.Handler {
 	if authenticator == nil {
 		authenticator = sandboxAuthenticator(opts.Token, opts.AdminToken)
 	}
-	h := &handler{authenticator: authenticator, tenantID: opts.TenantID, snapshots: opts.Snapshots, gate: opts.Gate,
+	h := &handler{idempotency: opts.Idempotency, authenticator: authenticator, tenantID: opts.TenantID, snapshots: opts.Snapshots, gate: opts.Gate,
 		revocations: opts.Revocations, retention: opts.Retention, logger: logger, metrics: opts.Metrics,
 		configured: opts.Authenticator != nil || opts.Token != "" || opts.AdminToken != ""}
 	return h.authenticate(h)
@@ -108,7 +111,14 @@ func sandboxAuthenticator(token, adminToken string) authn.Authenticator {
 	)
 }
 
+// IdempotencyStoreAPI records and replays idempotent responses.
+type IdempotencyStoreAPI interface {
+	Lookup(ctx context.Context, key, route string) (IdempotencyRecord, bool, error)
+	Save(ctx context.Context, record IdempotencyRecord) error
+}
+
 type handler struct {
+	idempotency   IdempotencyStoreAPI
 	authenticator authn.Authenticator
 	tenantID      string
 	configured    bool
@@ -132,7 +142,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		case http.MethodPost:
 			if h.requireScope(w, r, authn.ScopeSnapshotsWrite) {
-				h.createSnapshot(w, r)
+				h.withIdempotency("snapshots:create", h.createSnapshot)(w, r)
 			}
 		default:
 			methodNotAllowed(w, r, http.MethodGet, http.MethodPost)
@@ -198,7 +208,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if h.requireScope(w, r, authn.ScopeIdentityRevoke) {
-			h.revokeIdentity(w, r)
+			h.withIdempotency("identity:revoke", h.revokeIdentity)(w, r)
 		}
 	case len(parts) == 2 && parts[0] == "identity-revocations":
 		if r.Method != http.MethodGet {

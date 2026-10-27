@@ -39,6 +39,7 @@ type Server struct {
 	gate            internalapi.DenyGate
 	revocations     internalapi.Revocations
 	retention       internalapi.RetentionService
+	idempotency     internalapi.IdempotencyStoreAPI
 }
 
 // businessMetrics returns the business metric set, defaulting to the registry
@@ -106,6 +107,15 @@ func WithRetentionService(service internalapi.RetentionService) Option {
 	return func(s *Server) {
 		if service != nil {
 			s.retention = service
+		}
+	}
+}
+
+// WithIdempotencyStore attaches the Idempotency-Key store.
+func WithIdempotencyStore(store internalapi.IdempotencyStoreAPI) Option {
+	return func(s *Server) {
+		if store != nil {
+			s.idempotency = store
 		}
 	}
 }
@@ -204,6 +214,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		Gate:          s.gate,
 		Revocations:   s.revocations,
 		Retention:     s.retention,
+		Idempotency:   s.idempotency,
 		Metrics:       s.businessMetricsSet(),
 		Logger:        s.logger,
 	})

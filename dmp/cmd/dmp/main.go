@@ -17,6 +17,7 @@ import (
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/config"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/control"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/gate"
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/internalapi"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/observability"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/retention"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/revocation"
@@ -117,6 +118,7 @@ func controlPlaneOptions(cfg *config.Config, logger *slog.Logger) ([]adapterHTTP
 		adapterHTTP.WithControlStore(controlStore),
 		adapterHTTP.WithSnapshotStore(snapshotStore),
 		adapterHTTP.WithRevocationStore(revocationStore),
+		adapterHTTP.WithIdempotencyStore(internalapi.NewIdempotencyStore(conn, tenantID)),
 	}
 	if cfg.InternalToken != "" {
 		gateClient := &valkey.Client{Address: cfg.ValkeyAddr, Username: cfg.ValkeyUser, Password: cfg.ValkeyPassword, Timeout: 2 * time.Second}

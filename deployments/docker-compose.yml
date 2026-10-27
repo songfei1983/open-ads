@@ -55,6 +55,7 @@ services:
       - ../dmp/migrations/000004_dmp_retention.up.sql:/docker-entrypoint-initdb.d/000004_dmp_retention.up.sql:ro
       - ../dmp/migrations/000005_dmp_snapshot_purge.up.sql:/docker-entrypoint-initdb.d/000005_dmp_snapshot_purge.up.sql:ro
       - ../dmp/migrations/000006_dmp_control_audit_phases.up.sql:/docker-entrypoint-initdb.d/000006_dmp_control_audit_phases.up.sql:ro
+      - ../dmp/migrations/000007_dmp_idempotency.up.sql:/docker-entrypoint-initdb.d/000007_dmp_idempotency.up.sql:ro
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "127.0.0.1:8123/ping"]
       interval: 5s

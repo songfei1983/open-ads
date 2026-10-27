@@ -92,7 +92,9 @@ I4-08 实测（浏览器）：控制台各页无 console/page error；代理白�
 | R2 | 同版本落败行巡检清理（保留 `argMin(revision_id)`，先 dry-run 计数） | ✅ 完成 |
 | R5 | 抽出共享 `identity.TokenPolicy` + 负例 fixture 集 + 疑似原始身份指标 | ✅ 完成 |
 | R3 | 负载/POC 参数化并归档报告，D-01 后按生产拓扑复测 | ✅ 完成（复测待 D-01） |
-| R10 | DMP OpenAPI 3.1 契约工件 + import/revoke 幂等键 | 待办 |
+| R10 | DMP OpenAPI 3.1 契约工件 + import/revoke 幂等键 | ✅ 完成 |
+
+R10 验收（2026-10-27）：新增 `dmp/docs/openapi.yaml`（OpenAPI 3.1，25 路径 / 30 操作，覆盖控制面定义、审计、维护与内部导入/发布/解析/撤回/保留，含错误信封与 `Idempotency-Key` 参数）；契约漂移由 `TestOpenAPIContractMatchesTheRouter` 守护——逐个操作打到真实路由，出现 405 或"unknown … path"即失败。幂等键：迁移 `000007` 新增 `dmp_idempotency`（24h TTL），`POST /internal/v1/snapshots` 与 `POST /internal/v1/identity:revoke` 支持 `Idempotency-Key`，重放返回首次 2xx 响应并带 `Idempotency-Replayed: true`，同 key 换 body 返回 `409 idempotency_key_reuse`，未配置存储时带 key 请求返回 503。live 验证：首次 201、重放同一 snapshot_id 且 body 完全一致、换 body 409；`integration.sh` 新增两项断言并通过。
 
 R3 验收（2026-10-27）：`load_poc.py` 增加 `--label`/`--report`，报告含 `recorded_at`、拓扑标签、端点、导入 rows/s、校验耗时、删除耗时与目标阈值，默认归档到 `docs/plan/iteration-4/poc/<日期>-<label>.json`；新增 `poc/README.md` 说明复测命令、PASS/FAIL 判定与解读边界。归档 `2026-10-27-sandbox-single-node.json`：100k 行导入 28,383 rows/s、verify 0.09s、600 次 resolve p50 25.1ms / p95 37.1ms / p99 44.8ms（0 错误）、100k 行删除 0.15s、服务快照无损。生产拓扑（多副本 DMP、ClickHouse 分片、Valkey 集群、跨 AZ）复测仍待 D-01。
 
