@@ -24,6 +24,7 @@ var (
 	ErrStoreUnavailable = errors.New("snapshot store unavailable")
 	ErrNoPublication    = errors.New("no published snapshot")
 	ErrJobState         = errors.New("snapshot import job is not in a valid state for this operation")
+	ErrSealed           = errors.New("published snapshot is sealed")
 )
 
 // Import job states.
@@ -60,6 +61,7 @@ type Job struct {
 	SubmittedRows    uint64    `json:"submitted_rows"`
 	DuplicateRows    uint64    `json:"duplicate_rows"`
 	StoredRows       uint64    `json:"stored_rows"`
+	PurgedRows       uint64    `json:"purged_rows"`
 	Status           string    `json:"status"`
 	FailureReason    string    `json:"failure_reason,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`

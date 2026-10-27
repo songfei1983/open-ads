@@ -8,9 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/google/uuid"
 
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/control"
+	"github.com/songfei1983/open-ads/dmp/internal/dmp/revocation"
 	"github.com/songfei1983/open-ads/dmp/internal/dmp/snapshot"
 )
 
@@ -414,4 +416,75 @@ func TestDeleteSnapshotLeavesOtherSnapshotsIntact(t *testing.T) {
 	if err != nil || len(result.Segments) != 1 {
 		t.Fatalf("serving snapshot still resolves: %v %+v", err, result)
 	}
+}
+
+func TestSealedSnapshotAfterRevocationPurge(t *testing.T) {
+	store, defs, tenant := newIntegrationStore(t)
+	seedDefinitions(t, defs)
+	ctx := context.Background()
+
+	conn, err := clickhouseConn(t)
+	if err != nil {
+		t.Fatalf("clickhouse: %v", err)
+	}
+	revocationStore := revocation.NewStore(conn, tenant)
+
+	token := strings.Repeat("5", 64)
+	job, err := store.CreateJob(ctx, snapshot.CreateJobInput{
+		ProviderID: "dmp-provider-01", Namespace: "publisher-account-v1",
+		SchemaVersion: 1, SourceVersion: "feed-sealed", ExpectedRows: 1,
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if _, err := store.AppendRows(ctx, job.SnapshotID, []snapshot.MemberRow{
+		{SubjectToken: token, SubjectKeyVersion: 1, SegmentIDs: []string{"seg-tech-enthusiasts"}},
+	}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if _, err := store.Verify(ctx, job.SnapshotID); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if _, err := store.Publish(ctx, job.SnapshotID); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	// Physical deletion removes the row and records the purge.
+	if _, err := revocationStore.PurgeSubject(ctx, "publisher-account-v1", token); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	purged, err := store.PurgedRows(ctx, job.SnapshotID)
+	if err != nil || purged != 1 {
+		t.Fatalf("purge was not recorded: %v %d", err, purged)
+	}
+	if count, _, err := store.ChecksumOf(ctx, job.SnapshotID); err != nil || count != 0 {
+		t.Fatalf("membership row survived the purge: %v %d", err, count)
+	}
+
+	// A published snapshot is sealed, so verification never compares against a
+	// checksum that the purge invalidated.
+	if _, err := store.Verify(ctx, job.SnapshotID); !errors.Is(err, snapshot.ErrSealed) {
+		t.Fatalf("sealed snapshot must not re-verify, got %v", err)
+	}
+	// Publishing again stays idempotent (retry-safe).
+	if again, err := store.Publish(ctx, job.SnapshotID); err != nil || again.Status != snapshot.StatusPublished {
+		t.Fatalf("publish must stay idempotent: %v %+v", err, again)
+	}
+	// The revoked subject no longer resolves.
+	result, err := store.Resolve(ctx, snapshot.ResolveInput{
+		Namespace: "publisher-account-v1", ProviderID: "dmp-provider-01", SubjectToken: token,
+	})
+	if err != nil || len(result.Segments) != 0 {
+		t.Fatalf("purged subject must not resolve: %v %+v", err, result)
+	}
+}
+
+// clickhouseConn opens a standalone connection for tests that need two stores
+// on the same tenant.
+func clickhouseConn(t *testing.T) (clickhouse.Conn, error) {
+	t.Helper()
+	return control.OpenClickHouse(context.Background(), os.Getenv("DMP_CLICKHOUSE_TEST_ADDR"),
+		envOr("DMP_CLICKHOUSE_TEST_USER", "dmp_user"),
+		envOr("DMP_CLICKHOUSE_TEST_PASSWORD", "dmp_clickhouse_password"),
+		envOr("DMP_CLICKHOUSE_TEST_DATABASE", "dmp"))
 }

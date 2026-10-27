@@ -79,3 +79,19 @@ I4-08 实测（浏览器）：控制台各页无 console/page error；代理白�
 4. 管理面认证仍是共享 bearer token（sandbox）。生产态需按 D-01 切换为 mTLS workload identity + 按调用方授权。
 5. I4-02 起必须在写入前拒绝原始身份；当前控制面只接受定义元数据，不接触 subject token。
 6. sandbox 阶段单租户：`audiences:resolve` 不使用请求中的 `tenant_id`，解析固定落在 DMP 配置租户；SSP 调用不带 workload 身份。D-01 关闭前必须换成 mTLS 调用方授权与按调用方租户绑定。
+
+## 7. 风险收敛提案与进度
+
+| 提案 | 内容 | 状态 |
+|---|---|---|
+| R7 | 快照发布即封版：`verify` 对已发布快照返回 `409 snapshot_sealed`，`publish` 保持幂等；撤回 purge 写入 `dmp_snapshot_purge` 台账（`purged_rows`），控制台显示"已撤回 N"并隐藏封版快照的校验/删除动作，消除 purge 后的 checksum 假失败 | ✅ 完成 |
+| R8 | retention worker 用 Valkey 租约选主，避免多副本重复 sweep | 待办 |
+| R4+R6 | 引入 `Principal{Caller,Tenant,Scopes}` 与 `Authenticator`（Bearer 现状 + 预留 mTLS），resolve 强制 `tenant_id`（缺失 400、跨租户 403，过渡期保留 `tenant-default` 别名） | 待办 |
+| R1 | 控制面审计改为 intent + outcome 两行，缺 outcome 即"结果未知"并提供巡检查询；拒绝路径审计失败改为 fail-closed | 待办 |
+| R9 | DMP 业务指标：resolve 结果/时延、gate admission、导入校验、保留删除、epoch、tombstone 数 | 待办 |
+| R2 | 同版本落败行巡检清理（保留 `argMin(revision_id)`，先 dry-run 计数） | 待办 |
+| R5 | 抽出共享 `identity.TokenPolicy` + 负例 fixture 集 + 疑似原始身份指标 | 待办 |
+| R3 | 负载/POC 参数化并归档报告，D-01 后按生产拓扑复测 | 待办 |
+| R10 | DMP OpenAPI 3.1 契约工件 + import/revoke 幂等键 | 待办 |
+
+R7 验收（2026-10-27）：发布后 purge 1 行 → job `stored_rows=0 / purged_rows=1`；`verify` 返回 409 且状态仍为 `published`；`publish` 仍 200；该主体解析为空；ClickHouse 集成测试覆盖"发布 → purge → 封版 → 幂等发布 → 不再解析"。

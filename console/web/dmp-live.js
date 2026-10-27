@@ -507,7 +507,7 @@ function openSegmentDialog(existing) {
 
 function renderSnapshots(main) {
   main.append(pageHeader("snapshots", "＋ 新建导入", () => openImportDialog()));
-  main.append(note("导入约束", "只接受 64 位小写 hex 的伪名 token；segment 必须是该 provider 的 active 定义。行数/checksum/重复率任一不符则校验失败，旧快照继续服务。", "⇪"));
+  main.append(note("导入约束", "只接受 64 位小写 hex 的伪名 token；segment 必须是该 provider 的 active 定义。行数/checksum/重复率任一不符则校验失败，旧快照继续服务；快照一旦发布即封版，撤回只减行、不再重新校验。", "⇪"));
 
   const current = new Set(state.publications.map((publication) => publication.snapshot_id));
   main.append(tableCard("快照", "导入 → 校验 → 发布 → 可解析", ["快照", "Provider / Namespace", "来源", "状态", "行数", "重复", "创建时间", ""],
@@ -516,13 +516,22 @@ function renderSnapshots(main) {
       cell(`${snapshot.provider_id} / ${snapshot.namespace}`),
       cell(snapshot.source_version),
       nodeCell(statusPill(snapshot.status)),
-      cell(String(snapshot.stored_rows)),
+      nodeCell(
+        el("span", "", String(snapshot.stored_rows)),
+        snapshot.purged_rows > 0 ? el("span", "status-pill paused", `已撤回 ${snapshot.purged_rows}`) : null,
+      ),
       cell(String(snapshot.duplicate_rows)),
       cell(fmtTime(snapshot.created_at)),
       nodeCell(
-        makeButton("✓", "icon-button", () => verifySnapshot(snapshot), `校验 ${snapshot.snapshot_id}`),
-        makeButton("↑", "icon-button", () => confirmPublish(snapshot), `发布 ${snapshot.snapshot_id}`),
-        makeButton("🗑", "icon-button", () => confirmDelete(snapshot), `删除 ${snapshot.snapshot_id}`),
+        snapshot.status === "importing"
+          ? makeButton("✓", "icon-button", () => verifySnapshot(snapshot), `校验 ${snapshot.snapshot_id}`)
+          : null,
+        snapshot.status === "verified" || snapshot.status === "importing"
+          ? makeButton("↑", "icon-button", () => confirmPublish(snapshot), `发布 ${snapshot.snapshot_id}`)
+          : null,
+        snapshot.status === "published" || snapshot.status === "retired"
+          ? null
+          : makeButton("🗑", "icon-button", () => confirmDelete(snapshot), `删除 ${snapshot.snapshot_id}`),
         makeButton("⋯", "icon-button", () => showSnapshotDetails(snapshot), `查看 ${snapshot.snapshot_id}`),
       ),
     ])));
@@ -602,8 +611,9 @@ function showSnapshotDetails(snapshot) {
   for (const [key, label] of [
     ["snapshot_id", "快照"], ["provider_id", "Provider"], ["namespace", "Namespace"],
     ["source_version", "来源版本"], ["schema_version", "Schema"], ["status", "状态"],
-    ["expected_rows", "预期行数"], ["stored_rows", "已存行数"], ["submitted_rows", "提交行数"],
-    ["duplicate_rows", "重复行"], ["expected_checksum", "预期 checksum"], ["failure_reason", "失败原因"],
+    ["expected_rows", "预期行数"], ["stored_rows", "已存行数"], ["purged_rows", "已撤回行"],
+    ["submitted_rows", "提交行数"], ["duplicate_rows", "重复行"], ["expected_checksum", "预期 checksum"],
+    ["failure_reason", "失败原因"],
     ["created_at", "创建时间"], ["updated_at", "更新时间"],
   ]) {
     const item = el("li");

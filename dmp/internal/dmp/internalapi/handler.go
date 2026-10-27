@@ -593,6 +593,8 @@ func (h *handler) fail(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, requestID, http.StatusConflict, "invalid_state", err.Error())
 	case errors.Is(err, snapshot.ErrNotVerified):
 		writeError(w, requestID, http.StatusConflict, "invalid_state", err.Error())
+	case errors.Is(err, snapshot.ErrSealed):
+		writeError(w, requestID, http.StatusConflict, "snapshot_sealed", "published snapshots are sealed and cannot be re-verified")
 	case errors.Is(err, snapshot.ErrNoPublication):
 		writeError(w, requestID, http.StatusNotFound, "not_found", "no published snapshot for this provider/namespace")
 	case errors.Is(err, revocation.ErrInvalidRequest):

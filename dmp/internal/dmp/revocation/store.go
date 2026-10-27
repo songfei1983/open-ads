@@ -342,10 +342,14 @@ func (s *Store) TokenCounts(ctx context.Context, namespace, token string) (uint6
 }
 
 // PurgeSubject physically deletes membership and analytic event rows for one
-// revoked subject. The tombstone is kept: it is the authoritative deny record
-// and the proof that the deletion was requested.
+// revoked subject and records how many rows each snapshot lost, so the serving
+// snapshot's counts stay explainable. The tombstone is kept: it is the
+// authoritative deny record and the proof that the deletion was requested.
 func (s *Store) PurgeSubject(ctx context.Context, namespace, token string) (uint64, error) {
-	var removed uint64
+	perSnapshot, err := s.membershipCounts(ctx, namespace, token)
+	if err != nil {
+		return 0, err
+	}
 	for _, statement := range []string{
 		`ALTER TABLE dmp_membership_snapshot DELETE WHERE tenant_id = ? AND namespace = ? AND subject_token = ?
 		 SETTINGS mutations_sync = 1`,
@@ -353,7 +357,7 @@ func (s *Store) PurgeSubject(ctx context.Context, namespace, token string) (uint
 		 SETTINGS mutations_sync = 1`,
 	} {
 		if err := s.conn.Exec(ctx, statement, s.tenant, namespace, token); err != nil {
-			return removed, fmt.Errorf("%w: purge subject rows: %v", ErrStoreUnavailable, err)
+			return 0, fmt.Errorf("%w: purge subject rows: %v", ErrStoreUnavailable, err)
 		}
 	}
 	remaining, err := s.TokenCounts(ctx, namespace, token)
@@ -363,8 +367,61 @@ func (s *Store) PurgeSubject(ctx context.Context, namespace, token string) (uint
 	if remaining != 0 {
 		return 0, fmt.Errorf("%w: %d rows survived the purge", ErrStoreUnavailable, remaining)
 	}
-	removed = 1
-	return removed, nil
+	if len(perSnapshot) > 0 {
+		if err := s.recordPurge(ctx, namespace, token, perSnapshot); err != nil {
+			return 0, err
+		}
+	}
+	var purged uint64
+	for _, count := range perSnapshot {
+		purged += count
+	}
+	return purged, nil
+}
+
+// membershipCounts reports how many membership rows each snapshot holds for a
+// subject before the purge runs.
+func (s *Store) membershipCounts(ctx context.Context, namespace, token string) (map[uuid.UUID]uint64, error) {
+	rows, err := s.conn.Query(ctx, `SELECT snapshot_id, count()
+		FROM dmp_membership_snapshot
+		WHERE tenant_id = ? AND namespace = ? AND subject_token = ?
+		GROUP BY snapshot_id`, s.tenant, namespace, token)
+	if err != nil {
+		return nil, fmt.Errorf("%w: count subject memberships: %v", ErrStoreUnavailable, err)
+	}
+	defer rows.Close()
+	counts := make(map[uuid.UUID]uint64)
+	for rows.Next() {
+		var snapshotID uuid.UUID
+		var count uint64
+		if err := rows.Scan(&snapshotID, &count); err != nil {
+			return nil, fmt.Errorf("%w: scan subject membership count: %v", ErrStoreUnavailable, err)
+		}
+		counts[snapshotID] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: count subject memberships: %v", ErrStoreUnavailable, err)
+	}
+	return counts, nil
+}
+
+func (s *Store) recordPurge(ctx context.Context, namespace, token string, perSnapshot map[uuid.UUID]uint64) error {
+	batch, err := s.conn.PrepareBatch(ctx, `INSERT INTO dmp_snapshot_purge
+		(tenant_id, snapshot_id, namespace, subject_token, purged_rows, reason_code, purged_at)`)
+	if err != nil {
+		return fmt.Errorf("%w: prepare purge record: %v", ErrStoreUnavailable, err)
+	}
+	now := s.now()
+	for snapshotID, count := range perSnapshot {
+		if err := batch.Append(s.tenant, snapshotID, namespace, token, count, "revocation_purge", now); err != nil {
+			_ = batch.Abort()
+			return fmt.Errorf("%w: append purge record: %v", ErrStoreUnavailable, err)
+		}
+	}
+	if err := batch.Send(); err != nil {
+		return fmt.Errorf("%w: insert purge records: %v", ErrStoreUnavailable, err)
+	}
+	return nil
 }
 
 func (s *Store) count(ctx context.Context, query, namespace, token string, destination *uint64) error {

@@ -104,6 +104,9 @@ func (s *Store) Publish(ctx context.Context, snapshotID string) (Job, error) {
 	if job.Status != StatusVerified {
 		return job, fmt.Errorf("%w: job status is %s", ErrNotVerified, job.Status)
 	}
+	if job.PurgedRows > 0 {
+		return job, fmt.Errorf("%w: %d rows were purged after import", ErrVerification, job.PurgedRows)
+	}
 	count, checksum, err := s.ChecksumOf(ctx, snapshotID)
 	if err != nil {
 		return Job{}, err

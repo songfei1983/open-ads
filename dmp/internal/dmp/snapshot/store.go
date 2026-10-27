@@ -237,8 +237,14 @@ func (s *Store) Verify(ctx context.Context, snapshotID string) (Job, error) {
 	if err != nil {
 		return Job{}, err
 	}
-	if job.Status == StatusVerified || job.Status == StatusPublished {
+	if job.Status == StatusVerified {
 		return job, nil
+	}
+	if job.Status == StatusPublished {
+		// A published snapshot is sealed: its rows may have been reduced by
+		// revocation purges, so re-verifying it would compare against a checksum
+		// that no longer describes the live data.
+		return job, ErrSealed
 	}
 	if job.Status != StatusImporting {
 		return job, fmt.Errorf("%w: job status is %s", ErrJobState, job.Status)
@@ -250,6 +256,14 @@ func (s *Store) Verify(ctx context.Context, snapshotID string) (Job, error) {
 	}
 	job.StoredRows = uint64(len(keys))
 	checksum := Checksum(keys)
+	if job.PurgedRows > 0 {
+		reason := fmt.Sprintf("snapshot has %d purged rows and can no longer be verified", job.PurgedRows)
+		failed, stateErr := s.appendState(ctx, job, StatusFailed, reason)
+		if stateErr != nil {
+			return Job{}, stateErr
+		}
+		return failed, fmt.Errorf("%w: %s", ErrVerification, reason)
+	}
 
 	var reason string
 	switch {
@@ -458,7 +472,33 @@ func (s *Store) fillCounters(ctx context.Context, job *Job) error {
 	if err := countRows.Err(); err != nil {
 		return fmt.Errorf("%w: count stored rows: %v", ErrStoreUnavailable, err)
 	}
+
+	purgeRows, err := s.conn.Query(ctx, `SELECT sum(purged_rows) FROM dmp_snapshot_purge
+		WHERE tenant_id = ? AND snapshot_id = ?`, s.tenant, snapshotID)
+	if err != nil {
+		return fmt.Errorf("%w: count purged rows: %v", ErrStoreUnavailable, err)
+	}
+	if purgeRows.Next() {
+		if err := purgeRows.Scan(&job.PurgedRows); err != nil {
+			purgeRows.Close()
+			return fmt.Errorf("%w: scan purged rows: %v", ErrStoreUnavailable, err)
+		}
+	}
+	purgeRows.Close()
+	if err := purgeRows.Err(); err != nil {
+		return fmt.Errorf("%w: count purged rows: %v", ErrStoreUnavailable, err)
+	}
 	return nil
+}
+
+// PurgedRows reports how many membership rows revocation purges removed from a
+// snapshot.
+func (s *Store) PurgedRows(ctx context.Context, snapshotID string) (uint64, error) {
+	job, err := s.GetJob(ctx, snapshotID)
+	if err != nil {
+		return 0, err
+	}
+	return job.PurgedRows, nil
 }
 
 func (s *Store) newUUID() (uuid.UUID, error) {
