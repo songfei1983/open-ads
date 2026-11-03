@@ -18,7 +18,10 @@ func (e *Engine) Notify(ctx context.Context, outcome Outcome) {
 	}
 	client := e.NoticeClient
 	if client == nil {
-		client = &http.Client{Timeout: 500 * time.Millisecond}
+		client = &http.Client{
+			Timeout:       500 * time.Millisecond,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		}
 	}
 	timeout := e.NoticeTimeout
 	if timeout <= 0 {

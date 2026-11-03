@@ -39,6 +39,6 @@ make -C console run        # 单独起控制台(默认 :8083)
 
 控制台 <http://127.0.0.1:8083>;投放冒烟:`POST /sdk/v1/ad-requests`(728x90 / `publisher.test`/`demo`)。
 
-SSP 控制面冒烟(需要 `SSP_ADMIN_TOKEN`):`./ssp/scripts/integration.sh`。Iteration 5 验收记录见 [docs/plan/iteration-5/baseline-decisions.md](docs/plan/iteration-5/baseline-decisions.md)。
+SSP 控制面冒烟(需要 `SSP_ADMIN_TOKEN`):`./ssp/scripts/integration.sh`。配信全链路冒烟(需要 `SSP_ADMIN_TOKEN` + `DSP_ADMIN_TOKEN`,覆盖 filled → render → impression → click):`./ssp/scripts/filled-path.sh`(compose 内运行需加 `SSP_DSP_BID_URL=http://dsp:8081/openrtb2/bid SSP_DSP_CALLBACK_HOST=dsp`)。Iteration 5 验收记录见 [docs/plan/iteration-5/baseline-decisions.md](docs/plan/iteration-5/baseline-decisions.md)。
 
 Go 版本:模块统一要求 1.27.3+(标准库安全修复 GO-2026-6809)。

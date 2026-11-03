@@ -24,6 +24,7 @@ import (
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/control"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/dmp"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/domain"
+	"github.com/songfei1983/open-ads/ssp/internal/ssp/netguard"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/observability"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/render"
 	sspRuntime "github.com/songfei1983/open-ads/ssp/internal/ssp/runtime"
@@ -101,7 +102,10 @@ func main() {
 			server.SetDMPAdapter(&dmp.Adapter{
 				BaseURL: cfg.DMPURL, TenantID: cfg.DMPTenantID, Namespace: cfg.DMPNamespace,
 				ProviderID: cfg.DMPProviderID, HMACKey: key, Timeout: cfg.DMPTimeout,
-				Client: &http.Client{Timeout: 2 * time.Second},
+				Client: &http.Client{
+					Timeout:   2 * time.Second,
+					Transport: &http.Transport{DialContext: netguard.DialContext(2*time.Second, cfg.AllowPrivateCallbacks)},
+				},
 			})
 		} else if cfg.DMPURL != "" {
 			logger.Warn("SSP audience lookups are disabled; configure SSP_SUBJECT_HMAC_KEY")

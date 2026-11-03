@@ -57,7 +57,7 @@ func manifestFor(endpoints ...snapshot.DSPEndpoint) *snapshot.Manifest {
 }
 
 func engine() *auction.Engine {
-	return auction.NewEngine(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return auction.NewEngine(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), auction.AllowPrivateTargets())
 }
 
 func bidder(t *testing.T, price float64, mutate func(map[string]any)) (*httptest.Server, *atomic.Int32) {

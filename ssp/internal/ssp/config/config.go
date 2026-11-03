@@ -40,6 +40,10 @@ type Config struct {
 	InternalToken   string
 	ConfigPublisher bool
 
+	// AllowPrivateCallbacks waives the outbound private-address guard. It is a
+	// sandbox-only switch: peers live on a private container network there.
+	AllowPrivateCallbacks bool
+
 	// Read-only creative asset store shared with the DSP writer.
 	AssetStoreRoot string
 
@@ -98,6 +102,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	allowPrivateCallbacks, err := getEnvBool("SSP_ALLOW_PRIVATE_CALLBACKS")
+	if err != nil {
+		return nil, err
+	}
 	tokenKeyVersion, err := getEnvInt("SSP_TOKEN_KEY_VERSION", 1)
 	if err != nil {
 		return nil, err
@@ -138,21 +146,25 @@ func Load() (*Config, error) {
 		AdminToken:      getEnv("SSP_ADMIN_TOKEN", ""),
 		InternalToken:   getEnv("SSP_INTERNAL_TOKEN", ""),
 		ConfigPublisher: configPublisher,
-		AssetStoreRoot:  getEnv("OPENADS_ASSET_STORE_ROOT", "/var/openads/assets/ssp-read"),
-		TokenKey:        strings.TrimSpace(getEnv("SSP_TOKEN_KEY", "")),
-		TokenKeyVersion: uint32(tokenKeyVersion),
-		RenderTokenTTL:  time.Duration(renderTokenTTL) * time.Second,
-		EventTokenTTL:   time.Duration(eventTokenTTL) * time.Second,
-		DMPNamespace:    getEnv("SSP_DMP_NAMESPACE", "publisher-account-v1"),
-		DMPProviderID:   getEnv("SSP_DMP_PROVIDER_ID", ""),
-		DMPTenantID:     getEnv("SSP_DMP_TENANT_ID", "tenant-default"),
-		SubjectHMACKey:  strings.TrimSpace(getEnv("SSP_SUBJECT_HMAC_KEY", "")),
-		MaxSegments:     maxSegments,
-		ClientRateLimit: clientRateLimit,
-		AuctionTimeout:  time.Duration(auctionTimeout) * time.Millisecond,
-		DMPTimeout:      time.Duration(dmpTimeout) * time.Millisecond,
-		DSPTimeout:      time.Duration(dspTimeout) * time.Millisecond,
-		LogLevel:        getEnv("LOG_LEVEL", "INFO"),
+
+		// Sandbox-only: every peer sits on a private container network, so the
+		// outbound private-address guard must be waived explicitly.
+		AllowPrivateCallbacks: allowPrivateCallbacks,
+		AssetStoreRoot:        getEnv("OPENADS_ASSET_STORE_ROOT", "/var/openads/assets/ssp-read"),
+		TokenKey:              strings.TrimSpace(getEnv("SSP_TOKEN_KEY", "")),
+		TokenKeyVersion:       uint32(tokenKeyVersion),
+		RenderTokenTTL:        time.Duration(renderTokenTTL) * time.Second,
+		EventTokenTTL:         time.Duration(eventTokenTTL) * time.Second,
+		DMPNamespace:          getEnv("SSP_DMP_NAMESPACE", "publisher-account-v1"),
+		DMPProviderID:         getEnv("SSP_DMP_PROVIDER_ID", ""),
+		DMPTenantID:           getEnv("SSP_DMP_TENANT_ID", "tenant-default"),
+		SubjectHMACKey:        strings.TrimSpace(getEnv("SSP_SUBJECT_HMAC_KEY", "")),
+		MaxSegments:           maxSegments,
+		ClientRateLimit:       clientRateLimit,
+		AuctionTimeout:        time.Duration(auctionTimeout) * time.Millisecond,
+		DMPTimeout:            time.Duration(dmpTimeout) * time.Millisecond,
+		DSPTimeout:            time.Duration(dspTimeout) * time.Millisecond,
+		LogLevel:              getEnv("LOG_LEVEL", "INFO"),
 	}
 	if !validLogLevel(cfg.LogLevel) {
 		return nil, fmt.Errorf("invalid log level: %q", cfg.LogLevel)

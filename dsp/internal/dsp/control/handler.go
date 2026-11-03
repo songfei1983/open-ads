@@ -281,7 +281,18 @@ func (h *handler) listQuarantine(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) resolveQuarantine(w http.ResponseWriter, r *http.Request) {
-	err := h.store.ResolveQuarantine(r.Context(), r.PathValue("id"))
+	var request struct {
+		Reason string `json:"reason"`
+	}
+	if r.Body != nil {
+		decoder := json.NewDecoder(io.LimitReader(r.Body, 4<<10))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil && !errors.Is(err, io.EOF) {
+			h.writeError(w, invalid("reason", "body must be a JSON object with an optional reason"))
+			return
+		}
+	}
+	err := h.store.ResolveQuarantine(r.Context(), r.PathValue("id"), request.Reason)
 	if err != nil {
 		h.writeError(w, err)
 		return

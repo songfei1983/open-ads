@@ -137,3 +137,26 @@ func TestActiveDSPEndpointsOrdered(t *testing.T) {
 		t.Fatalf("expected priority order, got %v", endpoints)
 	}
 }
+
+func TestCallbackAllowedRejectsUnsafeTargets(t *testing.T) {
+	endpoint := snapshot.DSPEndpoint{
+		CallbackHosts: []string{"dsp.test", "127.0.0.1", "internal.dsp.test"},
+	}
+	allowed := []string{
+		"https://dsp.test/win", "http://dsp.test/loss", "https://dsp.test:8443/bill?price=1",
+	}
+	for _, rawURL := range allowed {
+		if !endpoint.CallbackAllowed(rawURL) {
+			t.Errorf("CallbackAllowed(%q) = false, want true", rawURL)
+		}
+	}
+	blocked := []string{
+		"", "ftp://dsp.test/win", "javascript:alert(1)", "file:///etc/passwd",
+		"https://evil.test/win", "https://dsp.test.evil.test/win",
+	}
+	for _, rawURL := range blocked {
+		if endpoint.CallbackAllowed(rawURL) {
+			t.Errorf("CallbackAllowed(%q) = true, want false", rawURL)
+		}
+	}
+}

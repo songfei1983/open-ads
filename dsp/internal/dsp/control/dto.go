@@ -301,13 +301,15 @@ type BudgetSummary struct {
 
 // QuarantineRecord represents an isolated notice record.
 type QuarantineRecord struct {
-	QuarantineID   string `json:"quarantine_id"`
-	ReservationID  string `json:"reservation_id"`
-	SourceEventKey string `json:"source_event_key"`
-	Outcome        string `json:"outcome"`
-	ReasonCode     string `json:"reason_code"`
-	Status         string `json:"status"`
-	ReceivedAt     string `json:"received_at"`
+	QuarantineID     string `json:"quarantine_id"`
+	ReservationID    string `json:"reservation_id"`
+	SourceEventKey   string `json:"source_event_key"`
+	Outcome          string `json:"outcome"`
+	ReasonCode       string `json:"reason_code"`
+	Status           string `json:"status"`
+	ReceivedAt       string `json:"received_at"`
+	ResolvedAt       string `json:"resolved_at,omitempty"`
+	ResolutionReason string `json:"resolution_reason,omitempty"`
 }
 
 // ConfigStatus represents the current publication status and manifest version.

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/dmp"
+	"github.com/songfei1983/open-ads/ssp/internal/ssp/netguard"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/observability"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/snapshot"
 )
@@ -96,32 +97,52 @@ type Engine struct {
 	Metrics       *observability.Metrics
 	Logger        *slog.Logger
 	Now           func() time.Time
+	// AllowPrivateTargets disables the private-address guard on outbound
+	// DSP/DMP traffic. Sandbox deployments set it because every service lives
+	// on a private Docker network; it must stay false when the callback
+	// allowlist can point at internal infrastructure.
+	AllowPrivateTargets bool
+}
+
+// Option customises engine construction.
+type Option func(*Engine)
+
+// AllowPrivateTargets lets the engine dial loopback and private addresses.
+func AllowPrivateTargets() Option {
+	return func(e *Engine) { e.AllowPrivateTargets = true }
 }
 
 // NewEngine builds an engine with bounded, non-redirecting HTTP clients.
-func NewEngine(metrics *observability.Metrics, logger *slog.Logger) *Engine {
+func NewEngine(metrics *observability.Metrics, logger *slog.Logger, options ...Option) *Engine {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	engine := &Engine{
+		Metrics:       metrics,
+		Logger:        logger,
+		NoticeTimeout: 300 * time.Millisecond,
+		Now:           func() time.Time { return time.Now().UTC() },
+	}
+	for _, option := range options {
+		option(engine)
+	}
+	dial := netguard.DialContext(5*time.Second, engine.AllowPrivateTargets)
 	transport := &http.Transport{
 		MaxIdleConns:        64,
 		MaxIdleConnsPerHost: 16,
 		IdleConnTimeout:     30 * time.Second,
+		DialContext:         dial,
 	}
-	client := &http.Client{
-		Transport: transport,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+	noRedirect := func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
-	return &Engine{
-		Client:        client,
-		NoticeClient:  &http.Client{Transport: transport, Timeout: 500 * time.Millisecond},
-		NoticeTimeout: 300 * time.Millisecond,
-		Metrics:       metrics,
-		Logger:        logger,
-		Now:           func() time.Time { return time.Now().UTC() },
+	engine.Client = &http.Client{Transport: transport, CheckRedirect: noRedirect}
+	engine.NoticeClient = &http.Client{
+		Transport:     transport,
+		Timeout:       500 * time.Millisecond,
+		CheckRedirect: noRedirect,
 	}
+	return engine
 }
 
 type wireRequest struct {

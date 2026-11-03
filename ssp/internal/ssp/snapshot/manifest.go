@@ -359,6 +359,9 @@ func (e DSPEndpoint) CallbackAllowed(rawURL string) bool {
 	if err != nil || parsed.Host == "" {
 		return false
 	}
+	if scheme := strings.ToLower(parsed.Scheme); scheme != "https" && scheme != "http" {
+		return false
+	}
 	host := strings.ToLower(parsed.Hostname())
 	for _, allowed := range e.CallbackHosts {
 		if strings.ToLower(strings.TrimSuffix(strings.TrimSpace(allowed), ".")) == host {

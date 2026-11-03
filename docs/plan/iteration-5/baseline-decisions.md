@@ -58,6 +58,13 @@ for m in identity console ssp dsp dmp; do (cd "$m" && gofmt -l . && go vet ./...
 node --check console/web/ssp-live.js
 node --check ssp/internal/ssp/adapter/http/sdk/openads-sdk.js
 
+# 配信全链路（filled → render → impression → click），CI 与本地共用
+SSP_ADMIN_TOKEN=... DSP_ADMIN_TOKEN=... ./ssp/scripts/filled-path.sh
+
+# DSP 账务写路径（真实 MariaDB，未设置 DSN 时跳过）
+cd dsp && DSP_MARIADB_TEST_DSN="dsp_user:dsp_pass@tcp(127.0.0.1:3306)/dsp_db?parseTime=true" \
+  go test ./internal/dsp/lease/ -run TestSettleReservation -v
+
 # 迁移与 compose
 make migration-check
 docker compose -f deployments/docker-compose.yml config >/dev/null

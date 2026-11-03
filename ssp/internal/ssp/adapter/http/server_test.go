@@ -136,6 +136,7 @@ func newHarness(t *testing.T, dmpStatus int) *harness {
 		ServiceName: "test-ssp", Port: 8080, AdminTenantID: testTenant,
 		AuctionTimeout: 150 * time.Millisecond, DMPTimeout: 50 * time.Millisecond, DSPTimeout: 50 * time.Millisecond,
 		RenderTokenTTL: time.Minute, EventTokenTTL: time.Hour, MaxSegments: 10, DMPNamespace: "publisher-account-v1",
+		AllowPrivateCallbacks: true,
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := adapterHTTP.NewServer(cfg, logger)
@@ -331,7 +332,8 @@ func TestSupplyIngressAuthenticatesAndAuctions(t *testing.T) {
 func TestProbesAndMissingConfiguration(t *testing.T) {
 	snapshot.Reset()
 	cfg := &config.Config{ServiceName: "test-ssp", Port: 8080, AuctionTimeout: 80 * time.Millisecond,
-		RenderTokenTTL: time.Minute, EventTokenTTL: time.Hour, MaxSegments: 10, AdminTenantID: testTenant}
+		RenderTokenTTL: time.Minute, EventTokenTTL: time.Hour, MaxSegments: 10, AdminTenantID: testTenant,
+		AllowPrivateCallbacks: true}
 	srv := adapterHTTP.NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()

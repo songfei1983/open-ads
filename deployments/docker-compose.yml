@@ -88,6 +88,9 @@ services:
       # Enable the admin management API and a publishing endpoint.
       DSP_ADMIN_TENANT_ID: "00000000-0000-0000-0000-000000000001"
       DSP_ADMIN_TOKEN: "supersecrettoken1234567890abcdEF"
+      # nurl/lurl/burl must be reachable from the SSP container, not from the
+      # DSP's own loopback.
+      DSP_BASE_NOTICE_URL: "http://dsp:8081"
       DSP_CONFIG_PUBLISHER: "true"
       # The DSP is the only writer of the SSP creative whitelist.
       SSP_INTERNAL_URL: "http://ssp:8080"
@@ -165,6 +168,9 @@ services:
       SSP_DMP_NAMESPACE: "publisher-account-v1"
       SSP_DMP_PROVIDER_ID: "dmp-provider-01"
       SSP_DMP_TENANT_ID: "tenant-default"
+      # Sandbox peers live on the private Docker bridge, so the outbound
+      # private-address guard is waived here. Keep it unset outside sandbox.
+      SSP_ALLOW_PRIVATE_CALLBACKS: "true"
       # Read-only view of the shared content-addressed DSP asset volume.
       OPENADS_ASSET_STORE_ROOT: "/var/openads/assets/dsp-write"
     ports:

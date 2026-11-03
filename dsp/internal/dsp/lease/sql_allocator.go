@@ -257,6 +257,7 @@ func (s *SQLBudgetStore) SettleReservation(ctx context.Context, params Settlemen
 		currency = "USD"
 	}
 
+	var settledLineItem []byte
 	for _, demand := range params.Demands {
 		if params.ActualAmount > demand.AmountMicros {
 			return fmt.Errorf("%w: actual amount exceeds reserved risk", ErrInvalidSettlement)
@@ -282,6 +283,9 @@ func (s *SQLBudgetStore) SettleReservation(ctx context.Context, params Settlemen
 				return fmt.Errorf("%w: lease not found for scope %q", ErrInvalidSettlement, demand.ScopeID)
 			}
 			return fmt.Errorf("query lease: %w", err)
+		}
+		if settledLineItem == nil {
+			settledLineItem = lineItemBytes
 		}
 
 		// Deduct held amount from lease
@@ -324,7 +328,10 @@ func (s *SQLBudgetStore) SettleReservation(ctx context.Context, params Settlemen
 		}
 	}
 
-	// For billable outcomes, record dsp_delivery_event and advertiser_spend_ledger
+	// For billable outcomes, record dsp_delivery_event and advertiser_spend_ledger.
+	// Attribution is always resolved from the persisted line item and campaign
+	// rows, never from the notice body, so a spoofed notice cannot bill another
+	// advertiser.
 	if params.Outcome == OutcomeBillable {
 		eventUUID := params.EventID
 		if eventUUID == "" {
@@ -334,9 +341,10 @@ func (s *SQLBudgetStore) SettleReservation(ctx context.Context, params Settlemen
 		if err != nil {
 			return fmt.Errorf("invalid event ID: %w", err)
 		}
-		advBytes := normalizeOptionalUUIDBytes(params.AdvertiserID)
-		campBytes := normalizeOptionalUUIDBytes(params.CampaignID)
-		liBytes := normalizeOptionalUUIDBytes(params.LineItemID)
+		advBytes, campBytes, liBytes, err := s.resolveAttribution(ctx, tx, params, settledLineItem)
+		if err != nil {
+			return err
+		}
 		crBytes := normalizeOptionalUUIDBytes(params.CreativeID)
 		occurredAt := params.OccurredAt
 		if occurredAt.IsZero() {
@@ -346,28 +354,61 @@ func (s *SQLBudgetStore) SettleReservation(ctx context.Context, params Settlemen
 		_, err = tx.ExecContext(ctx, `INSERT INTO dsp_delivery_event
 			(tenant_id, event_id, source_event_key, event_type, auction_id, bid_id, imp_id,
 			 advertiser_id, campaign_id, line_item_id, creative_id, currency, amount_micros, occurred_at, received_at, schema_version)
-			VALUES (?, ?, ?, 'billable', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), 1)
+			VALUES (?, ?, ?, 'billable', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
 			ON DUPLICATE KEY UPDATE received_at = VALUES(received_at)`,
 			s.tenantID, eventBytes, sourceKeyBytes, params.AuctionID, params.BidID, params.ImpID,
-			advBytes, campBytes, liBytes, crBytes, currency, params.ActualAmount, occurredAt)
+			advBytes, campBytes, liBytes, crBytes, currency, params.ActualAmount, occurredAt, now)
 		if err != nil {
 			return fmt.Errorf("insert dsp delivery event: %w", err)
 		}
 
 		entryUUID, _ := domain.NewUUIDv7()
 		entryBytes, _ := hex.DecodeString(entryUUID)
-		idempKey := sha256.Sum256([]byte(params.EventID + ":" + params.SourceEventKey))
+		idempKey := sha256.Sum256([]byte(eventUUID + ":" + params.SourceEventKey))
+		// The ledger is append-only: a replay with the same idempotency key is a
+		// no-op, never an amount update.
 		_, err = tx.ExecContext(ctx, `INSERT INTO advertiser_spend_ledger
-			(tenant_id, entry_id, idempotency_key, source_event_id, line_item_id, amount_micros)
-			VALUES (?, ?, ?, ?, ?, ?)
-			ON DUPLICATE KEY UPDATE amount_micros = VALUES(amount_micros)`,
-			s.tenantID, entryBytes, idempKey[:], eventBytes, liBytes, params.ActualAmount)
+			(tenant_id, entry_id, idempotency_key, source_event_id, advertiser_id, campaign_id,
+			 line_item_id, entry_type, amount_micros, currency, occurred_at, recorded_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, 'billable', ?, ?, ?, ?)
+			ON DUPLICATE KEY UPDATE entry_id = entry_id`,
+			s.tenantID, entryBytes, idempKey[:], eventBytes, advBytes, campBytes, liBytes,
+			params.ActualAmount, currency, occurredAt, now)
 		if err != nil {
 			return fmt.Errorf("insert advertiser spend ledger: %w", err)
 		}
 	}
 
 	return tx.Commit()
+}
+
+// resolveAttribution returns the advertiser, campaign and line item that own the
+// settled reservation. Explicit caller values win; otherwise the persisted
+// line_item/campaign rows are authoritative.
+func (s *SQLBudgetStore) resolveAttribution(ctx context.Context, tx *sql.Tx, params SettlementParams, lineItemBytes []byte) (adv, camp, li []byte, err error) {
+	if params.LineItemID != "" && params.CampaignID != "" && params.AdvertiserID != "" {
+		return normalizeOptionalUUIDBytes(params.AdvertiserID),
+			normalizeOptionalUUIDBytes(params.CampaignID),
+			normalizeOptionalUUIDBytes(params.LineItemID), nil
+	}
+	lineItemID := lineItemBytes
+	if params.LineItemID != "" {
+		lineItemID = normalizeOptionalUUIDBytes(params.LineItemID)
+	}
+	if lineItemID == nil {
+		return nil, nil, nil, fmt.Errorf("%w: no line item to attribute billable spend", ErrInvalidSettlement)
+	}
+	row := tx.QueryRowContext(ctx, `SELECT l.line_item_id, l.campaign_id, c.advertiser_id
+		FROM line_item l
+		JOIN campaign c ON c.tenant_id = l.tenant_id AND c.campaign_id = l.campaign_id
+		WHERE l.tenant_id = ? AND l.line_item_id = ?`, s.tenantID, lineItemID)
+	if err := row.Scan(&li, &camp, &adv); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil, nil, fmt.Errorf("%w: line item attribution not found", ErrInvalidSettlement)
+		}
+		return nil, nil, nil, fmt.Errorf("resolve billable attribution: %w", err)
+	}
+	return adv, camp, li, nil
 }
 
 // ReclaimExpiredLeases scans active leases past settlement_grace_until,

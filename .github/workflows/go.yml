@@ -53,9 +53,22 @@ jobs:
             dmp_namespace_version dmp_provider_version dmp_control_audit; do
             echo "$tables" | grep -qx "$table" || { echo "missing table: $table"; exit 1; }
           done
-      - name: Start SSP and DSP for the control-plane smoke test
+      - name: Start SSP and DSP for the control-plane and filled-path smoke tests
         run: |
-          (cd dsp && nohup go run ./cmd/dsp > "$RUNNER_TEMP/dsp.log" 2>&1 & echo $! > "$RUNNER_TEMP/dsp.pid")
+          mkdir -p "$RUNNER_TEMP/assets"
+          (cd dsp && \
+            DSP_ADMIN_TENANT_ID=00000000-0000-0000-0000-000000000001 \
+            DSP_ADMIN_TOKEN=supersecrettoken1234567890abcdEF \
+            DSP_CONFIG_PUBLISHER=true \
+            DSP_DB_HOST=127.0.0.1 DSP_DB_USER=dsp_user DSP_DB_PASSWORD=dsp_pass DSP_DB_NAME=dsp_db \
+            DSP_VALKEY_ADDR=127.0.0.1:6379 \
+            DSP_LEASE_TOKEN_KEY=2f8b1c4d6e8f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6071829 \
+            DSP_CREATIVE_WHITELIST=example.com=image/png \
+            DSP_BASE_NOTICE_URL=http://127.0.0.1:8081 \
+            OPENADS_ASSET_STORE_ROOT="$RUNNER_TEMP/assets" \
+            SSP_INTERNAL_URL=http://127.0.0.1:8080 \
+            SSP_INTERNAL_TOKEN=ssp-internal-token-0123456789abcdef \
+            nohup go run ./cmd/dsp > "$RUNNER_TEMP/dsp.log" 2>&1 & echo $! > "$RUNNER_TEMP/dsp.pid")
           (cd ssp && \
             SSP_ADMIN_TENANT_ID=00000000-0000-0000-0000-000000000001 \
             SSP_ADMIN_TOKEN=ssp-admin-token-0123456789abcdef \
@@ -64,6 +77,8 @@ jobs:
             SSP_TOKEN_KEY=1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809 \
             SSP_SUBJECT_HMAC_KEY=0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0 \
             SSP_DB_HOST=127.0.0.1 VALKEY_ADDR=127.0.0.1:6379 \
+            SSP_ALLOW_PRIVATE_CALLBACKS=true \
+            OPENADS_ASSET_STORE_ROOT="$RUNNER_TEMP/assets" \
             DSP_URL=http://127.0.0.1:8081 DMP_URL=http://127.0.0.1:8082 \
             nohup go run ./cmd/ssp > "$RUNNER_TEMP/ssp.log" 2>&1 & echo $! > "$RUNNER_TEMP/ssp.pid")
       - name: Verify the SSP control plane and ingress paths
@@ -71,6 +86,23 @@ jobs:
           SSP_ADMIN_TOKEN=ssp-admin-token-0123456789abcdef \
           SSP_DSP_BID_URL=http://127.0.0.1:8081/openrtb2/bid \
           ./ssp/scripts/integration.sh
+      - name: Verify the DSP settlement writes real ledger rows
+        run: |
+          cd dsp
+          DSP_MARIADB_TEST_DSN="dsp_user:dsp_pass@tcp(127.0.0.1:3306)/dsp_db?parseTime=true" \
+            go test ./internal/dsp/lease/ -run 'TestSettleReservation' -v
+      - name: Verify the filled request -> render -> impression -> click path
+        run: |
+          SSP_ADMIN_TOKEN=ssp-admin-token-0123456789abcdef \
+          DSP_ADMIN_TOKEN=supersecrettoken1234567890abcdEF \
+          SSP_DSP_BID_URL=http://127.0.0.1:8081/openrtb2/bid \
+          SSP_DSP_CALLBACK_HOST=127.0.0.1 \
+          ./ssp/scripts/filled-path.sh
+      - name: Upload service logs on failure
+        if: failure()
+        run: |
+          echo "==> DSP log"; tail -n 100 "$RUNNER_TEMP/dsp.log" || true
+          echo "==> SSP log"; tail -n 100 "$RUNNER_TEMP/ssp.log" || true
       - name: Stop infrastructure
         if: always()
         run: |

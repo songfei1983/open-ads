@@ -40,6 +40,12 @@ migration-check:
 	@test -s ssp/migrations/000002_ssp_control_plane.down.sql
 	@test -s dsp/migrations/000001_init_dsp_schema.up.sql
 	@test -s dsp/migrations/000001_init_dsp_schema.down.sql
+	@test -s dsp/migrations/000002_add_dsp_creative_asset_registry.up.sql
+	@test -s dsp/migrations/000002_add_dsp_creative_asset_registry.down.sql
+	@test -s dsp/migrations/000003_add_dsp_published_config.up.sql
+	@test -s dsp/migrations/000003_add_dsp_published_config.down.sql
+	@test -s dsp/migrations/000004_dsp_quarantine_resolution.up.sql
+	@test -s dsp/migrations/000004_dsp_quarantine_resolution.down.sql
 	@test -s dmp/migrations/000001_init_dmp_schema.up.sql
 	@test -s dmp/migrations/000001_init_dmp_schema.down.sql
 	@test -s dmp/migrations/000002_dmp_control_plane.up.sql

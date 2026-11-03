@@ -49,7 +49,11 @@ func NewServer(cfg *config.Config, logger *slog.Logger) *Server {
 		metrics: &observability.Metrics{},
 		limiter: limiter.New(),
 	}
-	s.engine = auction.NewEngine(s.metrics, logger)
+	var engineOptions []auction.Option
+	if cfg.AllowPrivateCallbacks {
+		engineOptions = append(engineOptions, auction.AllowPrivateTargets())
+	}
+	s.engine = auction.NewEngine(s.metrics, logger, engineOptions...)
 
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
