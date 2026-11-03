@@ -6,10 +6,10 @@
 
 | 服务 | 端口 | 说明 |
 |---|---|---|
-| SSP Client/API | `8080` | 广告请求、OpenRTB auction、同源 render 代理 |
+| SSP Client/API | `8080` | 广告请求、OpenRTB auction、管理 API、静态素材 renderer |
 | DSP | `8081` | 决策器、发布管理 API(`/admin/v1`)、render 端点 |
 | DMP | `8082` | 受众 resolve、身份撤回 |
-| Console | `8083` | 独立沙箱控制台(静态服务,带 live-reload) |
+| Console | `8083` | 独立沙箱控制台(SSP/DSP/DMP live API,带 live-reload) |
 | MariaDB | `3306` | SSP(`ssp_db`)/ DSP(`dsp_db`) |
 | Valkey | `6379` | 租约/发布的跨实例协调,ACL 按 `ssp:` `dsp:` `dmp:` 前缀隔离 |
 | ClickHouse | `9000` / `8123` | DMP 事件面 |
@@ -38,5 +38,7 @@ make -C console run        # 单独起控制台(默认 :8083)
 ```
 
 控制台 <http://127.0.0.1:8083>;投放冒烟:`POST /sdk/v1/ad-requests`(728x90 / `publisher.test`/`demo`)。
+
+SSP 控制面冒烟(需要 `SSP_ADMIN_TOKEN`):`./ssp/scripts/integration.sh`。Iteration 5 验收记录见 [docs/plan/iteration-5/baseline-decisions.md](docs/plan/iteration-5/baseline-decisions.md)。
 
 Go 版本:模块统一要求 1.27.3+(标准库安全修复 GO-2026-6809)。

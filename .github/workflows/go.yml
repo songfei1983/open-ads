@@ -53,27 +53,24 @@ jobs:
             dmp_namespace_version dmp_provider_version dmp_control_audit; do
             echo "$tables" | grep -qx "$table" || { echo "missing table: $table"; exit 1; }
           done
-      - name: Start SSP and DSP for RTB smoke test
+      - name: Start SSP and DSP for the control-plane smoke test
         run: |
           (cd dsp && nohup go run ./cmd/dsp > "$RUNNER_TEMP/dsp.log" 2>&1 & echo $! > "$RUNNER_TEMP/dsp.pid")
-          (cd ssp && DSP_URL=http://127.0.0.1:8081 nohup go run ./cmd/ssp > "$RUNNER_TEMP/ssp.log" 2>&1 & echo $! > "$RUNNER_TEMP/ssp.pid")
-          # The DSP serves only against published snapshots and none exists in
-          # this smoke environment; its /readyz therefore stays 503 by design,
-          # while the bid path still answers no-bid (nbr=2). Gate on the SSP
-          # readiness only.
-          for attempt in $(seq 1 30); do
-            curl --fail --silent http://127.0.0.1:8080/readyz && break
-            sleep 1
-          done
-          curl --fail --silent http://127.0.0.1:8080/readyz
-      - name: Verify SSP to DSP OpenRTB no-bid smoke
+          (cd ssp && \
+            SSP_ADMIN_TENANT_ID=00000000-0000-0000-0000-000000000001 \
+            SSP_ADMIN_TOKEN=ssp-admin-token-0123456789abcdef \
+            SSP_INTERNAL_TOKEN=ssp-internal-token-0123456789abcdef \
+            SSP_CONFIG_PUBLISHER=true \
+            SSP_TOKEN_KEY=1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809 \
+            SSP_SUBJECT_HMAC_KEY=0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0 \
+            SSP_DB_HOST=127.0.0.1 VALKEY_ADDR=127.0.0.1:6379 \
+            DSP_URL=http://127.0.0.1:8081 DMP_URL=http://127.0.0.1:8082 \
+            nohup go run ./cmd/ssp > "$RUNNER_TEMP/ssp.log" 2>&1 & echo $! > "$RUNNER_TEMP/ssp.pid")
+      - name: Verify the SSP control plane and ingress paths
         run: |
-          response="$(curl --fail --silent --X POST http://127.0.0.1:8080/openrtb2/auction \
-            -H 'Content-Type: application/json' \
-            --data-binary @fixtures/openrtb2/bid_request_banner.json)"
-          echo "$response"
-          echo "$response" | grep -q '"id"'
-          echo "$response" | grep -q '"nbr":2'
+          SSP_ADMIN_TOKEN=ssp-admin-token-0123456789abcdef \
+          SSP_DSP_BID_URL=http://127.0.0.1:8081/openrtb2/bid \
+          ./ssp/scripts/integration.sh
       - name: Stop infrastructure
         if: always()
         run: |

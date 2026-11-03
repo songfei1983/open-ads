@@ -105,6 +105,7 @@ func NewServer(webDir string) http.Handler {
 	})
 	mux.Handle("/api/dsp/", newDSPAdminProxy())
 	mux.Handle("/api/dmp/", newDMPAdminProxy())
+	mux.Handle("/api/ssp/", newSSPAdminProxy())
 	mux.Handle("/", &staticHandler{webDir: webDir})
 	return mux
 }
@@ -236,6 +237,59 @@ func newDMPAdminProxy() http.Handler {
 		}
 		if !allowed {
 			writeAPIError(w, http.StatusNotFound, "not_found", "该 DMP 路径不允许通过 console 访问")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), dspAdminProxyTimeout)
+		defer cancel()
+		request := r.Clone(ctx)
+		request.URL.Path = upstreamPath
+		request.Host = upstream.Host
+		request.Header.Set("Authorization", "Bearer "+token)
+		request.Header.Del("Cookie")
+		proxy.ServeHTTP(w, request)
+	})
+}
+
+// newSSPAdminProxy bridges the browser to the SSP management API. Only the
+// tenant-scoped /admin/v1 surface is reachable and the bearer token never
+// leaves the console process.
+func newSSPAdminProxy() http.Handler {
+	logger := slog.Default()
+	target := strings.TrimRight(os.Getenv("SSP_ADMIN_URL"), "/")
+	if target == "" {
+		target = "http://127.0.0.1:8080"
+	}
+	upstream, err := url.Parse(target)
+	if err != nil || upstream.Scheme == "" || upstream.Host == "" {
+		logger.Error("SSP_ADMIN_URL is not a valid admin upstream URL", slog.String("target", target), slog.Any("error", err))
+	}
+	proxy := httputil.NewSingleHostReverseProxy(upstream)
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, proxyErr error) {
+		logger.Warn("SSP admin upstream failed", slog.String("upstream", target), slog.Any("error", proxyErr))
+		writeAPIError(w, http.StatusBadGateway, "ssp_admin_unreachable", "SSP 管理 API 不可达，请确认 SSP 服务在运行")
+	}
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		resp.Header.Set("Cache-Control", "no-store")
+		return nil
+	}
+	token := strings.TrimSpace(os.Getenv("SSP_ADMIN_TOKEN"))
+	proxy.Transport = &http.Transport{
+		MaxIdleConns:        4,
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     30 * time.Second,
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if token == "" {
+			writeAPIError(w, http.StatusServiceUnavailable, "ssp_admin_unconfigured", "SSP 管理 API token 未配置（SSP_ADMIN_TOKEN）")
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodPut {
+			writeAPIError(w, http.StatusMethodNotAllowed, "invalid_request", "console 仅转发 GET/POST/PUT 到 SSP 管理 API")
+			return
+		}
+		upstreamPath := strings.TrimPrefix(r.URL.Path, "/api/ssp")
+		if !strings.HasPrefix(upstreamPath, "/admin/v1/") {
+			writeAPIError(w, http.StatusNotFound, "not_found", "仅 /admin/v1/* 可通过代理访问")
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), dspAdminProxyTimeout)

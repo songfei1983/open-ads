@@ -89,6 +89,9 @@ services:
       DSP_ADMIN_TENANT_ID: "00000000-0000-0000-0000-000000000001"
       DSP_ADMIN_TOKEN: "supersecrettoken1234567890abcdEF"
       DSP_CONFIG_PUBLISHER: "true"
+      # The DSP is the only writer of the SSP creative whitelist.
+      SSP_INTERNAL_URL: "http://ssp:8080"
+      SSP_INTERNAL_TOKEN: "ssp-internal-token-0123456789abcdef"
     ports:
       - "127.0.0.1:8081:8081"
     volumes:
@@ -116,6 +119,9 @@ services:
       # Same pattern for DMP: the operator token stays in the console process.
       DMP_ADMIN_URL: "http://dmp:8082"
       DMP_ADMIN_TOKEN: "dmp-admin-token-0123456789abcdef"
+      # SSP management API for the live SSP console.
+      SSP_ADMIN_URL: "http://ssp:8080"
+      SSP_ADMIN_TOKEN: "ssp-admin-token-0123456789abcdef"
     ports:
       - "127.0.0.1:8083:8083"
     volumes:
@@ -138,17 +144,35 @@ services:
       - dsp
       - dmp
     environment:
-      # Use defaults from config loader; override if needed.
       SSP_PORT: "8080"
-      # Route client auctions to the DSP bidder and consent checks to the DMP.
       DSP_URL: "http://dsp:8081"
       DMP_URL: "http://dmp:8082"
       VALKEY_ADDR: "valkey:6379"
+      SSP_DB_HOST: "mariadb"
+      SSP_DB_PORT: "3306"
+      SSP_DB_USER: "ssp_user"
+      SSP_DB_PASSWORD: "ssp_pass"
+      SSP_DB_NAME: "ssp_db"
+      SSP_VALKEY_USER: "ssp"
+      SSP_VALKEY_PASSWORD: "ssp_valkey_password"
+      SSP_ADMIN_TENANT_ID: "00000000-0000-0000-0000-000000000001"
+      SSP_ADMIN_TOKEN: "ssp-admin-token-0123456789abcdef"
+      SSP_INTERNAL_TOKEN: "ssp-internal-token-0123456789abcdef"
+      SSP_CONFIG_PUBLISHER: "true"
+      # Sandbox render/click/event token key (32 bytes hex).
+      SSP_TOKEN_KEY: "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809"
+      SSP_SUBJECT_HMAC_KEY: "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
+      SSP_DMP_NAMESPACE: "publisher-account-v1"
+      SSP_DMP_PROVIDER_ID: "dmp-provider-01"
+      SSP_DMP_TENANT_ID: "tenant-default"
+      # Read-only view of the shared content-addressed DSP asset volume.
+      OPENADS_ASSET_STORE_ROOT: "/var/openads/assets/dsp-write"
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
       - ../ssp:/src
       - ../ssp/.air.toml:/src/.air.toml
+      - dsp_assets:/var/openads:ro
     command: ["-c", ".air.toml"]
 
   # DMP service – built from the local Dockerfile.

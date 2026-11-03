@@ -309,3 +309,73 @@ func TestDMPProxyRequiresToken(t *testing.T) {
 		t.Fatalf("missing DMP token should be 503, got %d", resp.StatusCode)
 	}
 }
+
+func TestSSPProxyInjectsTokenAndOnlyAllowsAdminPaths(t *testing.T) {
+	var recorded []string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recorded = append(recorded, r.Method+" "+r.URL.Path+" auth="+maskAuth(r.Header.Get("Authorization")))
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(stub.Close)
+	client, baseURL := proxyClient(t, map[string]string{
+		"SSP_ADMIN_URL":   stub.URL,
+		"SSP_ADMIN_TOKEN": "ssp-secret-token",
+	})
+
+	resp, err := client.Get(baseURL + "/api/ssp/admin/v1/publishers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("proxied admin call: %d", resp.StatusCode)
+	}
+	if len(recorded) != 1 || recorded[0] != "GET /admin/v1/publishers auth=******" {
+		t.Fatalf("unexpected upstream call: %v", recorded)
+	}
+
+	nonAdmin, err := client.Get(baseURL + "/api/ssp/openrtb2/auction")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonAdmin.Body.Close()
+	if nonAdmin.StatusCode != http.StatusNotFound {
+		t.Fatalf("non-admin path should be 404, got %d", nonAdmin.StatusCode)
+	}
+
+	request, err := http.NewRequest(http.MethodDelete, baseURL+"/api/ssp/admin/v1/publishers/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteResp, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteResp.Body.Close()
+	if deleteResp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("DELETE should be 405, got %d", deleteResp.StatusCode)
+	}
+	if len(recorded) != 1 {
+		t.Fatalf("rejected requests leaked to upstream: %v", recorded)
+	}
+}
+
+func TestSSPProxyRequiresToken(t *testing.T) {
+	client, baseURL := proxyClient(t, map[string]string{"SSP_ADMIN_TOKEN": ""})
+	resp, err := client.Get(baseURL + "/api/ssp/admin/v1/publishers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("missing token should be 503, got %d", resp.StatusCode)
+	}
+}
+
+func maskAuth(value string) string {
+	if value == "" {
+		return ""
+	}
+	return "******"
+}

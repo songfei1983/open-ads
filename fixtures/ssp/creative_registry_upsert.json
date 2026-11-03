@@ -1,0 +1,16 @@
+{
+  "creatives": [
+    {
+      "creative_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89015",
+      "asset_ref": "as:018f7a3b2c9d7e1fa3b4c5d6e7f89016:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "asset_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "width_px": 728,
+      "height_px": 90,
+      "mime_type": "image/png",
+      "landing_url_host": "publisher.test",
+      "landing_url": "https://publisher.test/landing",
+      "status": "active",
+      "version": 1
+    }
+  ]
+}

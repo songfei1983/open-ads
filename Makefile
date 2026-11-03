@@ -36,6 +36,8 @@ migration-check:
 	@docker compose -f deployments/docker-compose.yml config >/dev/null
 	@test -s ssp/migrations/000001_init_ssp_schema.up.sql
 	@test -s ssp/migrations/000001_init_ssp_schema.down.sql
+	@test -s ssp/migrations/000002_ssp_control_plane.up.sql
+	@test -s ssp/migrations/000002_ssp_control_plane.down.sql
 	@test -s dsp/migrations/000001_init_dsp_schema.up.sql
 	@test -s dsp/migrations/000001_init_dsp_schema.down.sql
 	@test -s dmp/migrations/000001_init_dmp_schema.up.sql
