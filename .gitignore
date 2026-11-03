@@ -24,3 +24,6 @@ tmp/
 
 # Scratch test images
 tiny*.png
+
+# Console binary built by `go build`/`make -C console`
+console/console
