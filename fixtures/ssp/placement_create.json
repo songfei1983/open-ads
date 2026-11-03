@@ -1,0 +1,12 @@
+{
+  "property_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89013",
+  "auction_policy_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89014",
+  "name": "Home Leaderboard",
+  "media_type": "banner",
+  "width": 728,
+  "height": 90,
+  "floor_cpm_micros": 1200000,
+  "currency": "USD",
+  "privacy_policy": "consent_required",
+  "allowed_origins": ["https://publisher.test"]
+}

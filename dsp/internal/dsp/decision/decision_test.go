@@ -36,7 +36,7 @@ func TestFixtureDecisionerTargeting(t *testing.T) {
 		Creatives: map[string]domain.Creative{
 			"creative-1": {
 				ID: "creative-1", Active: true,
-				AssetMeta: domain.AssetMeta{MIMEType: "image/png", SizeKB: 20, Hash: "sha256:abc", Host: "assets.example.com"},
+				AssetMeta: domain.AssetMeta{MIMEType: "image/png", SizeKB: 20, Hash: "aaaa000000000000000000000000000000000000000000000000000000000000", Host: "assets.example.com", AssetRef: "as:00000000000000000000000000000001:aaaa000000000000000000000000000000000000000000000000000000000000", Width: 300, Height: 250, LandingURL: "https://assets.example.com/landing"},
 			},
 		},
 	}
@@ -96,7 +96,7 @@ func TestFixtureDecisionerWithBudgetReservation(t *testing.T) {
 		Creatives: map[string]domain.Creative{
 			"creative-1": {
 				ID: "creative-1", Active: true,
-				AssetMeta: domain.AssetMeta{MIMEType: "image/png", SizeKB: 20, Hash: "sha256:abc", Host: "assets.example.com"},
+				AssetMeta: domain.AssetMeta{MIMEType: "image/png", SizeKB: 20, Hash: "aaaa000000000000000000000000000000000000000000000000000000000000", Host: "assets.example.com", AssetRef: "as:00000000000000000000000000000001:aaaa000000000000000000000000000000000000000000000000000000000000", Width: 300, Height: 250, LandingURL: "https://assets.example.com/landing"},
 			},
 		},
 	}

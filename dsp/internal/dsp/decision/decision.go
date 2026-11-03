@@ -39,6 +39,11 @@ type Response struct {
 	WinNoticeURL      string
 	BillableNoticeURL string
 	LossNoticeURL     string
+	AssetRef          string
+	AssetSHA256       string
+	AssetWidth        int
+	AssetHeight       int
+	LandingURL        string
 }
 
 // Decisioner makes a bid decision without coupling the transport to storage.

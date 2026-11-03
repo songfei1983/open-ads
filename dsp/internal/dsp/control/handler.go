@@ -1,6 +1,8 @@
 package control
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
@@ -8,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/assets"
@@ -15,10 +18,21 @@ import (
 	"github.com/songfei1983/open-ads/dsp/internal/dsp/snapshot"
 )
 
+// SSPSyncConfig configures the DSP to SSP creative whitelist sync.
+type SSPSyncConfig struct {
+	BaseURL    string
+	Token      string
+	EndpointID string
+	Client     *http.Client
+}
+
 // NewHandler creates the tenant-scoped management API. Requests require the
 // configured bearer secret; tenant identity comes from server configuration.
-func NewHandler(store *SQLStore, bearerSecret string) http.Handler {
+func NewHandler(store *SQLStore, bearerSecret string, sspSync ...SSPSyncConfig) http.Handler {
 	h := &handler{store: store, bearerSecret: bearerSecret}
+	if len(sspSync) > 0 {
+		h.sspSync = sspSync[0]
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /admin/v1/advertisers", h.listAdvertisers)
 	mux.HandleFunc("POST /admin/v1/advertisers", h.createAdvertiser)
@@ -44,12 +58,14 @@ func NewHandler(store *SQLStore, bearerSecret string) http.Handler {
 	// Resolve a quarantine entry – use a valid URL pattern.
 	mux.HandleFunc("POST /admin/v1/quarantine/{id}/resolve", h.resolveQuarantine)
 	mux.HandleFunc("GET /admin/v1/status", h.getStatus)
+	mux.HandleFunc("POST /admin/v1/ssp/creative-registry/sync", h.syncCreativeRegistry)
 	return h.authenticate(mux)
 }
 
 type handler struct {
 	store        *SQLStore
 	bearerSecret string
+	sspSync      SSPSyncConfig
 }
 
 func (h *handler) authenticate(next http.Handler) http.Handler {
@@ -265,7 +281,18 @@ func (h *handler) listQuarantine(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) resolveQuarantine(w http.ResponseWriter, r *http.Request) {
-	err := h.store.ResolveQuarantine(r.Context(), r.PathValue("id"))
+	var request struct {
+		Reason string `json:"reason"`
+	}
+	if r.Body != nil {
+		decoder := json.NewDecoder(io.LimitReader(r.Body, 4<<10))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil && !errors.Is(err, io.EOF) {
+			h.writeError(w, invalid("reason", "body must be a JSON object with an optional reason"))
+			return
+		}
+	}
+	err := h.store.ResolveQuarantine(r.Context(), r.PathValue("id"), request.Reason)
 	if err != nil {
 		h.writeError(w, err)
 		return
@@ -368,4 +395,92 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(data)
+}
+
+type creativeRegistryPayload struct {
+	Creatives []creativeRegistryEntry `json:"creatives"`
+}
+
+type creativeRegistryEntry struct {
+	CreativeID     string `json:"creative_id"`
+	AssetRef       string `json:"asset_ref"`
+	AssetSHA256    string `json:"asset_sha256"`
+	Width          int    `json:"width_px"`
+	Height         int    `json:"height_px"`
+	MIMEType       string `json:"mime_type"`
+	LandingURLHost string `json:"landing_url_host"`
+	LandingURL     string `json:"landing_url"`
+	Status         string `json:"status"`
+	Version        uint64 `json:"version"`
+}
+
+// syncCreativeRegistry is the only DSP-side writer of the SSP whitelist.
+// The SSP never accepts operator supplied creative metadata.
+func (h *handler) syncCreativeRegistry(w http.ResponseWriter, r *http.Request) {
+	if h.sspSync.BaseURL == "" || h.sspSync.Token == "" {
+		writeAPIError(w, http.StatusServiceUnavailable, "ssp_sync_unconfigured", "SSP creative registry sync is not configured")
+		return
+	}
+	// D-01 replaces this operator supplied target with mTLS endpoint identity.
+	// In the sandbox the SSP endpoint id may be passed per sync request.
+	targetEndpoint := h.sspSync.EndpointID
+	if r.Body != nil {
+		var request struct {
+			DSPEndpointID string `json:"dsp_endpoint_id"`
+		}
+		_ = json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&request)
+		if request.DSPEndpointID != "" {
+			targetEndpoint = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(request.DSPEndpointID), "-", ""))
+		}
+	}
+	if targetEndpoint == "" {
+		writeAPIError(w, http.StatusUnprocessableEntity, "ssp_endpoint_required", "an SSP DSP endpoint id is required for sync")
+		return
+	}
+	creatives, err := h.store.ListPublishedCreatives(r.Context())
+	if err != nil {
+		h.writeError(w, err)
+		return
+	}
+	payload := creativeRegistryPayload{Creatives: make([]creativeRegistryEntry, 0, len(creatives))}
+	for _, creative := range creatives {
+		payload.Creatives = append(payload.Creatives, creativeRegistryEntry{
+			CreativeID: creative.ID, AssetRef: creative.AssetRef, AssetSHA256: creative.AssetSHA256,
+			Width: creative.Width, Height: creative.Height, MIMEType: creative.MIMEType,
+			LandingURLHost: creative.LandingURLHost, LandingURL: creative.LandingURL,
+			Status: "active", Version: creative.Version,
+		})
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		h.writeError(w, err)
+		return
+	}
+	client := h.sspSync.Client
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	target := h.sspSync.BaseURL + "/internal/v1/dsp-endpoints/" + targetEndpoint + "/creative-registry:upsert"
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
+	if err != nil {
+		writeAPIError(w, http.StatusBadGateway, "ssp_sync_failed", "SSP creative registry sync failed")
+		return
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+h.sspSync.Token)
+	response, err := client.Do(request)
+	if err != nil {
+		writeAPIError(w, http.StatusBadGateway, "ssp_sync_failed", "SSP creative registry sync failed")
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		writeAPIError(w, http.StatusBadGateway, "ssp_sync_rejected", "SSP rejected the creative registry sync")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, io.LimitReader(response.Body, 1<<20))
 }

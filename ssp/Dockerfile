@@ -5,6 +5,7 @@ WORKDIR /src
 
 # Cache module files
 COPY go.mod ./
+COPY go.sum ./
 RUN go mod download
 
 # Copy source

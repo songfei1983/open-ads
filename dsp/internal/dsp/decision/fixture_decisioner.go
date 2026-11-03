@@ -126,8 +126,23 @@ func (f FixtureDecisioner) Decide(ctx context.Context, req Request) (Response, e
 		impID := "1"
 		price := float64(best.BidCPMMicros) / 1_000_000.0
 		crid := ""
-		if len(best.CreativeIDs) > 0 {
-			crid = best.CreativeIDs[0]
+		var chosen domain.Creative
+		for _, creativeID := range best.CreativeIDs {
+			candidate, ok := man.Creatives[creativeID]
+			if !ok || !candidate.Active || candidate.AssetMeta.Hash == "" {
+				continue
+			}
+			if !supportedImageMIME(candidate.AssetMeta.MIMEType) {
+				continue
+			}
+			if !whitelisted(candidate.AssetMeta, f.Whitelist) {
+				continue
+			}
+			crid, chosen = creativeID, candidate
+			break
+		}
+		if crid == "" {
+			return noBid(req.ID), nil
 		}
 		tenantID := f.TenantID
 		if tenantID == "" {
@@ -185,6 +200,11 @@ func (f FixtureDecisioner) Decide(ctx context.Context, req Request) (Response, e
 			WinNoticeURL:          nurl,
 			BillableNoticeURL:     burl,
 			LossNoticeURL:         lurl,
+			AssetRef:              chosen.AssetMeta.AssetRef,
+			AssetSHA256:           chosen.AssetMeta.Hash,
+			AssetWidth:            chosen.AssetMeta.Width,
+			AssetHeight:           chosen.AssetMeta.Height,
+			LandingURL:            chosen.AssetMeta.LandingURL,
 		}, nil
 	}
 	return noBid(req.ID), nil
@@ -266,13 +286,20 @@ func hasValidCreative(manifest *snapshot.Manifest, lineItem domain.LineItem, whi
 			continue
 		}
 		asset := creative.AssetMeta
-		if asset.SizeKB <= 0 || asset.Hash == "" || !supportedImageMIME(asset.MIMEType) {
+		if asset.SizeKB <= 0 || asset.Hash == "" || asset.AssetRef == "" || !supportedImageMIME(asset.MIMEType) {
 			continue
 		}
-		for _, allowed := range whitelist {
-			if allowed.Host == asset.Host && allowed.MIME == asset.MIMEType {
-				return true
-			}
+		if whitelisted(asset, whitelist) {
+			return true
+		}
+	}
+	return false
+}
+
+func whitelisted(asset domain.AssetMeta, whitelist []domain.WhiteListEntry) bool {
+	for _, allowed := range whitelist {
+		if allowed.Host == asset.Host && allowed.MIME == asset.MIMEType {
+			return true
 		}
 	}
 	return false

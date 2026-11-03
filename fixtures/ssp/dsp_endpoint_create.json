@@ -1,0 +1,8 @@
+{
+  "name": "Sandbox DSP",
+  "bid_url": "https://dsp.test.example/openrtb2/bid",
+  "openrtb_profile": "openrtb2.6",
+  "callback_hosts": ["dsp.test.example"],
+  "priority": 10,
+  "timeout_ms": 50
+}

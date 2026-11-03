@@ -1,0 +1,7 @@
+{
+  "name": "Sandbox first price",
+  "at": 1,
+  "tie_breaker": "dsp_priority_then_ssp_hash",
+  "floor_enforcement": "strict",
+  "currency_policy": "exact_match"
+}

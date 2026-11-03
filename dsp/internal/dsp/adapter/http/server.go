@@ -253,6 +253,15 @@ func (s *Server) handleOpenRTBBid(w http.ResponseWriter, r *http.Request) {
 	if result.ReservationToken != "" {
 		ext["reservation_ref"] = result.ReservationToken
 	}
+	// The SSP verifies these against its synced creative whitelist before the
+	// bid can win, so they must describe the immutable asset exactly.
+	ext["openads"] = map[string]any{
+		"asset_ref":       result.AssetRef,
+		"asset_sha256":    result.AssetSHA256,
+		"asset_width_px":  result.AssetWidth,
+		"asset_height_px": result.AssetHeight,
+		"landing_url":     result.LandingURL,
+	}
 
 	bidResponse := map[string]any{
 		"id": req.ID,

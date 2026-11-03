@@ -15,6 +15,22 @@ type Metrics struct {
 	errors        atomic.Uint64
 	durationNanos atomic.Uint64
 	buckets       [len(metricBuckets) + 1]atomic.Uint64
+	business      *Business
+}
+
+// SetBusiness makes the handler render a caller-owned business registry.
+func (m *Metrics) SetBusiness(business *Business) {
+	if business != nil {
+		m.business = business
+	}
+}
+
+// Business returns the business metric set rendered with the HTTP metrics.
+func (m *Metrics) Business() *Business {
+	if m.business == nil {
+		m.business = NewBusiness()
+	}
+	return m.business
 }
 
 // Observe records one completed HTTP request.
@@ -50,4 +66,7 @@ func (m *Metrics) Handler(w http.ResponseWriter, _ *http.Request) {
 	}
 	cumulative += m.buckets[len(metricBuckets)].Load()
 	fmt.Fprintf(w, "open_ads_http_request_duration_seconds_bucket{le=\"+Inf\"} %d\n", cumulative)
+	if business := m.Business(); business != nil {
+		business.Write(w)
+	}
 }

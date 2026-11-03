@@ -949,7 +949,7 @@ func (s *SQLStore) ListBudgets(ctx context.Context) ([]BudgetSummary, error) {
 
 func (s *SQLStore) ListQuarantine(ctx context.Context) ([]QuarantineRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT quarantine_id, reservation_id, source_event_key, outcome,
-		reason_code, status, received_at
+		reason_code, status, received_at, resolved_at, resolution_reason
 		FROM dsp_notice_quarantine WHERE tenant_id = ? ORDER BY received_at DESC LIMIT 100`, s.tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("list quarantine: %w", err)
@@ -961,10 +961,13 @@ func (s *SQLStore) ListQuarantine(ctx context.Context) ([]QuarantineRecord, erro
 		var qBytes, resBytes, srcBytes []byte
 		var outcome, reason, status string
 		var receivedAt time.Time
-		if err := rows.Scan(&qBytes, &resBytes, &srcBytes, &outcome, &reason, &status, &receivedAt); err != nil {
+		var resolvedAt sql.NullTime
+		var resolutionReason sql.NullString
+		if err := rows.Scan(&qBytes, &resBytes, &srcBytes, &outcome, &reason, &status, &receivedAt,
+			&resolvedAt, &resolutionReason); err != nil {
 			return nil, fmt.Errorf("scan quarantine: %w", err)
 		}
-		items = append(items, QuarantineRecord{
+		record := QuarantineRecord{
 			QuarantineID:   hex.EncodeToString(qBytes),
 			ReservationID:  hex.EncodeToString(resBytes),
 			SourceEventKey: hex.EncodeToString(srcBytes),
@@ -972,24 +975,50 @@ func (s *SQLStore) ListQuarantine(ctx context.Context) ([]QuarantineRecord, erro
 			ReasonCode:     reason,
 			Status:         status,
 			ReceivedAt:     receivedAt.Format(time.RFC3339),
-		})
+		}
+		if resolvedAt.Valid {
+			record.ResolvedAt = resolvedAt.Time.Format(time.RFC3339)
+			record.ResolutionReason = resolutionReason.String
+		}
+		items = append(items, record)
 	}
 	return items, nil
 }
 
-func (s *SQLStore) ResolveQuarantine(ctx context.Context, id string) error {
+// ResolveQuarantine closes one quarantined notice. Re-resolving an already
+// resolved entry is an idempotent success.
+func (s *SQLStore) ResolveQuarantine(ctx context.Context, id, reason string) error {
 	qBytes, err := uuidBytes(id)
 	if err != nil {
 		return invalid("quarantine_id", "must be a valid 32-hex UUID")
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE dsp_notice_quarantine SET status = 'resolved' WHERE tenant_id = ? AND quarantine_id = ?`,
-		s.tenantID, qBytes)
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "operator_resolved"
+	}
+	if len(reason) > 512 {
+		return invalid("reason", "must be 512 characters or fewer")
+	}
+
+	var current string
+	err = s.db.QueryRowContext(ctx, `SELECT status FROM dsp_notice_quarantine
+		WHERE tenant_id = ? AND quarantine_id = ?`, s.tenantID, qBytes).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("read quarantine: %w", err)
+	}
+	if current == "resolved" {
+		return nil
+	}
+
+	_, err = s.db.ExecContext(ctx, `UPDATE dsp_notice_quarantine
+		SET status = 'resolved', resolved_at = NOW(6), resolution_reason = ?
+		WHERE tenant_id = ? AND quarantine_id = ?`,
+		reason, s.tenantID, qBytes)
 	if err != nil {
 		return fmt.Errorf("resolve quarantine: %w", err)
-	}
-	affected, _ := result.RowsAffected()
-	if affected == 0 {
-		return ErrNotFound
 	}
 	return nil
 }

@@ -1,7 +1,6 @@
 package http
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,35 +13,51 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/songfei1983/open-ads/ssp/internal/ssp/auction"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/config"
+	"github.com/songfei1983/open-ads/ssp/internal/ssp/dmp"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/domain"
+	"github.com/songfei1983/open-ads/ssp/internal/ssp/limiter"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/observability"
+	"github.com/songfei1983/open-ads/ssp/internal/ssp/render"
+	"github.com/songfei1983/open-ads/ssp/internal/ssp/snapshot"
+	"github.com/songfei1983/open-ads/ssp/internal/ssp/token"
 )
 
-// Server wraps the standard library http.Server.
+// Server wraps the standard library http.Server for the SSP.
 type Server struct {
-	server  *http.Server
-	logger  *slog.Logger
-	cfg     *config.Config
-	metrics *observability.Metrics
-	client  *http.Client
-	isReady atomic.Bool
+	server          *http.Server
+	logger          *slog.Logger
+	cfg             *config.Config
+	metrics         *observability.Metrics
+	engine          *auction.Engine
+	codec           *token.Codec
+	tracker         *render.Tracker
+	renderer        *render.Renderer
+	dmp             *dmp.Adapter
+	adminHandler    http.Handler
+	internalHandler http.Handler
+	limiter         *limiter.Limiter
+	isReady         atomic.Bool
 }
 
-// NewServer initializes the HTTP server with router, middlewares, and probes.
+// NewServer initializes the HTTP server with routing, middleware and probes.
 func NewServer(cfg *config.Config, logger *slog.Logger) *Server {
 	s := &Server{
 		logger:  logger,
 		cfg:     cfg,
 		metrics: &observability.Metrics{},
-		client:  &http.Client{},
+		limiter: limiter.New(),
 	}
+	var engineOptions []auction.Option
+	if cfg.AllowPrivateCallbacks {
+		engineOptions = append(engineOptions, auction.AllowPrivateTargets())
+	}
+	s.engine = auction.NewEngine(s.metrics, logger, engineOptions...)
 
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
-
-	// Insert CORS middleware before other middlewares so OPTIONS requests are handled early.
-	handler := s.requestIDMiddleware(s.requestDeadlineMiddleware(s.corsMiddleware(s.loggingMiddleware(s.recoveryMiddleware(mux)))))
+	handler := s.requestIDMiddleware(s.ingressDeadlineMiddleware(s.loggingMiddleware(s.recoveryMiddleware(mux))))
 
 	s.server = &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
@@ -52,193 +67,225 @@ func NewServer(cfg *config.Config, logger *slog.Logger) *Server {
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-
-	// Mark as ready by default in skeleton
 	s.isReady.Store(false)
-
 	return s
 }
 
-// SetReady updates the readiness state of the server.
-func (s *Server) SetReady(ready bool) {
-	s.isReady.Store(ready)
+// SetReady updates the readiness state.
+func (s *Server) SetReady(ready bool) { s.isReady.Store(ready) }
+
+// SetTokenCodec installs the AEAD codec used for render, click and event tokens.
+func (s *Server) SetTokenCodec(codec *token.Codec) {
+	s.codec = codec
+	s.tracker = &render.Tracker{Codec: codec, TenantID: s.cfg.AdminTenantID}
+	if s.renderer != nil {
+		s.renderer.Codec = codec
+	}
 }
 
-// Handler returns the root http.Handler (middleware wrapped mux).
-func (s *Server) Handler() http.Handler {
-	return s.server.Handler
-}
+// SetRenderer installs the read-only creative renderer.
+func (s *Server) SetRenderer(renderer *render.Renderer) { s.renderer = renderer }
+
+// SetDMPAdapter installs the audience resolver.
+func (s *Server) SetDMPAdapter(adapter *dmp.Adapter) { s.dmp = adapter }
+
+// SetAdminHandler installs the tenant-authenticated management API.
+func (s *Server) SetAdminHandler(handler http.Handler) { s.adminHandler = handler }
+
+// SetInternalHandler installs the DSP-facing internal API.
+func (s *Server) SetInternalHandler(handler http.Handler) { s.internalHandler = handler }
+
+// Handler returns the wrapped handler for tests.
+func (s *Server) Handler() http.Handler { return s.server.Handler }
+
+// Metrics returns the observability instance.
+func (s *Server) Metrics() *observability.Metrics { return s.metrics }
 
 func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.HandleFunc("GET /metrics", s.metrics.Handler)
-	// Register the ad-requests endpoint. The handler internally
-	// distinguishes POST and OPTIONS (CORS pre‑flight) based on the
-	// request method, so we register a single plain‑path handler.
+	mux.HandleFunc("POST /openrtb2/auction", s.handleOpenRTBAuction)
 	mux.HandleFunc("/sdk/v1/ad-requests", s.handleAdRequests)
-	// Same-origin creative render proxy: the page must never reference a
-	// cross-origin DSP host for impressions; the SSP streams the bytes.
-	mux.HandleFunc("GET /sdk/v1/render/{creative_id}", s.handleRenderProxy)
-	// Register the OpenRTB auction endpoint.
-	mux.HandleFunc("/openrtb2/auction", s.handleOpenRTBAuction)
-}
-
-// handleRenderProxy streams the DSP-rendered creative through the SSP origin
-// so that pages only reference same-origin render URLs. The DSP response
-// headers (content type, caching) are carried over; failures fail closed.
-func (s *Server) handleRenderProxy(w http.ResponseWriter, r *http.Request) {
-	creativeID := r.PathValue("creative_id")
-	if creativeID == "" || s.cfg.DSPURL == "" {
-		http.NotFound(w, r)
-		return
-	}
-	req, err := http.NewRequestWithContext(r.Context(), "GET", s.cfg.DSPURL+"/render/v1/"+creativeID, nil)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	resp, err := s.client.Do(req)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		w.WriteHeader(resp.StatusCode)
-		return
-	}
-	if ct := resp.Header.Get("Content-Type"); ct != "" {
-		w.Header().Set("Content-Type", ct)
-	}
-	if cl := resp.Header.Get("Content-Length"); cl != "" {
-		w.Header().Set("Content-Length", cl)
-	}
-	if cc := resp.Header.Get("Cache-Control"); cc != "" {
-		w.Header().Set("Cache-Control", cc)
-	}
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		s.logger.Warn("render proxy stream failed", slog.String("creative_id", creativeID), slog.Any("error", err))
-	}
-}
-
-// handleOptions responds to CORS preflight requests.
-func (s *Server) handleOptions(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-ID")
-	w.WriteHeader(http.StatusNoContent)
+	mux.HandleFunc("POST /sdk/v1/impressions", s.handleImpression)
+	mux.HandleFunc("GET /render/v1/assets/{token}", s.handleRenderAsset)
+	mux.HandleFunc("GET /render/v1/{token}", s.handleRender)
+	mux.HandleFunc("GET /click/v1/{token}", s.handleClick)
+	mux.HandleFunc("GET /sdk/v1/openads-sdk.js", s.handleSDK)
+	mux.Handle("/admin/v1/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.adminHandler == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "admin_unavailable", "message": "management API is not configured"})
+			return
+		}
+		s.adminHandler.ServeHTTP(w, r)
+	}))
+	mux.Handle("/internal/v1/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.internalHandler == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "internal_unavailable", "message": "internal API is not configured"})
+			return
+		}
+		s.internalHandler.ServeHTTP(w, r)
+	}))
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{
-		"status":  "ok",
-		"service": s.cfg.ServiceName,
-	})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "service": s.cfg.ServiceName})
 }
 
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
-	if !s.isReady.Load() {
+	version := snapshot.CurrentVersion()
+	if !s.isReady.Load() || version == "" {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-			"status":  "not_ready",
-			"service": s.cfg.ServiceName,
+			"status": "not_ready", "service": s.cfg.ServiceName, "config_version": version,
 		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
-		"status":         "ready",
-		"service":        s.cfg.ServiceName,
-		"config_version": s.cfg.ConfigVersion,
+		"status": "ready", "service": s.cfg.ServiceName, "config_version": version,
 	})
 }
 
-func (s *Server) handleAdRequests(w http.ResponseWriter, r *http.Request) {
-	// Pre‑flight handling for CORS
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-ID")
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
+type supplyRequest struct {
+	ID  string `json:"id"`
+	Imp []struct {
+		ID     string `json:"id"`
+		TagID  string `json:"tagid"`
+		Banner struct {
+			W int `json:"w"`
+			H int `json:"h"`
+		} `json:"banner"`
+	} `json:"imp"`
+	Site *struct {
+		Domain string `json:"domain"`
+		Page   string `json:"page"`
+	} `json:"site"`
+	TMax int      `json:"tmax"`
+	Cur  []string `json:"cur"`
+}
 
+func (s *Server) handleOpenRTBAuction(w http.ResponseWriter, r *http.Request) {
 	reqID := observability.RequestIDFromContext(r.Context())
 	w.Header().Set("Cache-Control", "no-store")
-	// Allow CORS for ad request responses (actual POST)
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	var req adRequest
-	if err := decodeJSON(w, r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "invalid_request", "message": "invalid ad request", "request_id": reqID})
+	manifest, _, err := snapshot.Current()
+	if err != nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "config_unavailable", "no published SSP configuration", reqID)
 		return
 	}
-	if req.PlacementID == "" || req.Slot.Width <= 0 || req.Slot.Height <= 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "invalid_request", "message": "placement and slot are required", "request_id": reqID})
+	credential := strings.TrimSpace(r.Header.Get("X-Supply-Key"))
+	if credential == "" {
+		credential = bearerToken(r)
+	}
+	if credential == "" {
+		writeAPIError(w, http.StatusUnauthorized, "unauthenticated", "supply credential required", reqID)
 		return
 	}
-
-	audience := []audienceSegment{}
-	if req.Consent.Value != "" && s.cfg.DMPURL != "" {
-		// Privacy gate: audience resolution is consent-based and the SSP
-		// fails closed to no-fill when the DMP cannot resolve segments.
-		var audienceErr error
-		audience, audienceErr = s.resolveAudience(r.Context(), reqID, req)
-		if audienceErr != nil {
-			s.logger.Warn("audience resolve failed", slog.String("request_id", reqID), slog.Any("error", audienceErr))
-			writeNoFill(w, reqID)
+	endpoint, ok := manifest.SupplyByCredentialHash(snapshot.HashSHA256Hex(credential))
+	if !ok {
+		writeAPIError(w, http.StatusUnauthorized, "unauthenticated", "supply credential is not valid", reqID)
+		return
+	}
+	if !s.limiter.Allow("supply:"+endpoint.ID, endpoint.RateLimitPerSecond) {
+		writeAPIError(w, http.StatusTooManyRequests, "rate_limited", "supply request rate exceeded", reqID)
+		return
+	}
+	property, ok := manifest.Properties[endpoint.PropertyID]
+	if !ok {
+		writeAPIError(w, http.StatusServiceUnavailable, "config_unavailable", "supply endpoint has no property", reqID)
+		return
+	}
+	var request supplyRequest
+	r.Body = http.MaxBytesReader(w, r.Body, 256<<10)
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&request); err != nil || request.ID == "" || len(request.ID) > 128 || len(request.Imp) != 1 {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "a single valid OpenRTB impression is required", reqID)
+		return
+	}
+	imp := request.Imp[0]
+	placement, ok := manifest.Supports(imp.TagID)
+	if !ok {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "tagid does not identify an active placement", reqID)
+		return
+	}
+	if placement.PropertyID != endpoint.PropertyID {
+		writeAPIError(w, http.StatusForbidden, "supply_mismatch", "placement is not authorized for this supply endpoint", reqID)
+		return
+	}
+	if imp.Banner.W != placement.Width || imp.Banner.H != placement.Height {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "impression size does not match the placement", reqID)
+		return
+	}
+	var siteDomain, sitePage string
+	if request.Site != nil {
+		siteDomain, sitePage = request.Site.Domain, request.Site.Page
+	}
+	if property.ExternalID != "" {
+		expected := normalizeDomain(property.ExternalID)
+		if siteDomain == "" && sitePage != "" {
+			if parsed, parseErr := url.Parse(sitePage); parseErr == nil {
+				siteDomain = parsed.Hostname()
+			}
+		}
+		if normalizeDomain(siteDomain) != expected {
+			writeAPIError(w, http.StatusForbidden, "supply_mismatch", "site does not match the supply profile", reqID)
 			return
 		}
 	}
-	if s.cfg.DSPURL == "" {
-		writeNoFill(w, reqID)
+	// Server-to-server Supply calls carry no Origin; browsers must match the
+	// endpoint allowlist exactly when one is configured.
+	if origin := r.Header.Get("Origin"); origin != "" && !snapshot.OriginAllowed(endpoint.AllowedOrigins, origin) {
+		writeAPIError(w, http.StatusForbidden, "origin_not_allowed", "origin is not allowlisted", reqID)
 		return
 	}
-
-	resp, err := s.requestBid(r.Context(), reqID, req)
-	if err != nil || resp == nil {
-		if err != nil {
-			s.logger.Warn("bid request failed", slog.String("request_id", reqID), slog.Any("error", err))
+	if len(request.Cur) > 0 && !currencyAllowed(request.Cur, placement.Currency) {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "requested currency is not supported", reqID)
+		return
+	}
+	auctionID, err := domain.NewUUIDv7()
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "internal_error", "unable to create auction", reqID)
+		return
+	}
+	budget := s.cfg.AuctionTimeout
+	if request.TMax > 0 {
+		candidate := time.Duration(request.TMax) * time.Millisecond
+		if candidate < budget {
+			budget = candidate
 		}
-		writeNoFill(w, reqID)
+	}
+	started := time.Now()
+	outcome := s.engine.Run(r.Context(), manifest, auction.Request{
+		AuctionID: auctionID, PlacementID: placement.ID, SupplyEndpointID: endpoint.ID,
+		SiteDomain: normalizeDomain(siteDomain), SitePage: sitePage,
+		Width: placement.Width, Height: placement.Height, Currency: placement.Currency,
+		FloorCPMMicros: placement.FloorCPMMicros, TMax: budget,
+	})
+	if !outcome.Filled {
+		writeJSON(w, http.StatusOK, map[string]any{"id": request.ID, "nbr": 2})
+		s.logAuction(reqID, auctionID, placement.ID, "no_fill", started)
 		return
 	}
-	// The render URL must be same-origin with the SSP endpoint: pages may
-	// only reference the SSP host for impressions (the prototype enforces
-	// this), so the creative is streamed through the render proxy below.
-	renderOrigin := requestOrigin(r)
-	if renderOrigin == "" {
-		renderOrigin = strings.TrimSuffix(s.cfg.DSPURL, "/")
+	ad, err := s.mintAd(r, placement, outcome)
+	if err != nil {
+		s.logger.Error("failed to mint supply render tokens", slog.String("request_id", reqID), slog.Any("error", err))
+		writeJSON(w, http.StatusOK, map[string]any{"id": request.ID, "nbr": 2})
+		return
 	}
-	renderURL := renderOrigin + "/sdk/v1/render/" + resp.CreativeID
+	go s.engine.Notify(context.Background(), outcome)
+	adm := fmt.Sprintf("<iframe src=\"%s\" width=\"%d\" height=\"%d\" frameborder=\"0\" scrolling=\"no\" sandbox=\"allow-scripts allow-popups allow-popups-to-escape-sandbox\"></iframe>",
+		htmlEscape(ad.RenderURL), placement.Width, placement.Height)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"request_id": reqID,
-		"status":     "filled",
-		"audience":   map[string]any{"segments": audience},
-		"ad": map[string]any{
-			"creative_id": resp.CreativeID,
-			"format":      "image",
-			"render_url":  renderURL,
-			"click_url":   resp.ClickURL,
-			"event_token": resp.EventToken,
-			"expires_at":  time.Now().UTC().Add(time.Minute).Format(time.RFC3339),
-		},
+		"id":    request.ID,
+		"cur":   placement.Currency,
+		"bidid": outcome.Winner.BidID,
+		"seatbid": []map[string]any{{
+			"bid": []map[string]any{{
+				"id": outcome.Winner.BidID, "impid": "1", "price": json.Number(auction.FormatCPMMicros(outcome.Winner.CPMMicros)),
+				"crid": outcome.Winner.CreativeID, "cid": outcome.Winner.CampaignID,
+				"w": placement.Width, "h": placement.Height, "adm": adm,
+			}},
+		}},
 	})
-}
-
-// corsMiddleware adds generic CORS headers and handles pre‑flight OPTIONS requests.
-func (s *Server) corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Allow any origin (sandbox);
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-ID")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	s.logAuction(reqID, auctionID, placement.ID, "filled", started)
 }
 
 type adRequest struct {
@@ -259,223 +306,235 @@ type adRequest struct {
 	} `json:"consent"`
 }
 
-type audienceResolveRequest struct {
-	RequestID    string   `json:"request_id"`
-	TenantID     string   `json:"tenant_id"`
-	ProviderID   string   `json:"provider_id"`
-	Namespace    string   `json:"namespace"`
-	SubjectToken string   `json:"subject_token"`
-	Purposes     []string `json:"purposes"`
-	MaxSegments  int      `json:"max_segments"`
+func (s *Server) handleAdRequests(w http.ResponseWriter, r *http.Request) {
+	reqID := observability.RequestIDFromContext(r.Context())
+	if r.Method == http.MethodOptions {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Request-ID")
+		w.Header().Set("Access-Control-Max-Age", "60")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeAPIError(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed", reqID)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	manifest, _, err := snapshot.Current()
+	if err != nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "config_unavailable", "no published SSP configuration", reqID)
+		return
+	}
+	var request adRequest
+	if !decodeJSON(w, r, &request, 64<<10) {
+		return
+	}
+	if domain.ValidateUUID32(request.RequestID) == nil {
+		reqID = request.RequestID
+		w.Header().Set("X-Request-ID", reqID)
+	}
+	if request.PlacementID == "" || request.Slot.Width <= 0 || request.Slot.Height <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "placement and slot are required", reqID)
+		return
+	}
+	placement, ok := manifest.Supports(request.PlacementID)
+	if !ok {
+		writeAPIError(w, http.StatusNotFound, "placement_not_found", "placement is not active", reqID)
+		return
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		origin = request.Page.Origin
+	}
+	if !snapshot.OriginAllowed(placement.AllowedOrigins, origin) {
+		writeAPIError(w, http.StatusForbidden, "origin_not_allowed", "origin is not allowlisted", reqID)
+		return
+	}
+	if request.Slot.Width != placement.Width || request.Slot.Height != placement.Height {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "slot size does not match the placement", reqID)
+		return
+	}
+	if s.cfg.ClientRateLimit > 0 && !s.limiter.Allow("client:"+placement.ID, s.cfg.ClientRateLimit) {
+		writeAPIError(w, http.StatusTooManyRequests, "rate_limited", "client request rate exceeded", reqID)
+		return
+	}
+	responseOrigin := origin
+	if responseOrigin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", responseOrigin)
+		w.Header().Set("Vary", "Origin")
+	}
+	started := time.Now()
+	segments, resolveErr := s.resolveAudience(r.Context(), reqID, placement, request)
+	if resolveErr != nil {
+		s.logger.Warn("audience resolve failed; failing closed", slog.String("request_id", reqID), slog.Any("error", resolveErr))
+		writeNoFill(w, reqID, "no_fill")
+		s.logAuction(reqID, "", placement.ID, "no_fill_audience", started)
+		return
+	}
+	auctionID, err := domain.NewUUIDv7()
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "internal_error", "unable to create auction", reqID)
+		return
+	}
+	budget := s.cfg.AuctionTimeout
+	outcome := s.engine.Run(r.Context(), manifest, auction.Request{
+		AuctionID: auctionID, PlacementID: placement.ID, SiteDomain: normalizeDomain(request.Page.Origin),
+		SitePage: request.Page.Origin + request.Page.Path, Width: placement.Width, Height: placement.Height,
+		Currency: placement.Currency, FloorCPMMicros: placement.FloorCPMMicros, TMax: budget,
+		Segments: segments,
+	})
+	if !outcome.Filled {
+		writeNoFill(w, reqID, "no_fill")
+		s.logAuction(reqID, auctionID, placement.ID, "no_fill", started)
+		return
+	}
+	ad, err := s.mintAd(r, placement, outcome)
+	if err != nil {
+		s.logger.Error("failed to mint SDK render tokens", slog.String("request_id", reqID), slog.Any("error", err))
+		writeNoFill(w, reqID, "no_fill")
+		return
+	}
+	go s.engine.Notify(context.Background(), outcome)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"request_id": reqID,
+		"status":     "filled",
+		"ad": map[string]any{
+			"creative_id": outcome.Winner.CreativeID,
+			"format":      "image",
+			"render_url":  ad.RenderURL,
+			"click_url":   ad.ClickURL,
+			"event_token": ad.EventToken,
+			"expires_at":  ad.ExpiresAt,
+		},
+		"diagnostics": map[string]any{
+			"auction_id":  auctionID,
+			"outcome":     "bid",
+			"duration_ms": time.Since(started).Milliseconds(),
+		},
+	})
+	s.logAuction(reqID, auctionID, placement.ID, "filled", started)
 }
 
-type bidRequest struct {
-	ID   string   `json:"id"`
-	Imp  []bidImp `json:"imp"`
-	Site bidSite  `json:"site"`
-	User *bidUser `json:"user,omitempty"`
-	AT   int      `json:"at"`
-	TMax int      `json:"tmax"`
-	Cur  []string `json:"cur"`
-}
-type bidImp struct {
-	ID     string `json:"id"`
-	TagID  string `json:"tagid"`
-	Banner struct {
-		W int `json:"w"`
-		H int `json:"h"`
-	} `json:"banner"`
-}
-type bidSite struct {
-	Domain string `json:"domain,omitempty"`
-	Page   string `json:"page"`
-}
-type bidUser struct {
-	ID string `json:"id"`
-}
-type bidResponse struct {
-	ID      string `json:"id"`
-	SeatBid []struct {
-		Bid []struct {
-			ImpID string  `json:"impid"`
-			Price float64 `json:"price"`
-			AdID  string  `json:"adid"`
-			Adm   string  `json:"adm"`
-			CID   string  `json:"cid"`
-			Crid  string  `json:"crid"`
-			Ext   struct {
-				ReservationRef string `json:"reservation_ref"`
-			} `json:"ext"`
-		} `json:"bid"`
-	} `json:"seatbid"`
-}
-type selectedBid struct{ CreativeID, RenderURL, ClickURL, EventToken string }
-
-// audienceSegment is one resolved interest segment; only campaign-agnostic
-// metadata ever crosses the SSP boundary.
-type audienceSegment struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+type adTokens struct {
+	RenderURL  string
+	ClickURL   string
+	EventToken string
+	ExpiresAt  string
 }
 
-func (s *Server) resolveAudience(ctx context.Context, reqID string, req adRequest) ([]audienceSegment, error) {
-	payload := audienceResolveRequest{RequestID: reqID, TenantID: "tenant-default", ProviderID: "dmp-provider-01", Namespace: "publisher-account-v1", SubjectToken: req.Consent.Value, Purposes: []string{"personalized_ads"}, MaxSegments: 10}
-	target := struct {
-		Segments []audienceSegment `json:"segments"`
-	}{}
-	if err := s.postJSON(ctx, s.cfg.DMPURL+"/internal/v1/audiences:resolve", payload, &target, s.cfg.DMPTimeout); err != nil {
+func (s *Server) mintAd(r *http.Request, placement snapshot.Placement, outcome auction.Outcome) (adTokens, error) {
+	if s.codec == nil {
+		return adTokens{}, errors.New("renderer token codec is not configured")
+	}
+	now := time.Now().UTC()
+	expires := now.Add(s.cfg.RenderTokenTTL)
+	eventExpires := now.Add(s.cfg.EventTokenTTL)
+	winner := outcome.Winner
+	eventToken, err := s.codec.Seal(token.AudienceEvent, token.EventClaims{
+		TenantID: s.cfg.AdminTenantID, PlacementID: placement.ID, AuctionID: outcome.AuctionID,
+		BidID: winner.BidID, ImpID: winner.ImpID, CreativeID: winner.CreativeID,
+		DSPEndpointID: winner.EndpointID, Reservation: winner.Reservation,
+		BidCPMMicros: winner.CPMMicros, Currency: winner.Currency, BURLTarget: winner.BURL,
+		ExpiresAt: eventExpires,
+	})
+	if err != nil {
+		return adTokens{}, err
+	}
+	clickToken, err := s.codec.Seal(token.AudienceClick, token.ClickClaims{
+		TenantID: s.cfg.AdminTenantID, AuctionID: outcome.AuctionID, BidID: winner.BidID,
+		LandingURL: winner.Creative.LandingURL, ExpiresAt: expires,
+	})
+	if err != nil {
+		return adTokens{}, err
+	}
+	frameAncestors := strings.Join(placement.AllowedOrigins, " ")
+	renderToken, err := s.codec.Seal(token.AudienceRender, token.RenderClaims{
+		TenantID: s.cfg.AdminTenantID, PlacementID: placement.ID, AuctionID: outcome.AuctionID,
+		BidID: winner.BidID, ImpID: winner.ImpID, CreativeID: winner.CreativeID,
+		DSPEndpointID: winner.EndpointID, AssetRef: winner.Creative.AssetRef,
+		AssetSHA256: winner.Creative.AssetSHA256, MIMEType: winner.Creative.MIMEType,
+		Width: winner.Creative.Width, Height: winner.Creative.Height, LandingURL: winner.Creative.LandingURL,
+		FrameAncestor: frameAncestors, ClickToken: clickToken, EventToken: eventToken, ExpiresAt: expires,
+	})
+	if err != nil {
+		return adTokens{}, err
+	}
+	origin := requestOrigin(r)
+	return adTokens{
+		RenderURL:  origin + "/render/v1/" + renderToken,
+		ClickURL:   origin + "/click/v1/" + clickToken,
+		EventToken: eventToken,
+		ExpiresAt:  expires.Format(time.RFC3339),
+	}, nil
+}
+
+func (s *Server) resolveAudience(ctx context.Context, reqID string, placement snapshot.Placement, request adRequest) ([]dmp.Segment, error) {
+	if placement.PrivacyPolicy == "no_identity" {
+		return nil, nil
+	}
+	if strings.TrimSpace(request.Consent.Value) == "" {
+		return nil, nil
+	}
+	if s.dmp == nil || !s.dmp.Enabled() {
+		return nil, nil
+	}
+	segments, err := s.dmp.Resolve(ctx, reqID, request.Consent.Value, s.cfg.MaxSegments)
+	if err != nil {
 		return nil, err
 	}
 	s.metrics.ObserveAudienceResolve()
-	s.logger.Info("audience resolved", slog.String("request_id", reqID), slog.Int("segments", len(target.Segments)))
-	return target.Segments, nil
+	return segments, nil
 }
 
-func (s *Server) requestBid(ctx context.Context, reqID string, req adRequest) (*selectedBid, error) {
-	page := req.Page.Origin + req.Page.Path
-	// OpenRTB site.domain carries the publisher host for contextual targeting.
-	var domain string
-	if parsed, err := url.Parse(req.Page.Origin); err == nil && parsed.Hostname() != "" {
-		domain = strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
-	}
-	payload := bidRequest{ID: reqID, AT: 1, TMax: int(s.cfg.AuctionTimeout / time.Millisecond), Cur: []string{"USD"}, Site: bidSite{Domain: domain, Page: page}, Imp: []bidImp{{ID: "1", TagID: req.PlacementID}}}
-	payload.Imp[0].Banner.W, payload.Imp[0].Banner.H = req.Slot.Width, req.Slot.Height
-	if req.Consent.Value != "" {
-		payload.User = &bidUser{ID: req.Consent.Value}
-	}
-	var response bidResponse
-	if err := s.postJSON(ctx, s.cfg.DSPURL+"/openrtb2/bid", payload, &response, s.cfg.DSPTimeout); err != nil {
-		return nil, err
-	}
-	if response.ID != "" && response.ID != reqID {
-		return nil, fmt.Errorf("bid response id mismatch")
-	}
-	for _, seat := range response.SeatBid {
-		for _, bid := range seat.Bid {
-			if bid.ImpID == "1" && bid.Price > 0 && bid.Adm != "" {
-				creative := bid.Crid
-				if creative == "" {
-					// Fall back for bidders predating the crid field.
-					creative = bid.CID
-				}
-				// LLD 630: the event token must be the AEAD-sealed reservation
-				// reference, never a plaintext resource identifier.
-				eventToken := bid.Ext.ReservationRef
-				if eventToken == "" {
-					eventToken = bid.AdID
-				}
-				return &selectedBid{CreativeID: creative, RenderURL: extractIframeURL(bid.Adm), EventToken: eventToken}, nil
-			}
-		}
-	}
-	return nil, nil
-}
-
-func (s *Server) postJSON(ctx context.Context, url string, payload, target any, timeout time.Duration) error {
-	callCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if requestID := observability.RequestIDFromContext(ctx); requestID != "" {
-		req.Header.Set("X-Request-ID", requestID)
-	}
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("downstream status %d", resp.StatusCode)
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(target); err != nil && !errors.Is(err, io.EOF) {
-		return err
-	}
-	return nil
-}
-
-func extractIframeURL(adm string) string {
-	const prefix = `src="`
-	start := strings.Index(adm, prefix)
-	if start < 0 {
-		return ""
-	}
-	start += len(prefix)
-	end := strings.IndexByte(adm[start:], '"')
-	if end < 0 {
-		return ""
-	}
-	return adm[start : start+end]
-}
-
-func writeNoFill(w http.ResponseWriter, reqID string) {
-	writeJSON(w, http.StatusOK, map[string]any{"request_id": reqID, "status": "no_fill"})
-}
-
-// requestOrigin derives the externally visible origin of the incoming request
-// so the served render URL is same-origin with the caller. TLS termination in
-// front of the SSP must set X-Forwarded-Proto for HTTPS to be preserved.
-func requestOrigin(r *http.Request) string {
-	if r.Host == "" {
-		return ""
-	}
-	scheme := "http"
-	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
-		scheme = proto
-	}
-	return scheme + "://" + r.Host
-}
-
-func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-	defer r.Body.Close()
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		return err
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return errors.New("request body must contain one JSON value")
-	}
-	return nil
-}
-
-func (s *Server) handleOpenRTBAuction(w http.ResponseWriter, r *http.Request) {
-	reqID := observability.RequestIDFromContext(r.Context())
-	var request struct {
-		ID  string            `json:"id"`
-		Imp []json.RawMessage `json:"imp"`
-	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 256<<10))
-	if err != nil || json.Unmarshal(body, &request) != nil || request.ID == "" || len(request.Imp) == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "invalid_request", "message": "invalid OpenRTB request", "request_id": reqID})
+func (s *Server) handleImpression(w http.ResponseWriter, r *http.Request) {
+	if s.tracker == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "rejected"})
 		return
 	}
-	if s.cfg.DSPURL == "" {
-		writeJSON(w, http.StatusOK, map[string]any{"id": request.ID, "nbr": 2})
+	s.tracker.Handle(w, r)
+}
+
+func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) {
+	if s.renderer == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "renderer_unavailable"})
 		return
 	}
-	var response json.RawMessage
-	callCtx := observability.WithRequestID(r.Context(), request.ID)
-	if err := s.postJSON(callCtx, s.cfg.DSPURL+"/openrtb2/bid", json.RawMessage(body), &response, s.cfg.DSPTimeout); err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"id": request.ID, "nbr": 2})
+	s.renderer.Render(w, r, r.PathValue("token"))
+}
+
+func (s *Server) handleRenderAsset(w http.ResponseWriter, r *http.Request) {
+	if s.renderer == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "renderer_unavailable"})
 		return
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(response)
+	s.renderer.Asset(w, r, r.PathValue("token"))
+}
+
+func (s *Server) handleClick(w http.ResponseWriter, r *http.Request) {
+	if s.renderer == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "renderer_unavailable"})
+		return
+	}
+	s.renderer.Click(w, r, r.PathValue("token"))
+}
+
+func (s *Server) logAuction(reqID, auctionID, placementID, outcome string, started time.Time) {
+	s.logger.Info("auction completed",
+		slog.String("request_id", reqID),
+		slog.String("auction_id", auctionID),
+		slog.String("placement_id", placementID),
+		slog.String("outcome", outcome),
+		slog.Int64("duration_ms", time.Since(started).Milliseconds()),
+	)
 }
 
 // Start runs the HTTP server.
 func (s *Server) Start() error {
-	s.isReady.Store(true)
 	s.logger.Info("starting HTTP server", slog.String("addr", s.server.Addr))
 	if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("listen and serve: %w", err)
@@ -501,15 +560,18 @@ func (s *Server) requestIDMiddleware(next http.Handler) http.Handler {
 				return
 			}
 		}
-
 		ctx := observability.WithRequestID(r.Context(), reqID)
 		w.Header().Set("X-Request-ID", reqID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-func (s *Server) requestDeadlineMiddleware(next http.Handler) http.Handler {
+func (s *Server) ingressDeadlineMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/openrtb2/") && !strings.HasPrefix(r.URL.Path, "/sdk/v1/ad-requests") {
+			next.ServeHTTP(w, r)
+			return
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), s.cfg.AuctionTimeout)
 		defer cancel()
 		next.ServeHTTP(w, r.WithContext(ctx))
@@ -520,20 +582,15 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-
 		next.ServeHTTP(rw, r)
-
-		duration := time.Since(start)
-		reqID := observability.RequestIDFromContext(r.Context())
-
 		s.logger.Info("http request",
 			slog.String("method", r.Method),
-			slog.String("path", r.URL.Path),
+			slog.String("route", safeRoute(r.URL.Path)),
 			slog.Int("status", rw.statusCode),
-			slog.Int64("duration_ms", duration.Milliseconds()),
-			slog.String("request_id", reqID),
+			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+			slog.String("request_id", observability.RequestIDFromContext(r.Context())),
 		)
-		s.metrics.Observe(rw.statusCode, duration)
+		s.metrics.Observe(rw.statusCode, time.Since(start))
 	})
 }
 
@@ -542,19 +599,103 @@ func (s *Server) recoveryMiddleware(next http.Handler) http.Handler {
 		defer func() {
 			if rec := recover(); rec != nil {
 				reqID := observability.RequestIDFromContext(r.Context())
-				s.logger.Error("panic recovered",
-					slog.Any("recover", rec),
-					slog.String("request_id", reqID),
-				)
+				s.logger.Error("panic recovered", slog.Any("recover", rec), slog.String("request_id", reqID))
 				writeJSON(w, http.StatusInternalServerError, map[string]string{
-					"code":       "internal_error",
-					"message":    "An unexpected error occurred.",
-					"request_id": reqID,
+					"code": "internal_error", "message": "An unexpected error occurred.", "request_id": reqID,
 				})
 			}
 		}()
 		next.ServeHTTP(w, r)
 	})
+}
+
+// safeRoute keeps opaque bearer tokens out of access logs.
+func safeRoute(path string) string {
+	switch {
+	case strings.HasPrefix(path, "/render/v1/assets/"):
+		return "/render/v1/assets/{token}"
+	case strings.HasPrefix(path, "/render/v1/"):
+		return "/render/v1/{token}"
+	case strings.HasPrefix(path, "/click/v1/"):
+		return "/click/v1/{token}"
+	default:
+		return path
+	}
+}
+
+func requestOrigin(r *http.Request) string {
+	if r.Host == "" {
+		return ""
+	}
+	scheme := "http"
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto == "https" || proto == "http" {
+		scheme = proto
+	}
+	return scheme + "://" + r.Host
+}
+
+func bearerToken(r *http.Request) string {
+	authorization := r.Header.Get("Authorization")
+	if strings.HasPrefix(authorization, "Bearer ") {
+		return strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer "))
+	}
+	return ""
+}
+
+func normalizeDomain(value string) string {
+	value = strings.TrimSpace(value)
+	if parsed, err := url.Parse(value); err == nil && parsed.Hostname() != "" {
+		value = parsed.Hostname()
+	}
+	return strings.TrimSuffix(strings.ToLower(value), ".")
+}
+
+func currencyAllowed(values []string, expected string) bool {
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value), expected) {
+			return true
+		}
+	}
+	return false
+}
+
+func htmlEscape(value string) string {
+	replacer := strings.NewReplacer("&", "&amp;", "\"", "&quot;", "'", "&#39;", "<", "&lt;", ">", "&gt;")
+	return replacer.Replace(value)
+}
+
+func writeNoFill(w http.ResponseWriter, reqID, outcome string) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"request_id":  reqID,
+		"status":      "no_fill",
+		"diagnostics": map[string]any{"outcome": outcome},
+	})
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, target any, limit int64) bool {
+	reqID := observability.RequestIDFromContext(r.Context())
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	defer r.Body.Close()
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "invalid request body", reqID)
+		return false
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "request body must contain one JSON value", reqID)
+		return false
+	}
+	return true
+}
+
+func writeAPIError(w http.ResponseWriter, status int, code, message, reqID string) {
+	payload := map[string]string{"code": code, "message": message}
+	if reqID != "" {
+		payload["request_id"] = reqID
+	}
+	writeJSON(w, status, payload)
 }
 
 type responseWriter struct {

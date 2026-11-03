@@ -1,4 +1,4 @@
-.PHONY: help build test migration-check clean run-ssp run-dsp run-dmp infra-up infra-down
+.PHONY: help build test migration-check clean run-ssp run-dsp run-dmp infra-up infra-down retention-drills backup-expiry
 
 help:
 	@printf '%s\n' \
@@ -36,10 +36,24 @@ migration-check:
 	@docker compose -f deployments/docker-compose.yml config >/dev/null
 	@test -s ssp/migrations/000001_init_ssp_schema.up.sql
 	@test -s ssp/migrations/000001_init_ssp_schema.down.sql
+	@test -s ssp/migrations/000002_ssp_control_plane.up.sql
+	@test -s ssp/migrations/000002_ssp_control_plane.down.sql
 	@test -s dsp/migrations/000001_init_dsp_schema.up.sql
 	@test -s dsp/migrations/000001_init_dsp_schema.down.sql
+	@test -s dsp/migrations/000002_add_dsp_creative_asset_registry.up.sql
+	@test -s dsp/migrations/000002_add_dsp_creative_asset_registry.down.sql
+	@test -s dsp/migrations/000003_add_dsp_published_config.up.sql
+	@test -s dsp/migrations/000003_add_dsp_published_config.down.sql
+	@test -s dsp/migrations/000004_dsp_quarantine_resolution.up.sql
+	@test -s dsp/migrations/000004_dsp_quarantine_resolution.down.sql
 	@test -s dmp/migrations/000001_init_dmp_schema.up.sql
 	@test -s dmp/migrations/000001_init_dmp_schema.down.sql
+	@test -s dmp/migrations/000002_dmp_control_plane.up.sql
+	@test -s dmp/migrations/000002_dmp_control_plane.down.sql
+	@test -s dmp/migrations/000003_dmp_snapshot_import.up.sql
+	@test -s dmp/migrations/000003_dmp_snapshot_import.down.sql
+	@test -s dmp/migrations/000004_dmp_retention.up.sql
+	@test -s dmp/migrations/000004_dmp_retention.down.sql
 	@echo "==> Migration files and compose wiring are valid"
 
 run-ssp:
@@ -56,6 +70,12 @@ infra-up:
 
 infra-down:
 	docker compose -f deployments/docker-compose.yml down
+
+retention-drills:
+	./dmp/scripts/gate-drills.sh
+
+backup-expiry:
+	DMP_BACKUP_DIR="$${DMP_BACKUP_DIR:?set DMP_BACKUP_DIR}" ./dmp/scripts/backup-expiry.sh --apply
 
 clean:
 	rm -rf bin ssp/bin dsp/bin dmp/bin

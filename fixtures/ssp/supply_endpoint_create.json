@@ -1,0 +1,8 @@
+{
+  "property_id": "018f7a3b2c9d7e1fa3b4c5d6e7f89013",
+  "name": "Publisher Web",
+  "protocol_version": "openrtb2.6",
+  "credential": "supply-secret-value-0123456789",
+  "allowed_origins": ["https://publisher.test"],
+  "rate_limit_per_second": 100
+}

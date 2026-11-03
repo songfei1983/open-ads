@@ -190,8 +190,60 @@ func (s *SQLStore) publishedPayload(ctx context.Context, tx *sql.Tx, kind string
 			return nil, err
 		}
 		u, _ := url.Parse(landing)
-		return json.Marshal(domain.Creative{ID: hex.EncodeToString(id), Active: status == "active", AssetMeta: domain.AssetMeta{MIMEType: format, SizeKB: int((size + 1023) / 1024), Hash: hex.EncodeToString(hash), Host: strings.ToLower(u.Hostname())}})
+		return json.Marshal(domain.Creative{ID: hex.EncodeToString(id), Active: status == "active", AssetMeta: domain.AssetMeta{
+			MIMEType: format, SizeKB: int((size + 1023) / 1024), Hash: hex.EncodeToString(hash),
+			Host: strings.ToLower(u.Hostname()), AssetRef: assetRef, Width: int(width), Height: int(height), LandingURL: landing,
+		}})
 	default:
 		return nil, invalid("resource_type", "is not publishable")
 	}
+}
+
+// PublishedCreative is one immutable creative ready to sync to the SSP.
+type PublishedCreative struct {
+	ID             string
+	AssetRef       string
+	AssetSHA256    string
+	Width          int
+	Height         int
+	MIMEType       string
+	LandingURLHost string
+	LandingURL     string
+	Version        uint64
+}
+
+// ListPublishedCreatives returns the active published creatives for the SSP
+// whitelist. It never reads the draft creative table.
+func (s *SQLStore) ListPublishedCreatives(ctx context.Context) ([]PublishedCreative, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT aggregate_id, config_version, payload
+		FROM dsp_published_config WHERE tenant_id = ? AND aggregate_type = 'creative'
+		ORDER BY aggregate_id`, s.tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list published creatives: %w", err)
+	}
+	defer rows.Close()
+	creatives := make([]PublishedCreative, 0)
+	for rows.Next() {
+		var id []byte
+		var version uint64
+		var payload []byte
+		if err := rows.Scan(&id, &version, &payload); err != nil {
+			return nil, fmt.Errorf("scan published creative: %w", err)
+		}
+		var value domain.Creative
+		if err := json.Unmarshal(payload, &value); err != nil {
+			return nil, fmt.Errorf("decode published creative: %w", err)
+		}
+		if !value.Active || value.AssetMeta.AssetRef == "" || value.AssetMeta.Hash == "" {
+			continue
+		}
+		creatives = append(creatives, PublishedCreative{
+			ID: hex.EncodeToString(id), AssetRef: value.AssetMeta.AssetRef,
+			AssetSHA256: value.AssetMeta.Hash, Width: value.AssetMeta.Width,
+			Height: value.AssetMeta.Height, MIMEType: value.AssetMeta.MIMEType,
+			LandingURLHost: value.AssetMeta.Host, LandingURL: value.AssetMeta.LandingURL,
+			Version: version,
+		})
+	}
+	return creatives, rows.Err()
 }

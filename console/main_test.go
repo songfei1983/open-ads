@@ -221,3 +221,161 @@ func TestDSPAdminProxyRequiresToken(t *testing.T) {
 		t.Fatalf("missing token should be 503, got %d", resp.StatusCode)
 	}
 }
+
+// newDMPStub answers the DMP paths the console may reach.
+func newDMPStub(t *testing.T, recorded *[]string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*recorded = append(*recorded, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+}
+
+func TestDMPProxyAllowsOnlyOperatorPaths(t *testing.T) {
+	var recorded []string
+	stub := newDMPStub(t, &recorded)
+	for key, value := range map[string]string{
+		"DMP_ADMIN_URL":   stub.URL,
+		"DMP_ADMIN_TOKEN": "dmp-admin-token-0123456789abcdef",
+	} {
+		t.Setenv(key, value)
+	}
+	dir := webDir(t)
+	ts := httptest.NewServer(console.NewServer(dir))
+	t.Cleanup(ts.Close)
+	client := ts.Client()
+
+	allowed := []string{
+		"/api/dmp/admin/v1/providers",
+		"/api/dmp/internal/v1/snapshots",
+		"/api/dmp/internal/v1/identity-revocations",
+		"/api/dmp/internal/v1/retention:policy",
+	}
+	for _, path := range allowed {
+		resp, err := client.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s should be proxied, got %d", path, resp.StatusCode)
+		}
+	}
+	if len(recorded) != len(allowed) {
+		t.Fatalf("unexpected upstream calls: %v", recorded)
+	}
+
+	// The console must never reach resolve, health probes or unknown paths.
+	for _, path := range []string{"/api/dmp/internal/v1/audiences:resolve", "/api/dmp/readyz", "/api/dmp/admin/v2/unknown"} {
+		resp, err := client.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s should be blocked, got %d", path, resp.StatusCode)
+		}
+	}
+	if len(recorded) != len(allowed) {
+		t.Fatalf("blocked paths leaked upstream: %v", recorded)
+	}
+
+	request, err := http.NewRequest(http.MethodDelete, ts.URL+"/api/dmp/admin/v1/providers/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("DELETE should be 405, got %d", response.StatusCode)
+	}
+}
+
+func TestDMPProxyRequiresToken(t *testing.T) {
+	t.Setenv("DMP_ADMIN_TOKEN", "")
+	dir := webDir(t)
+	ts := httptest.NewServer(console.NewServer(dir))
+	t.Cleanup(ts.Close)
+	resp, err := ts.Client().Get(ts.URL + "/api/dmp/admin/v1/providers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("missing DMP token should be 503, got %d", resp.StatusCode)
+	}
+}
+
+func TestSSPProxyInjectsTokenAndOnlyAllowsAdminPaths(t *testing.T) {
+	var recorded []string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recorded = append(recorded, r.Method+" "+r.URL.Path+" auth="+maskAuth(r.Header.Get("Authorization")))
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(stub.Close)
+	client, baseURL := proxyClient(t, map[string]string{
+		"SSP_ADMIN_URL":   stub.URL,
+		"SSP_ADMIN_TOKEN": "ssp-secret-token",
+	})
+
+	resp, err := client.Get(baseURL + "/api/ssp/admin/v1/publishers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("proxied admin call: %d", resp.StatusCode)
+	}
+	if len(recorded) != 1 || recorded[0] != "GET /admin/v1/publishers auth=******" {
+		t.Fatalf("unexpected upstream call: %v", recorded)
+	}
+
+	nonAdmin, err := client.Get(baseURL + "/api/ssp/openrtb2/auction")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonAdmin.Body.Close()
+	if nonAdmin.StatusCode != http.StatusNotFound {
+		t.Fatalf("non-admin path should be 404, got %d", nonAdmin.StatusCode)
+	}
+
+	request, err := http.NewRequest(http.MethodDelete, baseURL+"/api/ssp/admin/v1/publishers/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteResp, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteResp.Body.Close()
+	if deleteResp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("DELETE should be 405, got %d", deleteResp.StatusCode)
+	}
+	if len(recorded) != 1 {
+		t.Fatalf("rejected requests leaked to upstream: %v", recorded)
+	}
+}
+
+func TestSSPProxyRequiresToken(t *testing.T) {
+	client, baseURL := proxyClient(t, map[string]string{"SSP_ADMIN_TOKEN": ""})
+	resp, err := client.Get(baseURL + "/api/ssp/admin/v1/publishers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("missing token should be 503, got %d", resp.StatusCode)
+	}
+}
+
+func maskAuth(value string) string {
+	if value == "" {
+		return ""
+	}
+	return "******"
+}
