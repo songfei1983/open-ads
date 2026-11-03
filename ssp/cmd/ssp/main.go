@@ -24,6 +24,7 @@ import (
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/control"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/dmp"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/domain"
+	"github.com/songfei1983/open-ads/ssp/internal/ssp/ledger"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/netguard"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/observability"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/render"
@@ -64,6 +65,23 @@ func main() {
 		if err := store.EnsureTenant(context.Background(), "sandbox"); err != nil {
 			logger.Error("failed to ensure SSP tenant", slog.Any("error", err))
 			os.Exit(1)
+		}
+		ledgerStore, err := ledger.NewStore(db, cfg.AdminTenantID)
+		if err != nil {
+			logger.Error("failed to initialize the SSP ledger", slog.Any("error", err))
+			os.Exit(1)
+		}
+		server.SetLedger(ledgerStore)
+		billableOutbox := &ledger.Sender{
+			Store:  ledgerStore,
+			Logger: logger,
+			Client: &http.Client{
+				Timeout: 2 * time.Second,
+				CheckRedirect: func(*http.Request, []*http.Request) error {
+					return http.ErrUseLastResponse
+				},
+				Transport: &http.Transport{DialContext: netguard.DialContext(2*time.Second, cfg.AllowPrivateCallbacks)},
+			},
 		}
 		valkeyClient := &valkey.Client{
 			Address: cfg.ValkeyAddr, Username: cfg.ValkeyUser, Password: cfg.ValkeyPassword,
@@ -113,7 +131,11 @@ func main() {
 
 		if cfg.AdminToken != "" {
 			runtimeReader := &sspRuntime.Reader{Client: valkeyClient, Tenant: cfg.AdminTenantID}
-			server.SetAdminHandler(control.NewAdminHandler(store, cfg.AdminToken, runtimeReader, logger))
+			adminMux := http.NewServeMux()
+			adminMux.Handle("/admin/v1/billable-outbox", ledger.NewAdminHandler(ledgerStore, cfg.AdminToken))
+			adminMux.Handle("/admin/v1/publisher-payable", ledger.NewAdminHandler(ledgerStore, cfg.AdminToken))
+			adminMux.Handle("/", control.NewAdminHandler(store, cfg.AdminToken, runtimeReader, logger))
+			server.SetAdminHandler(adminMux)
 		} else {
 			logger.Warn("SSP management API is disabled; SSP_ADMIN_TOKEN is not configured")
 		}
@@ -131,6 +153,7 @@ func main() {
 		workerCtx, cancel := context.WithCancel(context.Background())
 		stopWorker = cancel
 		go refreshConfig(workerCtx, server, store, valkeyClient, cfg, instanceID, logger)
+		go billableOutbox.Run(workerCtx, time.Second)
 	} else {
 		logger.Warn("SSP config refresh is disabled; configure SSP_ADMIN_TENANT_ID")
 		server.SetReady(true)

@@ -17,6 +17,9 @@ var (
 	ErrInsufficientBudget  = errors.New("insufficient or unavailable budget lease")
 	ErrReservationConflict = errors.New("reservation ID conflicts with an existing reservation")
 	ErrInvalidSettlement   = errors.New("invalid reservation settlement")
+	// ErrSettlementExpired flags a notice that arrived after the reservation's
+	// settlement grace window; it must be quarantined, never silently settled.
+	ErrSettlementExpired = errors.New("reservation settlement grace has expired")
 )
 
 type Outcome string

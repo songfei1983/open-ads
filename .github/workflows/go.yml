@@ -90,7 +90,12 @@ jobs:
         run: |
           cd dsp
           DSP_MARIADB_TEST_DSN="dsp_user:dsp_pass@tcp(127.0.0.1:3306)/dsp_db?parseTime=true" \
-            go test ./internal/dsp/lease/ -run 'TestSettleReservation' -v
+            go test ./internal/dsp/lease/ -run 'TestSettleReservation|TestAppendSpendReversal' -v
+      - name: Verify the SSP ledger, outbox and reversal rules
+        run: |
+          cd ssp
+          SSP_MARIADB_TEST_DSN="ssp_user:ssp_pass@tcp(127.0.0.1:3306)/ssp_db?parseTime=true" \
+            go test ./internal/ssp/ledger/ -v
       - name: Verify the filled request -> render -> impression -> click path
         run: |
           SSP_ADMIN_TOKEN=ssp-admin-token-0123456789abcdef \

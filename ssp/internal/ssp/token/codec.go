@@ -21,8 +21,12 @@ const (
 	AudienceRender = "ssp.render.v1"
 	// AudienceClick authorizes one click redirect.
 	AudienceClick = "ssp.click.v1"
-	// AudienceEvent authorizes one impression event.
+	// AudienceEvent authorizes one impression event reported by the browser SDK.
 	AudienceEvent = "ssp.event.v1"
+	// AudienceSupplyEvent authorizes the same impression reported server-to-server
+	// by a Supply endpoint. It shares the event key with AudienceEvent so both
+	// audiences land in one ledger transaction.
+	AudienceSupplyEvent = "ssp.supply.event.v1"
 )
 
 // Codec seals and opens versioned AES-256-GCM tokens.
@@ -154,18 +158,23 @@ func (c ClickClaims) Expired(now time.Time) bool { return !now.Before(c.ExpiresA
 
 // EventClaims carry the financial context recovered at impression time.
 type EventClaims struct {
-	TenantID      string    `json:"tenant_id"`
-	PlacementID   string    `json:"placement_id"`
-	AuctionID     string    `json:"auction_id"`
-	BidID         string    `json:"bid_id"`
-	ImpID         string    `json:"imp_id"`
-	CreativeID    string    `json:"creative_id"`
-	DSPEndpointID string    `json:"dsp_endpoint_id"`
-	Reservation   string    `json:"reservation_ref,omitempty"`
-	BidCPMMicros  int64     `json:"bid_cpm_micros"`
-	Currency      string    `json:"currency"`
-	BURLTarget    string    `json:"burl_target,omitempty"`
-	ExpiresAt     time.Time `json:"expires_at"`
+	TenantID      string `json:"tenant_id"`
+	PublisherID   string `json:"publisher_id"`
+	PropertyID    string `json:"property_id"`
+	PlacementID   string `json:"placement_id"`
+	AuctionID     string `json:"auction_id"`
+	BidID         string `json:"bid_id"`
+	ImpID         string `json:"imp_id"`
+	CreativeID    string `json:"creative_id"`
+	DSPEndpointID string `json:"dsp_endpoint_id"`
+	Reservation   string `json:"reservation_ref,omitempty"`
+	BidCPMMicros  int64  `json:"bid_cpm_micros"`
+	// BillableMicros is the settled per-impression amount, computed once at
+	// mint time so the tracker never re-derives money from a stale CPM.
+	BillableMicros int64     `json:"billable_micros"`
+	Currency       string    `json:"currency"`
+	BURLTarget     string    `json:"burl_target,omitempty"`
+	ExpiresAt      time.Time `json:"expires_at"`
 }
 
 // Expired reports whether the claims are outside their validity window.

@@ -404,15 +404,24 @@ func (s *Server) handleLossNotice(w http.ResponseWriter, r *http.Request) {
 			ImpID:          claims.ImpressionID,
 		}
 		if err := s.settlementStore.SettleReservation(r.Context(), params); err != nil {
-			if errors.Is(err, lease.ErrReservationConflict) {
+			switch {
+			case errors.Is(err, lease.ErrReservationConflict):
 				writeJSON(w, http.StatusConflict, map[string]string{
 					"code": "reservation_conflict", "message": err.Error(),
 				})
-				return
+			case errors.Is(err, lease.ErrSettlementExpired):
+				writeJSON(w, http.StatusGone, map[string]string{
+					"code": "settlement_expired", "message": "notice arrived after the settlement grace window",
+				})
+			case errors.Is(err, lease.ErrInvalidSettlement):
+				writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+					"code": "invalid_settlement", "message": err.Error(),
+				})
+			default:
+				writeJSON(w, http.StatusInternalServerError, map[string]string{
+					"code": "settlement_failed", "message": err.Error(),
+				})
 			}
-			writeJSON(w, http.StatusInternalServerError, map[string]string{
-				"code": "settlement_failed", "message": err.Error(),
-			})
 			return
 		}
 	}
@@ -492,9 +501,14 @@ func (s *Server) handleBillableNotice(w http.ResponseWriter, r *http.Request) {
 			occurredAt = parsed
 		}
 	}
-	sourceKey := req.SourceEventKey
+	// The contract fixes the source event key in the body; falling back to the
+	// event id would let a caller re-key the same impression into a new charge.
+	sourceKey := strings.TrimSpace(req.SourceEventKey)
 	if sourceKey == "" {
-		sourceKey = req.EventID
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"code": "invalid_request", "message": "source_event_key is required",
+		})
+		return
 	}
 
 	if s.settlementStore != nil && claims.ReservationID != "" {
@@ -514,15 +528,24 @@ func (s *Server) handleBillableNotice(w http.ResponseWriter, r *http.Request) {
 			OccurredAt:     occurredAt,
 		}
 		if err := s.settlementStore.SettleReservation(r.Context(), params); err != nil {
-			if errors.Is(err, lease.ErrReservationConflict) {
+			switch {
+			case errors.Is(err, lease.ErrReservationConflict):
 				writeJSON(w, http.StatusConflict, map[string]string{
 					"code": "reservation_conflict", "message": err.Error(),
 				})
-				return
+			case errors.Is(err, lease.ErrSettlementExpired):
+				writeJSON(w, http.StatusGone, map[string]string{
+					"code": "settlement_expired", "message": "notice arrived after the settlement grace window",
+				})
+			case errors.Is(err, lease.ErrInvalidSettlement):
+				writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+					"code": "invalid_settlement", "message": err.Error(),
+				})
+			default:
+				writeJSON(w, http.StatusInternalServerError, map[string]string{
+					"code": "settlement_failed", "message": err.Error(),
+				})
 			}
-			writeJSON(w, http.StatusInternalServerError, map[string]string{
-				"code": "settlement_failed", "message": err.Error(),
-			})
 			return
 		}
 	}

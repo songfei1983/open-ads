@@ -264,7 +264,9 @@ func (s *SQLBudgetStore) SettleReservation(ctx context.Context, params Settlemen
 		}
 		leaseIDStr := params.LeaseIDs[demand.ScopeID]
 		if leaseIDStr == "" {
-			continue
+			// Every applicable scope must settle together: leaving one behind
+			// would leak a held reservation and overspend the line item.
+			return fmt.Errorf("%w: missing lease for scope %q", ErrInvalidSettlement, demand.ScopeID)
 		}
 		leaseBytes, err := normalizeUUIDBytes(leaseIDStr)
 		if err != nil {
@@ -275,30 +277,50 @@ func (s *SQLBudgetStore) SettleReservation(ctx context.Context, params Settlemen
 		var scope string
 		var periodStart time.Time
 		var held int64
-		err = tx.QueryRowContext(ctx, `SELECT line_item_id, budget_scope, period_start, held_micros
+		var graceUntil time.Time
+		var materialized bool
+		err = tx.QueryRowContext(ctx, `SELECT line_item_id, budget_scope, period_start, held_micros,
+			settlement_grace_until
 			FROM budget_lease WHERE tenant_id = ? AND lease_id = ? FOR UPDATE`,
-			s.tenantID, leaseBytes).Scan(&lineItemBytes, &scope, &periodStart, &held)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("%w: lease not found for scope %q", ErrInvalidSettlement, demand.ScopeID)
+			s.tenantID, leaseBytes).Scan(&lineItemBytes, &scope, &periodStart, &held, &graceUntil)
+		if errors.Is(err, sql.ErrNoRows) {
+			// Runtime budget holds live in Valkey; the settleable reservation is
+			// bound to a scope id, not to a MariaDB lease row. Materialise the
+			// lease so the settlement keeps its foreign key and audit trail.
+			lineItemBytes, scope, periodStart, leaseBytes, err = s.materializeLease(ctx, tx, params, demand, now)
+			if err != nil {
+				return err
 			}
+			materialized = true
+			graceUntil = now
+		} else if err != nil {
 			return fmt.Errorf("query lease: %w", err)
 		}
 		if settledLineItem == nil {
 			settledLineItem = lineItemBytes
 		}
+		if !materialized && now.After(graceUntil) {
+			if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+				return fmt.Errorf("rollback expired settlement: %w", err)
+			}
+			s.quarantineLateNotice(ctx, params, "grace_expired")
+			return fmt.Errorf("%w: scope %q grace ended at %s", ErrSettlementExpired,
+				demand.ScopeID, graceUntil.UTC().Format(time.RFC3339))
+		}
 
 		// Deduct held amount from lease
 		_, err = tx.ExecContext(ctx, `UPDATE budget_lease
-			SET held_micros = GREATEST(0, held_micros - ?) WHERE tenant_id = ? AND lease_id = ?`,
+			SET held_micros = GREATEST(0, held_micros - ?), status = 'settled'
+			WHERE tenant_id = ? AND lease_id = ?`,
 			demand.AmountMicros, s.tenantID, leaseBytes)
 		if err != nil {
 			return fmt.Errorf("update lease held micros: %w", err)
 		}
 
 		// Deduct leased amount from account, and record spend if billable
+		var accountResult sql.Result
 		if params.Outcome == OutcomeBillable {
-			_, err = tx.ExecContext(ctx, `UPDATE budget_account
+			accountResult, err = tx.ExecContext(ctx, `UPDATE budget_account
 				SET leased_micros = GREATEST(0, leased_micros - ?),
 				    spent_micros = spent_micros + ?,
 				    version = version + 1,
@@ -306,7 +328,7 @@ func (s *SQLBudgetStore) SettleReservation(ctx context.Context, params Settlemen
 				WHERE tenant_id = ? AND line_item_id = ? AND budget_scope = ? AND period_start = ?`,
 				demand.AmountMicros, params.ActualAmount, s.tenantID, lineItemBytes, scope, periodStart)
 		} else {
-			_, err = tx.ExecContext(ctx, `UPDATE budget_account
+			accountResult, err = tx.ExecContext(ctx, `UPDATE budget_account
 				SET leased_micros = GREATEST(0, leased_micros - ?),
 				    version = version + 1,
 				    updated_at = NOW(6)
@@ -315,6 +337,12 @@ func (s *SQLBudgetStore) SettleReservation(ctx context.Context, params Settlemen
 		}
 		if err != nil {
 			return fmt.Errorf("update budget account balance: %w", err)
+		}
+		if accountResult != nil {
+			affected, rowsErr := accountResult.RowsAffected()
+			if rowsErr == nil && affected == 0 {
+				return fmt.Errorf("%w: budget account missing for scope %q", ErrInvalidSettlement, demand.ScopeID)
+			}
 		}
 
 		// Record settlement row
@@ -409,6 +437,72 @@ func (s *SQLBudgetStore) resolveAttribution(ctx context.Context, tx *sql.Tx, par
 		return nil, nil, nil, fmt.Errorf("resolve billable attribution: %w", err)
 	}
 	return adv, camp, li, nil
+}
+
+// materializeLease creates the settleable lease row for a reservation whose
+// budget hold lives in Valkey. It keeps the settlement's foreign key and audit
+// trail intact without duplicating the runtime lease bookkeeping in MariaDB.
+func (s *SQLBudgetStore) materializeLease(ctx context.Context, tx *sql.Tx, params SettlementParams, demand Demand, now time.Time) ([]byte, string, time.Time, []byte, error) {
+	lineItemID, scope, ok := splitScopeID(demand.ScopeID)
+	if !ok {
+		return nil, "", time.Time{}, nil, fmt.Errorf("%w: cannot attribute scope %q", ErrInvalidSettlement, demand.ScopeID)
+	}
+	lineItemBytes, err := normalizeUUIDBytes(lineItemID)
+	if err != nil {
+		return nil, "", time.Time{}, nil, fmt.Errorf("%w: invalid line item in scope %q", ErrInvalidSettlement, demand.ScopeID)
+	}
+	periodStart := normalizePeriodStart(scope, now)
+	// The runtime lease id is shared by every reservation of a scope, so the
+	// settleable row is keyed by the reservation instead: one row per
+	// reservation and scope, which is also what the settlement FK needs.
+	leaseBytes := settlementLeaseID(params.ReservationID, demand.ScopeID)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO budget_lease
+		(tenant_id, lease_id, line_item_id, budget_scope, period_start, owner_instance, amount_micros,
+		 held_micros, settlement_grace_until, status, expires_at)
+		VALUES (?, ?, ?, ?, ?, 'settlement', ?, ?, ?, 'settled', ?)
+		ON DUPLICATE KEY UPDATE held_micros = VALUES(held_micros), status = 'settled'`,
+		s.tenantID, leaseBytes, lineItemBytes, scope, periodStart, int64(demand.AmountMicros),
+		int64(demand.AmountMicros), now.UTC(), now.UTC()); err != nil {
+		return nil, "", time.Time{}, nil, fmt.Errorf("materialize settlement lease: %w", err)
+	}
+	return lineItemBytes, scope, periodStart, leaseBytes, nil
+}
+
+// settlementLeaseID derives the stable lease id used for a settlement whose
+// budget hold was tracked in Valkey.
+func settlementLeaseID(reservationID, scopeID string) []byte {
+	digest := sha256.Sum256([]byte("openads.settlement.lease.v1|" + reservationID + "|" + scopeID))
+	return digest[:16]
+}
+
+// splitScopeID parses "<lineItemID>:<scope>" into its parts.
+func splitScopeID(scopeID string) (string, string, bool) {
+	lineItemID, scope, ok := strings.Cut(scopeID, ":")
+	if !ok || lineItemID == "" || scope == "" {
+		return "", "", false
+	}
+	return lineItemID, scope, true
+}
+
+// quarantineLateNotice parks a notice that arrived after the settlement grace so
+// a finance operator can decide on it instead of silently dropping the money.
+func (s *SQLBudgetStore) quarantineLateNotice(ctx context.Context, params SettlementParams, reason string) {
+	resBytes, err := normalizeUUIDBytes(params.ReservationID)
+	if err != nil {
+		return
+	}
+	quarantineID, err := domain.NewUUIDv7()
+	if err != nil {
+		return
+	}
+	quarantineBytes, _ := hex.DecodeString(quarantineID)
+	payloadHash := sha256.Sum256([]byte(string(params.Outcome) + ":" + params.ReservationID + ":" + params.SourceEventKey))
+	_, _ = s.db.ExecContext(ctx, `INSERT INTO dsp_notice_quarantine
+		(tenant_id, quarantine_id, reservation_id, source_event_key, outcome, reason_code, payload_hash, status, received_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NOW(6))
+		ON DUPLICATE KEY UPDATE reason_code = VALUES(reason_code)`,
+		s.tenantID, quarantineBytes, resBytes, normalize32Bytes(params.SourceEventKey),
+		string(params.Outcome), reason, payloadHash[:])
 }
 
 // ReclaimExpiredLeases scans active leases past settlement_grace_until,

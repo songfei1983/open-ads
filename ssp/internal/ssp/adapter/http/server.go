@@ -17,6 +17,7 @@ import (
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/config"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/dmp"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/domain"
+	"github.com/songfei1983/open-ads/ssp/internal/ssp/ledger"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/limiter"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/observability"
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/render"
@@ -33,6 +34,7 @@ type Server struct {
 	engine          *auction.Engine
 	codec           *token.Codec
 	tracker         *render.Tracker
+	ledger          *ledger.Store
 	renderer        *render.Renderer
 	dmp             *dmp.Adapter
 	adminHandler    http.Handler
@@ -77,9 +79,18 @@ func (s *Server) SetReady(ready bool) { s.isReady.Store(ready) }
 // SetTokenCodec installs the AEAD codec used for render, click and event tokens.
 func (s *Server) SetTokenCodec(codec *token.Codec) {
 	s.codec = codec
-	s.tracker = &render.Tracker{Codec: codec, TenantID: s.cfg.AdminTenantID}
+	s.tracker = &render.Tracker{Codec: codec, TenantID: s.cfg.AdminTenantID, Store: s.ledger}
 	if s.renderer != nil {
 		s.renderer.Codec = codec
+	}
+}
+
+// SetLedger installs the impression ledger. Without it impressions are rejected
+// instead of being silently deduplicated in memory.
+func (s *Server) SetLedger(store *ledger.Store) {
+	s.ledger = store
+	if s.tracker != nil {
+		s.tracker.Store = store
 	}
 }
 
@@ -108,6 +119,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /openrtb2/auction", s.handleOpenRTBAuction)
 	mux.HandleFunc("/sdk/v1/ad-requests", s.handleAdRequests)
 	mux.HandleFunc("POST /sdk/v1/impressions", s.handleImpression)
+	mux.HandleFunc("POST /internal/v1/supply/impressions", s.handleSupplyImpression)
 	mux.HandleFunc("GET /render/v1/assets/{token}", s.handleRenderAsset)
 	mux.HandleFunc("GET /render/v1/{token}", s.handleRender)
 	mux.HandleFunc("GET /click/v1/{token}", s.handleClick)
@@ -264,7 +276,7 @@ func (s *Server) handleOpenRTBAuction(w http.ResponseWriter, r *http.Request) {
 		s.logAuction(reqID, auctionID, placement.ID, "no_fill", started)
 		return
 	}
-	ad, err := s.mintAd(r, placement, outcome)
+	ad, err := s.mintAd(r, manifest, placement, outcome)
 	if err != nil {
 		s.logger.Error("failed to mint supply render tokens", slog.String("request_id", reqID), slog.Any("error", err))
 		writeJSON(w, http.StatusOK, map[string]any{"id": request.ID, "nbr": 2})
@@ -282,6 +294,12 @@ func (s *Server) handleOpenRTBAuction(w http.ResponseWriter, r *http.Request) {
 				"id": outcome.Winner.BidID, "impid": "1", "price": json.Number(auction.FormatCPMMicros(outcome.Winner.CPMMicros)),
 				"crid": outcome.Winner.CreativeID, "cid": outcome.Winner.CampaignID,
 				"w": placement.Width, "h": placement.Height, "adm": adm,
+				// The Supply endpoint reports the impression server-to-server with
+				// this token; it shares the event key with the SDK audience.
+				"ext": map[string]any{"openads": map[string]any{
+					"impression_url": ad.SupplyImpressionURL,
+					"event_token":    ad.SupplyEventToken,
+				}},
 			}},
 		}},
 	})
@@ -393,7 +411,7 @@ func (s *Server) handleAdRequests(w http.ResponseWriter, r *http.Request) {
 		s.logAuction(reqID, auctionID, placement.ID, "no_fill", started)
 		return
 	}
-	ad, err := s.mintAd(r, placement, outcome)
+	ad, err := s.mintAd(r, manifest, placement, outcome)
 	if err != nil {
 		s.logger.Error("failed to mint SDK render tokens", slog.String("request_id", reqID), slog.Any("error", err))
 		writeNoFill(w, reqID, "no_fill")
@@ -421,13 +439,15 @@ func (s *Server) handleAdRequests(w http.ResponseWriter, r *http.Request) {
 }
 
 type adTokens struct {
-	RenderURL  string
-	ClickURL   string
-	EventToken string
-	ExpiresAt  string
+	RenderURL           string
+	ClickURL            string
+	EventToken          string
+	SupplyImpressionURL string
+	SupplyEventToken    string
+	ExpiresAt           string
 }
 
-func (s *Server) mintAd(r *http.Request, placement snapshot.Placement, outcome auction.Outcome) (adTokens, error) {
+func (s *Server) mintAd(r *http.Request, manifest *snapshot.Manifest, placement snapshot.Placement, outcome auction.Outcome) (adTokens, error) {
 	if s.codec == nil {
 		return adTokens{}, errors.New("renderer token codec is not configured")
 	}
@@ -435,13 +455,28 @@ func (s *Server) mintAd(r *http.Request, placement snapshot.Placement, outcome a
 	expires := now.Add(s.cfg.RenderTokenTTL)
 	eventExpires := now.Add(s.cfg.EventTokenTTL)
 	winner := outcome.Winner
-	eventToken, err := s.codec.Seal(token.AudienceEvent, token.EventClaims{
-		TenantID: s.cfg.AdminTenantID, PlacementID: placement.ID, AuctionID: outcome.AuctionID,
+	billable, err := domain.CalculateBillableFromCPM(domain.Micros(winner.CPMMicros), 1)
+	if err != nil || billable <= 0 {
+		return adTokens{}, fmt.Errorf("compute billable amount: %w", err)
+	}
+	publisherID := ""
+	if property, ok := manifest.Properties[placement.PropertyID]; ok {
+		publisherID = property.PublisherID
+	}
+	claims := token.EventClaims{
+		TenantID: s.cfg.AdminTenantID, PublisherID: publisherID, PropertyID: placement.PropertyID,
+		PlacementID: placement.ID, AuctionID: outcome.AuctionID,
 		BidID: winner.BidID, ImpID: winner.ImpID, CreativeID: winner.CreativeID,
 		DSPEndpointID: winner.EndpointID, Reservation: winner.Reservation,
-		BidCPMMicros: winner.CPMMicros, Currency: winner.Currency, BURLTarget: winner.BURL,
+		BidCPMMicros: winner.CPMMicros, BillableMicros: int64(billable),
+		Currency: winner.Currency, BURLTarget: winner.BURL,
 		ExpiresAt: eventExpires,
-	})
+	}
+	eventToken, err := s.codec.Seal(token.AudienceEvent, claims)
+	if err != nil {
+		return adTokens{}, err
+	}
+	supplyToken, err := s.codec.Seal(token.AudienceSupplyEvent, claims)
 	if err != nil {
 		return adTokens{}, err
 	}
@@ -466,10 +501,12 @@ func (s *Server) mintAd(r *http.Request, placement snapshot.Placement, outcome a
 	}
 	origin := requestOrigin(r)
 	return adTokens{
-		RenderURL:  origin + "/render/v1/" + renderToken,
-		ClickURL:   origin + "/click/v1/" + clickToken,
-		EventToken: eventToken,
-		ExpiresAt:  expires.Format(time.RFC3339),
+		SupplyImpressionURL: origin + "/internal/v1/supply/impressions",
+		SupplyEventToken:    supplyToken,
+		RenderURL:           origin + "/render/v1/" + renderToken,
+		ClickURL:            origin + "/click/v1/" + clickToken,
+		EventToken:          eventToken,
+		ExpiresAt:           expires.Format(time.RFC3339),
 	}, nil
 }
 
@@ -496,7 +533,32 @@ func (s *Server) handleImpression(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "rejected"})
 		return
 	}
-	s.tracker.Handle(w, r)
+	s.tracker.Handle(w, r, token.AudienceEvent)
+}
+
+// handleSupplyImpression accepts the server-to-server Supply report. The Supply
+// credential identifies the endpoint; the sealed token carries the same event
+// key as the SDK audience, so both paths share one ledger transaction.
+func (s *Server) handleSupplyImpression(w http.ResponseWriter, r *http.Request) {
+	reqID := observability.RequestIDFromContext(r.Context())
+	if s.tracker == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "rejected"})
+		return
+	}
+	manifest, _, err := snapshot.Current()
+	if err != nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "config_unavailable", "no published SSP configuration", reqID)
+		return
+	}
+	credential := strings.TrimSpace(r.Header.Get("X-Supply-Key"))
+	if credential == "" {
+		credential = bearerToken(r)
+	}
+	if _, ok := manifest.SupplyByCredentialHash(snapshot.HashSHA256Hex(credential)); credential == "" || !ok {
+		writeAPIError(w, http.StatusUnauthorized, "unauthenticated", "supply credential is required", reqID)
+		return
+	}
+	s.tracker.Handle(w, r, token.AudienceSupplyEvent)
 }
 
 func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) {

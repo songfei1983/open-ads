@@ -176,6 +176,54 @@ second="$(curl --fail --silent -X POST "$SSP_BASE/sdk/v1/impressions" -H 'Conten
 echo "$second"
 echo "$second" | grep -q '"status":"duplicate"'
 
+echo "==> publisher payable is booked exactly once"
+auction_id="$(echo "$sdk" | python3 -c 'import json,sys; print(json.load(sys.stdin)["diagnostics"]["auction_id"])')"
+expected_amount="$((BID_CPM_MICROS / 1000))"
+curl --fail --silent -H "Authorization: Bearer ${SSP_ADMIN_TOKEN}" \
+  "$SSP_BASE/admin/v1/publisher-payable?limit=50" | python3 -c '
+import json, sys
+auction, expected = sys.argv[1], int(sys.argv[2])
+rows = json.load(sys.stdin)
+matches = [row for row in rows if row["auction_id"] == auction and row["entry_type"] == "billable"]
+if len(matches) != 1:
+    raise SystemExit(f"expected one billable payable entry for {auction}, got {len(matches)}")
+if matches[0]["amount_micros"] != expected:
+    raise SystemExit("payable amount %d != %d" % (matches[0]["amount_micros"], expected))
+print("payable", matches[0]["entry_id"], matches[0]["amount_micros"])
+' "$auction_id" "$expected_amount"
+
+echo "==> billable outbox delivers the impression to the DSP"
+outbox_status=""
+for _ in $(seq 1 30); do
+  outbox_status="$(curl --fail --silent -H "Authorization: Bearer ${SSP_ADMIN_TOKEN}" \
+    "$SSP_BASE/admin/v1/billable-outbox?limit=50" | python3 -c '
+import json, sys
+auction = sys.argv[1]
+rows = [row for row in json.load(sys.stdin) if row["auction_id"] == auction]
+print(rows[0]["status"] if rows else "missing")
+' "$auction_id")"
+  case "$outbox_status" in
+    delivered | quarantined | rejected) break ;;
+  esac
+  sleep 1
+done
+echo "outbox $outbox_status"
+test "$outbox_status" = "delivered"
+
+echo "==> DSP recorded the advertiser spend"
+curl --fail --silent -H "Authorization: Bearer ${DSP_ADMIN_TOKEN}" \
+  "$DSP_BASE/admin/v1/spend-ledger?limit=50" | python3 -c '
+import json, sys
+line_item, expected = sys.argv[1], int(sys.argv[2])
+rows = [row for row in json.load(sys.stdin)
+        if row["line_item_id"] == line_item and row["entry_type"] == "billable"]
+if len(rows) != 1:
+    raise SystemExit(f"expected one billable spend entry for {line_item}, got {len(rows)}")
+if rows[0]["amount_micros"] != expected:
+    raise SystemExit("spend amount %d != %d" % (rows[0]["amount_micros"], expected))
+print("spend", rows[0]["entry_id"], rows[0]["amount_micros"])
+' "$line_item" "$expected_amount"
+
 echo "==> click redirects to the allowlisted landing page"
 location="$(curl -s -o /dev/null -w '%{redirect_url}' "$click_url")"
 test "$location" = "https://example.com/landing"
@@ -187,5 +235,22 @@ supply_code="${supply_response##*$'\n'}"
 response="${supply_response%$'\n'*}"
 echo "$response"
 echo "$response" | grep -q '"seatbid"'
+
+echo "==> Supply reports the impression through the shared ledger"
+supply_token="$(echo "$response" | python3 -c '
+import json, sys
+print(json.load(sys.stdin)["seatbid"][0]["bid"][0]["ext"]["openads"]["event_token"])
+')"
+supply_impression="{\"event_token\":\"$supply_token\"}"
+first_supply="$(curl --fail --silent -X POST "$SSP_BASE/internal/v1/supply/impressions" \
+  -H 'Content-Type: application/json' -H "X-Supply-Key: $SUPPLY_KEY" -d "$supply_impression")"
+echo "$first_supply"
+echo "$first_supply" | grep -q '"status":"accepted"'
+second_supply="$(curl --fail --silent -X POST "$SSP_BASE/internal/v1/supply/impressions" \
+  -H 'Content-Type: application/json' -H "X-Supply-Key: $SUPPLY_KEY" -d "$supply_impression")"
+echo "$second_supply"
+echo "$second_supply" | grep -q '"status":"duplicate"'
+test "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$SSP_BASE/internal/v1/supply/impressions" \
+  -H 'Content-Type: application/json' -H 'X-Supply-Key: wrong-credential' -d "$supply_impression")" = "401"
 
 echo "==> filled-path integration smoke passed"

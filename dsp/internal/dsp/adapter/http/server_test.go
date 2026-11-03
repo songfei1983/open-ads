@@ -127,7 +127,7 @@ func TestBillableNoticeEndpoint(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	body := strings.NewReader(`{"event_id":"018f7a3b","amount_micros":2500}`)
+	body := strings.NewReader(`{"event_id":"018f7a3b","source_event_key":"src-018f7a3b","amount_micros":2500}`)
 	req, _ := http.NewRequest("POST", ts.URL+"/rtb/v1/billable/bid-123", body)
 	req.Header.Set("Content-Type", "application/json")
 
@@ -352,6 +352,7 @@ func TestBillableNoticeWithAEADTokenAndSettlement(t *testing.T) {
 	// 3. Replay with conflicting amount -> 409 Conflict
 	conflictBody := fmt.Sprintf(`{
 		"event_id": "evt-002",
+		"source_event_key": "src-002",
 		"reservation_ref": "%s",
 		"amount_micros": 1000,
 		"currency": "USD"
@@ -370,6 +371,7 @@ func TestBillableNoticeWithAEADTokenAndSettlement(t *testing.T) {
 	// 4. Overdrawn amount (> reserved) -> 400 Bad Request
 	overBody := fmt.Sprintf(`{
 		"event_id": "evt-003",
+		"source_event_key": "src-003",
 		"reservation_ref": "%s",
 		"amount_micros": 3000,
 		"currency": "USD"
@@ -441,6 +443,7 @@ func TestLossNoticeAndConflictingBillable(t *testing.T) {
 	// 2. Subsequent billable notice for the same reservation must conflict (409)
 	billableBody := fmt.Sprintf(`{
 		"event_id": "evt-loss-001",
+		"source_event_key": "src-loss-001",
 		"reservation_ref": "%s",
 		"amount_micros": 2000,
 		"currency": "USD"

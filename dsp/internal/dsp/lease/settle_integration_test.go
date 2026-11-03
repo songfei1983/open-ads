@@ -78,6 +78,7 @@ func seedLineItem(t *testing.T, ctx context.Context, db *sql.DB, tenant, adverti
 		tenantHex := hex.EncodeToString(tenant)
 		cleanup := []string{
 			`DELETE FROM dsp_notice_quarantine WHERE tenant_id = UNHEX(?)`,
+			`DELETE FROM advertiser_spend_ledger WHERE tenant_id = UNHEX(?) AND entry_type = 'reversal'`,
 			`DELETE FROM advertiser_spend_ledger WHERE tenant_id = UNHEX(?)`,
 			`DELETE FROM dsp_delivery_event WHERE tenant_id = UNHEX(?)`,
 			`DELETE FROM budget_reservation_settlement WHERE tenant_id = UNHEX(?)`,
@@ -264,5 +265,237 @@ func TestSettleReservationQuarantinesConflictingOutcome(t *testing.T) {
 	}
 	if pending != 1 {
 		t.Fatalf("pending quarantine rows = %d, want 1", pending)
+	}
+}
+
+func TestSettleReservationRejectsNoticeAfterGrace(t *testing.T) {
+	db := newIntegrationDB(t)
+	ctx := context.Background()
+
+	tenantBytes := randomHex(t, 16)
+	advertiserBytes := randomHex(t, 16)
+	campaignBytes := randomHex(t, 16)
+	lineItemBytes := randomHex(t, 16)
+	seedLineItem(t, ctx, db, tenantBytes, advertiserBytes, campaignBytes, lineItemBytes, "USD")
+
+	tenantID := hex.EncodeToString(tenantBytes)
+	lineItemID := hex.EncodeToString(lineItemBytes)
+	store, err := lease.NewSQLBudgetStore(db, tenantID)
+	if err != nil {
+		t.Fatalf("new budget store: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := store.EnsureAccount(ctx, lineItemID, "daily", now, "USD", 10_000_000); err != nil {
+		t.Fatalf("ensure account: %v", err)
+	}
+	grant, err := store.AllocateLease(ctx, lineItemID, "daily", now, "grace-test", 2500, 30*time.Second)
+	if err != nil {
+		t.Fatalf("allocate lease: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE budget_lease SET settlement_grace_until = ?
+		WHERE tenant_id = ? AND lease_id = UNHEX(?)`,
+		now.Add(-time.Minute), tenantBytes, grant.LeaseID); err != nil {
+		t.Fatalf("expire grace: %v", err)
+	}
+
+	params := lease.SettlementParams{
+		TenantID:       tenantID,
+		ReservationID:  randomUUIDString(t),
+		Outcome:        lease.OutcomeBillable,
+		ActualAmount:   domain.Micros(2500),
+		Currency:       "USD",
+		SourceEventKey: hex.EncodeToString(randomHex(t, 32)),
+		Demands:        []lease.Demand{{ScopeID: grant.ScopeID, AmountMicros: 2500}},
+		LeaseIDs:       map[string]string{grant.ScopeID: grant.LeaseID},
+		EventID:        randomUUIDString(t),
+		AuctionID:      "auction-grace",
+		BidID:          "bid-grace",
+		ImpID:          "1",
+		OccurredAt:     now,
+	}
+	if err := store.SettleReservation(ctx, params); !errors.Is(err, lease.ErrSettlementExpired) {
+		t.Fatalf("late notice error = %v, want ErrSettlementExpired", err)
+	}
+
+	var quarantine, settlements, spends int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM dsp_notice_quarantine
+		WHERE tenant_id = ? AND reason_code = 'grace_expired'`, tenantBytes).Scan(&quarantine); err != nil {
+		t.Fatalf("count quarantine: %v", err)
+	}
+	if quarantine != 1 {
+		t.Fatalf("quarantine rows = %d, want 1", quarantine)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM budget_reservation_settlement WHERE tenant_id = ?`, tenantBytes).Scan(&settlements); err != nil {
+		t.Fatalf("count settlements: %v", err)
+	}
+	if settlements != 0 {
+		t.Fatalf("settlements = %d, want 0", settlements)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM advertiser_spend_ledger WHERE tenant_id = ?`, tenantBytes).Scan(&spends); err != nil {
+		t.Fatalf("count spend ledger: %v", err)
+	}
+	if spends != 0 {
+		t.Fatalf("spend entries = %d, want 0", spends)
+	}
+}
+
+func TestSettleReservationRequiresEveryScope(t *testing.T) {
+	db := newIntegrationDB(t)
+	ctx := context.Background()
+
+	tenantBytes := randomHex(t, 16)
+	advertiserBytes := randomHex(t, 16)
+	campaignBytes := randomHex(t, 16)
+	lineItemBytes := randomHex(t, 16)
+	seedLineItem(t, ctx, db, tenantBytes, advertiserBytes, campaignBytes, lineItemBytes, "USD")
+
+	tenantID := hex.EncodeToString(tenantBytes)
+	lineItemID := hex.EncodeToString(lineItemBytes)
+	store, err := lease.NewSQLBudgetStore(db, tenantID)
+	if err != nil {
+		t.Fatalf("new budget store: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := store.EnsureAccount(ctx, lineItemID, "daily", now, "USD", 10_000_000); err != nil {
+		t.Fatalf("ensure account: %v", err)
+	}
+	grant, err := store.AllocateLease(ctx, lineItemID, "daily", now, "scope-test", 2500, 30*time.Second)
+	if err != nil {
+		t.Fatalf("allocate lease: %v", err)
+	}
+
+	lifetimeScope := lineItemID + ":lifetime"
+	params := lease.SettlementParams{
+		TenantID:       tenantID,
+		ReservationID:  randomUUIDString(t),
+		Outcome:        lease.OutcomeBillable,
+		ActualAmount:   domain.Micros(2500),
+		Currency:       "USD",
+		SourceEventKey: hex.EncodeToString(randomHex(t, 32)),
+		Demands: []lease.Demand{
+			{ScopeID: grant.ScopeID, AmountMicros: 2500},
+			{ScopeID: lifetimeScope, AmountMicros: 2500},
+		},
+		LeaseIDs:   map[string]string{grant.ScopeID: grant.LeaseID},
+		EventID:    randomUUIDString(t),
+		AuctionID:  "auction-scope",
+		BidID:      "bid-scope",
+		ImpID:      "1",
+		OccurredAt: now,
+	}
+	if err := store.SettleReservation(ctx, params); !errors.Is(err, lease.ErrInvalidSettlement) {
+		t.Fatalf("missing scope error = %v, want ErrInvalidSettlement", err)
+	}
+
+	var settlements, spends int
+	var spent int64
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM budget_reservation_settlement WHERE tenant_id = ?`, tenantBytes).Scan(&settlements); err != nil {
+		t.Fatalf("count settlements: %v", err)
+	}
+	if settlements != 0 {
+		t.Fatalf("settlements = %d, want 0 (all-or-nothing)", settlements)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM advertiser_spend_ledger WHERE tenant_id = ?`, tenantBytes).Scan(&spends); err != nil {
+		t.Fatalf("count spend ledger: %v", err)
+	}
+	if spends != 0 {
+		t.Fatalf("spend entries = %d, want 0", spends)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT spent_micros FROM budget_account
+		WHERE tenant_id = ? AND budget_scope = 'daily'`, tenantBytes).Scan(&spent); err != nil {
+		t.Fatalf("read spent: %v", err)
+	}
+	if spent != 0 {
+		t.Fatalf("spent_micros = %d, want 0 after a rolled back settlement", spent)
+	}
+}
+
+func TestAppendSpendReversalRules(t *testing.T) {
+	db := newIntegrationDB(t)
+	ctx := context.Background()
+
+	tenantBytes := randomHex(t, 16)
+	advertiserBytes := randomHex(t, 16)
+	campaignBytes := randomHex(t, 16)
+	lineItemBytes := randomHex(t, 16)
+	seedLineItem(t, ctx, db, tenantBytes, advertiserBytes, campaignBytes, lineItemBytes, "USD")
+
+	tenantID := hex.EncodeToString(tenantBytes)
+	lineItemID := hex.EncodeToString(lineItemBytes)
+	store, err := lease.NewSQLBudgetStore(db, tenantID)
+	if err != nil {
+		t.Fatalf("new budget store: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := store.EnsureAccount(ctx, lineItemID, "daily", now, "USD", 10_000_000); err != nil {
+		t.Fatalf("ensure account: %v", err)
+	}
+	grant, err := store.AllocateLease(ctx, lineItemID, "daily", now, "reversal-test", 2500, 30*time.Second)
+	if err != nil {
+		t.Fatalf("allocate lease: %v", err)
+	}
+	if err := store.SettleReservation(ctx, lease.SettlementParams{
+		TenantID:       tenantID,
+		ReservationID:  randomUUIDString(t),
+		Outcome:        lease.OutcomeBillable,
+		ActualAmount:   domain.Micros(2500),
+		Currency:       "USD",
+		SourceEventKey: hex.EncodeToString(randomHex(t, 32)),
+		Demands:        []lease.Demand{{ScopeID: grant.ScopeID, AmountMicros: 2500}},
+		LeaseIDs:       map[string]string{grant.ScopeID: grant.LeaseID},
+		EventID:        randomUUIDString(t),
+		AuctionID:      "auction-reversal",
+		BidID:          "bid-reversal",
+		ImpID:          "1",
+		OccurredAt:     now,
+	}); err != nil {
+		t.Fatalf("settle billable: %v", err)
+	}
+
+	entries, err := store.ListSpendLedger(ctx, 10)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("list spend ledger: %v (%d entries)", err, len(entries))
+	}
+	original := entries[0]
+
+	partial, err := store.AppendSpendReversal(ctx, original.EntryID, domain.Micros(1000), "partial refund")
+	if err != nil {
+		t.Fatalf("partial reversal: %v", err)
+	}
+	replay, err := store.AppendSpendReversal(ctx, original.EntryID, domain.Micros(1000), "partial refund")
+	if err != nil {
+		t.Fatalf("replayed reversal: %v", err)
+	}
+	if replay != partial {
+		t.Fatalf("replayed reversal = %s, want %s", replay, partial)
+	}
+	if _, err := store.AppendSpendReversal(ctx, original.EntryID, domain.Micros(2000), "over-refund"); !errors.Is(err, lease.ErrInvalidSettlement) {
+		t.Fatalf("over reversal error = %v, want ErrInvalidSettlement", err)
+	}
+	if _, err := store.AppendSpendReversal(ctx, randomUUIDString(t), domain.Micros(1), "missing"); !errors.Is(err, lease.ErrSpendEntryNotFound) {
+		t.Fatalf("missing entry error = %v, want ErrSpendEntryNotFound", err)
+	}
+
+	if _, err := store.AppendSpendReversal(ctx, original.EntryID, domain.Micros(1500), "final refund"); err != nil {
+		t.Fatalf("final reversal: %v", err)
+	}
+	entries, err = store.ListSpendLedger(ctx, 10)
+	if err != nil {
+		t.Fatalf("list spend ledger: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("spend rows = %d, want 3", len(entries))
+	}
+	reversed := int64(0)
+	for _, entry := range entries {
+		if entry.EntryType == "reversal" {
+			reversed += -entry.AmountMicros
+			if entry.Reverses != original.EntryID {
+				t.Fatalf("reversal %s references %q, want %q", entry.EntryID, entry.Reverses, original.EntryID)
+			}
+		}
+	}
+	if reversed != 2500 {
+		t.Fatalf("cumulative reversed = %d, want 2500", reversed)
 	}
 }

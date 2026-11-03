@@ -136,6 +136,8 @@ make migration-check && docker compose -f deployments/docker-compose.yml config 
 
 ### 7.4 残留限制（进入 Iteration 6 时仍需处理）
 
+> 2026-11-03 更新：以下 1–4 项已在 [Iteration 6](../iteration-6/baseline-decisions.md) 收敛，第 5 项（沙箱开关）仍然有效。
+
 1. **通知退避与隔离**：SSP 侧 win/loss notice 仍为单次 best-effort；指数退避、4xx 隔离、SSRF 复核与重放属 I6-07（本次已补齐禁止重定向与私网拒绝，未补退避队列）。
 2. **账本冲正**：`publisher_payable_ledger`/`advertiser_spend_ledger` 只写入正向 billable 分录；`reversal`/`adjustment` 与累计冲正上限校验属 I6-06。
 3. **SSP 侧账务**：impression 仍只做 token 校验与进程内去重，尚未写 `ssp_delivery_event`/payable/billable outbox（I6-02/03）。

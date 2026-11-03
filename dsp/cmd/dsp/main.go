@@ -49,6 +49,7 @@ func main() {
 	var stopConfigWorker context.CancelFunc
 	tenantID := strings.ToLower(strings.ReplaceAll(cfg.AdminTenantID, "-", ""))
 	var store *control.SQLStore
+	var budgetStore *lease.SQLBudgetStore
 	var db *sql.DB
 	if cfg.AdminToken != "" || cfg.ConfigPublisher {
 		db, err = openDatabase(cfg)
@@ -62,6 +63,11 @@ func main() {
 			logger.Error("failed to initialize DSP management store", slog.Any("error", err))
 			os.Exit(1)
 		}
+		budgetStore, err = lease.NewSQLBudgetStore(db, tenantID)
+		if err != nil {
+			logger.Error("failed to initialize DSP settlement store", slog.Any("error", err))
+			os.Exit(1)
+		}
 		if cfg.AdminToken != "" {
 			assetStore, err := assets.NewFileStore(cfg.AssetStoreRoot)
 			if err != nil {
@@ -71,9 +77,12 @@ func main() {
 			defer assetStore.Close()
 			store.SetAssetStore(assetStore)
 			server.SetAssetStore(assetStore)
-			server.SetAdminHandler(control.NewHandler(store, cfg.AdminToken, control.SSPSyncConfig{
+			adminMux := http.NewServeMux()
+			adminMux.Handle("/admin/v1/spend-ledger", lease.NewAdminHandler(budgetStore, cfg.AdminToken))
+			adminMux.Handle("/", control.NewHandler(store, cfg.AdminToken, control.SSPSyncConfig{
 				BaseURL: cfg.SSPInternalURL, Token: cfg.SSPInternalToken, EndpointID: cfg.SSPEndpointID,
 			}))
+			server.SetAdminHandler(adminMux)
 		}
 	}
 	if tenantID != "" {
@@ -115,12 +124,7 @@ func main() {
 			logger.Warn("DSP reservation tokens are disabled; configure DSP_LEASE_TOKEN_KEY")
 		}
 		server.SetReserver(reserver)
-		if db != nil {
-			budgetStore, err := lease.NewSQLBudgetStore(db, tenantID)
-			if err != nil {
-				logger.Error("failed to create DSP settlement store", slog.Any("error", err))
-				os.Exit(1)
-			}
+		if budgetStore != nil {
 			server.SetSettlementStore(budgetStore)
 		} else {
 			logger.Warn("DSP settlement persistence is disabled; notices settle in Valkey only")
