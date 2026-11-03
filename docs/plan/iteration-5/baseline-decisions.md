@@ -1,7 +1,7 @@
 # Iteration 5 基线决策与架构映射记录
 
-状态：I5-01~I5-08 完成（sandbox 单租户、单 Region 拓扑）
-适用分支：`feat/iteration-5`
+状态：I5-01~I5-08 完成（sandbox 单租户、单 Region 拓扑）；2026-11-03 追加 Iteration 6 前置缺陷修复，见 §7
+适用分支：已合并至 `main`（合并提交 `6d29702`）
 关联文档：[Iteration 4 基线决策](../iteration-4/baseline-decisions.md) | [首期开发计划](../implementation-plan.md) | [API](../../design/API.md) | [LLD](../../design/LLD.md)
 
 ## 1. 目标与范围
@@ -86,10 +86,58 @@ docker compose -f deployments/docker-compose.yml config >/dev/null
 ## 6. 明确延期与已知限制
 
 1. **账务**：impression 只做 token 校验与进程内去重，不写 `ssp_delivery_event`/payable/DSP billable outbox；Iteration 6 实现唯一事务与冲正。
-2. **通知重试**：win/loss notice 当前单次 best-effort，失败只计数与告警；指数退避、quarantine 与处置 API 属 Iteration 6。
+2. **通知重试**：win/loss notice 当前单次 best-effort，失败只计数与告警；指数退避属 Iteration 6。quarantine 处置 API 曾不可用，已于 2026-11-03 修复（见 §7 F5-03）。
 3. **身份与授权**：Supply 使用共享 secret 的哈希鉴权，DSP→SSP 内部同步使用共享 internal bearer；mTLS/workload identity 待 D-01。
 4. **多实例**：本地只验收单实例；Valkey manifest/心跳键与落后 10s 摘除逻辑支持多实例，但未在真实多实例拓扑压测。
 5. **DMP sandbox 数据**：需要已发布 snapshot 才能返回 segments；没有发布数据时 SSP 按设计 fail-closed。DMP tenant 绑定通过 `SSP_DMP_TENANT_ID` 适配（默认 `tenant-default`）。
 6. **素材同步**：DSP 既有 published creative 必须在本版本后重新 publish，才会包含 `asset_ref`、`asset_sha256`、尺寸与 `landing_url`；同步前 SSP 拒绝其 bid。
 7. **控制台**：SSP 管理台复用 console 的模拟样式，只覆盖 I5 范围资源；DSP “同步到 SSP” 仍通过 DSP 管理 API 触发（`POST /admin/v1/ssp/creative-registry/sync`，sandbox 可在 body 传 `dsp_endpoint_id`）。
 8. **限流**：进程内 token bucket，不跨实例共享；跨实例配额后续进入网关/Redis 方案。
+
+
+## 7. 修复记录（2026-11-03，Iteration 6 前置）
+
+iteration-6 就绪度评审在 main（合并提交 `6d29702`）上复测配信链路后，发现 2 个 P0、3 个 P1 缺陷正好落在 Iteration 6 的验收路径上。本节记录修复内容、验证证据与残留限制；这些问题**不属于** I5 原始验收范围，但若不修复，I6-02/03/04/05 无法通过。
+
+### 7.1 缺陷与修复
+
+| ID | 级别 | 问题 | 修复 | 验证证据 |
+|---|---|---|---|---|
+| F5-01 | P0 | DSP 创建了 `control.SQLStore` 但从未调用 `SetSettlementStore`，运行态 `settlementStore` 恒为 nil。所有 `nurl`/`lurl`/`burl` 返回成功却**不写任何持久记录**：无 settlement 行、不释放预算、无 advertiser spend。 | [dsp/cmd/dsp/main.go](../../../dsp/cmd/dsp/main.go) 用同一 `*sql.DB` 构造 `lease.NewSQLBudgetStore` 并注入；DB 不可用时记录 warn 而非静默跳过。 | notice 处理路径从"204 空转"变为真实事务；见 F5-02 的 MariaDB 断言。 |
+| F5-02 | P0 | `advertiser_spend_ledger` 的 INSERT 只列 6 列，缺 `advertiser_id`/`campaign_id`/`entry_type`/`currency`/`occurred_at`/`recorded_at` 六个 NOT NULL 列，真实执行必然 `ERROR 1364`；且使用 `ON DUPLICATE KEY UPDATE amount_micros = ...` 改写追加式账本。 | [sql_allocator.go](../../../dsp/internal/dsp/lease/sql_allocator.go)：归属改为从 `line_item JOIN campaign` 权威解析（不信任 notice body，避免伪造通知串账）；补齐全部必填列；upsert 改为 `entry_id = entry_id` 的幂等空更新，账本金额不可变。 | 新增 [settle_integration_test.go](../../../dsp/internal/dsp/lease/settle_integration_test.go)（真实 MariaDB，`DSP_MARIADB_TEST_DSN` 门控）：billable 结算后 spend=2500、advertiser/campaign/line_item 三者与 seed 一致、`entry_type=billable`、delivery event 1 条、settlement 1 条；同终态重放幂等且仍为 1 条；`spent_micros=2500 / leased_micros=0`；冲突终态返回 `ErrReservationConflict` 并写入 `pending` quarantine。 |
+| F5-03 | P1 | `POST /admin/v1/quarantine/{id}/resolve` 写 `status='resolved'`，但表约束只允许 `('pending','accepted','rejected')`，接口恒 500；`resolved_at`/`resolved_by`/`resolution_reason` 三列从未写入。 | 新增 [000004_dsp_quarantine_resolution.up.sql](../../../dsp/migrations/000004_dsp_quarantine_resolution.up.sql)（MariaDB 无法 DROP 内联 CHECK，改用 `MODIFY COLUMN` 去掉后重建具名约束）并同步 [sql_store.go](../../../dsp/internal/dsp/control/sql_store.go)：写入 `resolved_at`/`resolution_reason`，重复处置幂等、未知 ID 404，列表接口回显这两列。 | 迁移 up/down 往返均成功；实机 `POST .../resolve` → 200 `{"status":"resolved"}`，重放 200，未知 ID 404；`GET /admin/v1/quarantine` 返回 `resolved_at` 与 `resolution_reason`。 |
+| F5-04 | P1 | SSP 出站通知沿用默认重定向策略（allowlist 主机可 302 到内网）；`CallbackAllowed` 只比对 hostname 字符串，不校验 scheme、不拒绝私网地址，与 I0 威胁模型不符。 | 新增 [netguard](../../../ssp/internal/ssp/netguard/netguard.go)：拒绝 loopback/私网/link-local/CGNAT/multicast（含 DNS 解析后校验）；[engine.go](../../../ssp/internal/ssp/auction/engine.go) 的竞价与 notice 客户端统一**禁止跟随重定向**；`CallbackAllowed` 增加 scheme 白名单（仅 http/https）。因沙箱所有 peer 都在私有容器网络，新增 `SSP_ALLOW_PRIVATE_CALLBACKS` 显式豁免（默认关闭，compose 与 CI 显式开启）。 | `netguard` 单测覆盖 14 个 IP 样本（11 拒绝 + 3 放行）、受限 dial 与豁免分支；`CallbackAllowed` 单测覆盖 `ftp:`/`javascript:`/`file:` 与 allowlist 外主机；SSP 全量单测通过。 |
+| F5-05 | P1 | CI 只断言 Supply `nbr=2` 与 SDK `no_fill`，**从未验证 filled → render → impression 链路**；DSP 账务 SQL 写路径没有任何集成测试（这正是 F5-02 长期潜伏的原因）。 | 新增 [filled-path.sh](../../../ssp/scripts/filled-path.sh)：发布 DSP advertiser→campaign→creative（1×1 PNG 上传 + SHA-256）→line item，发布 SSP supply chain，同步 creative registry，再断言 filled、render 壳、asset 字节哈希、impression `accepted`/`duplicate`、click 302、Supply seatbid；接入 CI，并把 DSP 启动补齐 admin/DB/Valkey/lease key/资产卷/内部同步等环境变量，新增 settlement 集成测试步骤与失败日志上传。 | 本地实测全绿（CI 步骤已接入，首次远端运行需在推送后确认）；`open_ads_ssp_auctions_filled_total` 由 0 变正，`notices_sent_total=7`。 |
+
+### 7.2 顺带修复的沙箱阻塞项
+
+| 项 | 问题 | 修复 |
+|---|---|---|
+| 通知回传不可达 | `DSP_BASE_NOTICE_URL` 未配置，nurl/burl 指向 DSP 自身 loopback；SSP 跨容器回传必然失败。同时 bid 的 callback host（`127.0.0.1`）与 SSP endpoint allowlist（`dsp`）不一致，导致整条 bid 被 `creative_not_whitelisted` 丢弃。 | [docker-compose.yml](../../../deployments/docker-compose.yml) 设置 `DSP_BASE_NOTICE_URL: "http://dsp:8081"`，与 callback allowlist 对齐。 |
+| 空卷迁移缺失 | [02-apply-migrations.sql](../../../deployments/mariadb-init/02-apply-migrations.sql) 只应用 DSP `000001`，全新卷缺少 `000002`/`000003`/`000004`，DSP 起来即失效。 | 补齐 DSP `000002`–`000004`，并把这些文件加入 `make migration-check` 断言。 |
+
+### 7.3 复验命令
+
+```bash
+# 全模块
+for m in identity console ssp dsp dmp; do (cd "$m" && gofmt -l . && go vet ./... && go test ./...); done
+
+# 账务写路径（真实 MariaDB）
+cd dsp && DSP_MARIADB_TEST_DSN="dsp_user:dsp_pass@tcp(127.0.0.1:3306)/dsp_db?parseTime=true" \
+  go test ./internal/dsp/lease/ -run TestSettleReservation -v
+
+# 配信全链路（compose 内运行）
+SSP_ADMIN_TOKEN=... DSP_ADMIN_TOKEN=... \
+SSP_DSP_BID_URL=http://dsp:8081/openrtb2/bid SSP_DSP_CALLBACK_HOST=dsp \
+  ./ssp/scripts/filled-path.sh
+
+make migration-check && docker compose -f deployments/docker-compose.yml config >/dev/null
+```
+
+### 7.4 残留限制（进入 Iteration 6 时仍需处理）
+
+1. **通知退避与隔离**：SSP 侧 win/loss notice 仍为单次 best-effort；指数退避、4xx 隔离、SSRF 复核与重放属 I6-07（本次已补齐禁止重定向与私网拒绝，未补退避队列）。
+2. **账本冲正**：`publisher_payable_ledger`/`advertiser_spend_ledger` 只写入正向 billable 分录；`reversal`/`adjustment` 与累计冲正上限校验属 I6-06。
+3. **SSP 侧账务**：impression 仍只做 token 校验与进程内去重，尚未写 `ssp_delivery_event`/payable/billable outbox（I6-02/03）。
+4. **多 scope 结算**：`SettleReservation` 在 `LeaseIDs[scope]` 缺失时静默 `continue`，与"所有 scope 全有或全无"的表述不完全一致，需在 I6-04 收敛。
+5. **沙箱开关**：`SSP_ALLOW_PRIVATE_CALLBACKS=true` 仅适用于私有容器网络；生产/多租户环境必须保持默认关闭，并按 D-01 切换 mTLS 调用方身份。
