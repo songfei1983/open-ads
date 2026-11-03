@@ -23,6 +23,7 @@ type ReservationClaims struct {
 	AuctionID      string            `json:"auction_id"`
 	BidID          string            `json:"bid_id"`
 	ImpressionID   string            `json:"imp_id"`
+	LineItemID     string            `json:"line_item_id,omitempty"`
 	Currency       string            `json:"currency"`
 	ReservedMicros int64             `json:"reserved_micros"`
 	ExpiresAt      time.Time         `json:"expires_at"`

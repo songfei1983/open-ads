@@ -35,9 +35,12 @@ type Config struct {
 
 	// Control plane. The management API is tenant scoped: one ssp process
 	// serves exactly one tenant and never trusts a tenant from the request.
-	AdminTenantID   string
-	AdminToken      string
-	InternalToken   string
+	AdminTenantID string
+	AdminToken    string
+	InternalToken string
+	// FinanceToken optionally authorises the ledger-only finance surface. When
+	// unset the admin token also grants it (sandbox default).
+	FinanceToken    string
 	ConfigPublisher bool
 
 	// AllowPrivateCallbacks waives the outbound private-address guard. It is a
@@ -144,6 +147,7 @@ func Load() (*Config, error) {
 		DSPURL:          strings.TrimRight(getEnv("DSP_URL", ""), "/"),
 		AdminTenantID:   getEnv("SSP_ADMIN_TENANT_ID", ""),
 		AdminToken:      getEnv("SSP_ADMIN_TOKEN", ""),
+		FinanceToken:    getEnv("SSP_FINANCE_TOKEN", ""),
 		InternalToken:   getEnv("SSP_INTERNAL_TOKEN", ""),
 		ConfigPublisher: configPublisher,
 

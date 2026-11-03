@@ -317,6 +317,25 @@ func (s *SQLBudgetStore) SettleReservation(ctx context.Context, params Settlemen
 			return fmt.Errorf("update lease held micros: %w", err)
 		}
 
+		// The account is the money authority; a hold smaller than the settled
+		// risk means the Valkey lease and MariaDB drifted. The settlement still
+		// proceeds (money must be recorded) but the drift is parked for a
+		// finance operator instead of being hidden by GREATEST(0, ...).
+		var accountLeased int64
+		if err := tx.QueryRowContext(ctx, `SELECT leased_micros FROM budget_account
+			WHERE tenant_id = ? AND line_item_id = ? AND budget_scope = ? AND period_start = ? FOR UPDATE`,
+			s.tenantID, lineItemBytes, scope, periodStart).Scan(&accountLeased); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: budget account missing for scope %q", ErrInvalidSettlement, demand.ScopeID)
+			}
+			return fmt.Errorf("query budget account: %w", err)
+		}
+		if accountLeased < int64(demand.AmountMicros) {
+			if err := s.recordUnderflowQuarantine(ctx, tx, params, demand.ScopeID, accountLeased); err != nil {
+				return err
+			}
+		}
+
 		// Deduct leased amount from account, and record spend if billable
 		var accountResult sql.Result
 		if params.Outcome == OutcomeBillable {
@@ -439,6 +458,29 @@ func (s *SQLBudgetStore) resolveAttribution(ctx context.Context, tx *sql.Tx, par
 	return adv, camp, li, nil
 }
 
+// recordUnderflowQuarantine parks a lease/account drift for reconciliation.
+func (s *SQLBudgetStore) recordUnderflowQuarantine(ctx context.Context, tx *sql.Tx, params SettlementParams, scopeID string, landed int64) error {
+	resBytes, err := normalizeUUIDBytes(params.ReservationID)
+	if err != nil {
+		return fmt.Errorf("%w: invalid reservation id", ErrInvalidSettlement)
+	}
+	quarantineID, err := domain.NewUUIDv7()
+	if err != nil {
+		return fmt.Errorf("create quarantine id: %w", err)
+	}
+	quarantineBytes, _ := hex.DecodeString(quarantineID)
+	payloadHash := sha256.Sum256([]byte(fmt.Sprintf("leased_underflow:%s:%s:%d", params.ReservationID, scopeID, landed)))
+	if _, err := tx.ExecContext(ctx, `INSERT INTO dsp_notice_quarantine
+		(tenant_id, quarantine_id, reservation_id, source_event_key, outcome, reason_code, payload_hash, status, received_at)
+		VALUES (?, ?, ?, ?, ?, 'leased_underflow', ?, 'pending', NOW(6))
+		ON DUPLICATE KEY UPDATE reason_code = VALUES(reason_code)`,
+		s.tenantID, quarantineBytes, resBytes, normalize32Bytes(params.SourceEventKey+":"+scopeID),
+		string(params.Outcome), payloadHash[:]); err != nil {
+		return fmt.Errorf("record lease underflow quarantine: %w", err)
+	}
+	return nil
+}
+
 // materializeLease creates the settleable lease row for a reservation whose
 // budget hold lives in Valkey. It keeps the settlement's foreign key and audit
 // trail intact without duplicating the runtime lease bookkeeping in MariaDB.
@@ -482,6 +524,69 @@ func splitScopeID(scopeID string) (string, string, bool) {
 		return "", "", false
 	}
 	return lineItemID, scope, true
+}
+
+// WinNotice records a non-billable win for delivery attribution. It never
+// touches the budget, the spend ledger or the reservation terminal state.
+type WinNotice struct {
+	ReservationID string
+	LineItemID    string
+	AuctionID     string
+	BidID         string
+	ImpID         string
+	CreativeID    string
+	Currency      string
+	OccurredAt    time.Time
+}
+
+// RecordWinNotice persists one non-billable win event. Replays are idempotent.
+func (s *SQLBudgetStore) RecordWinNotice(ctx context.Context, notice WinNotice) error {
+	if notice.BidID == "" {
+		return fmt.Errorf("%w: bid id is required", ErrInvalidSettlement)
+	}
+	eventUUID, err := domain.NewUUIDv7()
+	if err != nil {
+		return fmt.Errorf("create win event id: %w", err)
+	}
+	eventBytes, _ := hex.DecodeString(eventUUID)
+	sourceKey := normalize32Bytes("win:" + s.tenantHex() + ":" + notice.BidID)
+	occurredAt := notice.OccurredAt
+	if occurredAt.IsZero() {
+		occurredAt = time.Now().UTC()
+	}
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin win notice transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	advBytes, campBytes, liBytes, err := s.resolveAttribution(ctx, tx, SettlementParams{
+		LineItemID: notice.LineItemID,
+	}, nil)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO dsp_delivery_event
+		(tenant_id, event_id, source_event_key, event_type, auction_id, bid_id, imp_id,
+		 advertiser_id, campaign_id, line_item_id, creative_id, currency, amount_micros,
+		 occurred_at, received_at, schema_version)
+		VALUES (?, ?, ?, 'win', ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 1)
+		ON DUPLICATE KEY UPDATE received_at = VALUES(received_at)`,
+		s.tenantID, eventBytes, sourceKey, notice.AuctionID, notice.BidID, notice.ImpID,
+		advBytes, campBytes, liBytes, normalizeOptionalUUIDBytes(notice.CreativeID),
+		notice.Currency, occurredAt, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("insert win delivery event: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit win notice: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLBudgetStore) tenantHex() string {
+	return hex.EncodeToString(s.tenantID)
 }
 
 // quarantineLateNotice parks a notice that arrived after the settlement grace so

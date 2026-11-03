@@ -26,6 +26,12 @@ type SettlementStore interface {
 	SettleReservation(ctx context.Context, params lease.SettlementParams) error
 }
 
+// WinNoticeRecorder is an optional capability of the settlement store: it
+// persists non-billable win attribution.
+type WinNoticeRecorder interface {
+	RecordWinNotice(ctx context.Context, notice lease.WinNotice) error
+}
+
 // Server wraps the standard library http.Server for DSP.
 type Server struct {
 	server          *http.Server
@@ -348,7 +354,36 @@ func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWinNotice(w http.ResponseWriter, r *http.Request) {
-	// Win notice (nurl) records win status without altering held budget or spend
+	// Win notice (nurl) records win status without altering held budget or spend.
+	bidID := r.PathValue("bid_id")
+	ref := r.URL.Query().Get("ref")
+	if ref != "" && s.tokenCodec != nil {
+		claims, err := s.tokenCodec.Open(ref, time.Now().UTC())
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"code": "invalid_token", "message": "invalid or expired reservation token",
+			})
+			return
+		}
+		if claims.BidID != "" && bidID != "" && claims.BidID != bidID {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"code": "invalid_request", "message": "bid_id does not match reservation token",
+			})
+			return
+		}
+		if recorder, ok := s.settlementStore.(WinNoticeRecorder); ok {
+			if err := recorder.RecordWinNotice(r.Context(), lease.WinNotice{
+				ReservationID: claims.ReservationID,
+				LineItemID:    claims.LineItemID,
+				AuctionID:     claims.AuctionID,
+				BidID:         bidID,
+				ImpID:         claims.ImpressionID,
+				Currency:      claims.Currency,
+			}); err != nil {
+				s.logger.Warn("failed to record win notice", slog.String("bid_id", bidID), slog.Any("error", err))
+			}
+		}
+	}
 	w.WriteHeader(http.StatusOK)
 }
 

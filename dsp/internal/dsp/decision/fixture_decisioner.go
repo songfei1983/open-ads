@@ -156,6 +156,7 @@ func (f FixtureDecisioner) Decide(ctx context.Context, req Request) (Response, e
 				AuctionID:      req.ID,
 				BidID:          bidID,
 				ImpressionID:   impID,
+				LineItemID:     best.ID,
 				Currency:       best.Currency,
 				ReservedMicros: int64(spendRisk),
 				ExpiresAt:      now.Add(10 * time.Minute),
@@ -172,6 +173,9 @@ func (f FixtureDecisioner) Decide(ctx context.Context, req Request) (Response, e
 		burl := baseURL + "/rtb/v1/billable/" + bidID
 		lurl := baseURL + "/rtb/v1/loss/" + bidID + "?reason=${AUCTION_LOSS}"
 		if token != "" {
+			// The win notice carries the reservation reference so the DSP can
+			// persist non-billable win attribution without settling budget.
+			nurl += "&ref=" + token
 			lurl += "&ref=" + token
 		}
 		width, height := req.BannerWidth, req.BannerHeight

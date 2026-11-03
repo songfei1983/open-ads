@@ -9,20 +9,27 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/songfei1983/open-ads/ssp/internal/ssp/domain"
 )
 
-// NewAdminHandler exposes the finance-operator surface: the billable outbox and
-// the append-only publisher payable ledger.
-func NewAdminHandler(store *Store, bearerSecret string) http.Handler {
-	h := &adminHandler{store: store, secret: bearerSecret}
+// NewAdminHandler exposes the finance-operator surface: the billable outbox, the
+// append-only publisher payable ledger and its adjustment audit. Any configured
+// bearer secret is accepted; D-01 replaces this with role-scoped identities.
+func NewAdminHandler(store *Store, bearerSecrets ...string) http.Handler {
+	h := &adminHandler{store: store}
+	for _, secret := range bearerSecrets {
+		if trimmed := strings.TrimSpace(secret); trimmed != "" {
+			h.secrets = append(h.secrets, trimmed)
+		}
+	}
 	return http.HandlerFunc(h.serve)
 }
 
 type adminHandler struct {
-	store  *Store
-	secret string
+	store   *Store
+	secrets []string
 }
 
 func (h *adminHandler) serve(w http.ResponseWriter, r *http.Request) {
@@ -33,7 +40,7 @@ func (h *adminHandler) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if h.store == nil || h.secret == "" {
+	if h.store == nil || len(h.secrets) == 0 {
 		adminError(w, http.StatusServiceUnavailable, "dependency_unavailable", "ledger API is not configured")
 		return
 	}
@@ -49,6 +56,10 @@ func (h *adminHandler) serve(w http.ResponseWriter, r *http.Request) {
 		h.resolveOutbox(w, r, strings.TrimPrefix(path, "billable-outbox/"))
 	case path == "publisher-payable" && r.Method == http.MethodGet:
 		h.listPayable(w, r)
+	case path == "publisher-payable/audit" && r.Method == http.MethodGet:
+		h.listAudit(w, r)
+	case path == "publisher-payable/export" && r.Method == http.MethodGet:
+		h.exportPayable(w, r)
 	case strings.HasPrefix(path, "publisher-payable/") && r.Method == http.MethodPost:
 		h.reversal(w, r, strings.TrimPrefix(path, "publisher-payable/"))
 	default:
@@ -62,8 +73,12 @@ func (h *adminHandler) authorized(r *http.Request) bool {
 		return false
 	}
 	provided := sha256.Sum256([]byte(strings.TrimPrefix(authorization, "Bearer ")))
-	expected := sha256.Sum256([]byte(h.secret))
-	return subtle.ConstantTimeCompare(provided[:], expected[:]) == 1
+	matched := 0
+	for _, secret := range h.secrets {
+		expected := sha256.Sum256([]byte(secret))
+		matched |= subtle.ConstantTimeCompare(provided[:], expected[:])
+	}
+	return matched == 1
 }
 
 func (h *adminHandler) listOutbox(w http.ResponseWriter, r *http.Request) {
@@ -149,7 +164,11 @@ func (h *adminHandler) reversal(w http.ResponseWriter, r *http.Request, action s
 		return
 	}
 	reversalID, err := h.store.AppendPayableReversal(r.Context(), Reversal{
-		EntryID: entryID, AmountMicros: domain.Micros(request.AmountMicros), Reason: request.Reason,
+		EntryID:      entryID,
+		AmountMicros: domain.Micros(request.AmountMicros),
+		Reason:       request.Reason,
+		Actor:        strings.TrimSpace(r.Header.Get("X-Actor")),
+		RequestID:    w.Header().Get("X-Request-ID"),
 	})
 	switch {
 	case errors.Is(err, ErrEntryNotFound):
@@ -161,6 +180,52 @@ func (h *adminHandler) reversal(w http.ResponseWriter, r *http.Request, action s
 	default:
 		adminJSON(w, http.StatusCreated, map[string]any{"entry_id": reversalID, "reverses_entry_id": entryID})
 	}
+}
+
+func (h *adminHandler) listAudit(w http.ResponseWriter, r *http.Request) {
+	limit, err := parseLimit(r)
+	if err != nil {
+		adminError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	entries, err := h.store.ListPayableAudit(r.Context(), limit)
+	if err != nil {
+		adminError(w, http.StatusServiceUnavailable, "dependency_unavailable", "unable to read the payable audit")
+		return
+	}
+	adminJSON(w, http.StatusOK, entries)
+}
+
+// exportPayable is a read-only reconciliation view. It is not a payment
+// instruction: sandbox profile has no payout or invoice state.
+func (h *adminHandler) exportPayable(w http.ResponseWriter, r *http.Request) {
+	from, err := parseTimestamp(r.URL.Query().Get("from"))
+	if err != nil {
+		adminError(w, http.StatusBadRequest, "invalid_request", "from must be an RFC3339 timestamp")
+		return
+	}
+	to, err := parseTimestamp(r.URL.Query().Get("to"))
+	if err != nil {
+		adminError(w, http.StatusBadRequest, "invalid_request", "to must be an RFC3339 timestamp")
+		return
+	}
+	summary, err := h.store.ExportPayable(r.Context(), from, to)
+	if err != nil {
+		if errors.Is(err, ErrExportRange) {
+			adminError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		adminError(w, http.StatusServiceUnavailable, "dependency_unavailable", "unable to export the payable ledger")
+		return
+	}
+	adminJSON(w, http.StatusOK, summary)
+}
+
+func parseTimestamp(raw string) (time.Time, error) {
+	if strings.TrimSpace(raw) == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse(time.RFC3339, raw)
 }
 
 func parseLimit(r *http.Request) (int, error) {

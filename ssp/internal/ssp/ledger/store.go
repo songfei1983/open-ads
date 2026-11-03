@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -21,6 +22,9 @@ var ErrEntryNotFound = errors.New("ledger entry not found")
 // ErrReversalRejected is returned when a reversal violates the append-only
 // ledger rules (wrong type, wrong sign, wrong currency or over-reversal).
 var ErrReversalRejected = errors.New("reversal rejected")
+
+// ErrExportRange is returned when an export window is inverted or too wide.
+var ErrExportRange = errors.New("export range is invalid")
 
 const mysqlDuplicateEntry = 1062
 
@@ -222,6 +226,8 @@ type Reversal struct {
 	EntryID      string
 	AmountMicros domain.Micros // positive magnitude; stored negated
 	Reason       string
+	Actor        string
+	RequestID    string
 }
 
 // AppendPayableReversal appends a reversal entry. Partial reversals are allowed
@@ -302,10 +308,161 @@ func (s *Store) AppendPayableReversal(ctx context.Context, reversal Reversal) (s
 	if err != nil {
 		return "", fmt.Errorf("insert payable reversal: %w", err)
 	}
+	if err := appendReversalAudit(ctx, tx, s.tenant, entryBytes, originalBytes,
+		int64(reversal.AmountMicros), reversal, now); err != nil {
+		return "", err
+	}
 	if err := tx.Commit(); err != nil {
 		return "", fmt.Errorf("commit payable reversal: %w", err)
 	}
 	return entryID, nil
+}
+
+// PublisherTotal aggregates one publisher over an export window.
+type PublisherTotal struct {
+	PublisherID      string `json:"publisher_id"`
+	Currency         string `json:"currency"`
+	BillableMicros   int64  `json:"billable_micros"`
+	ReversalMicros   int64  `json:"reversal_micros"`
+	NetPayableMicros int64  `json:"net_payable_micros"`
+	EntryCount       int    `json:"entry_count"`
+}
+
+// ExportSummary is the read-only reconciliation view of the payable ledger.
+// It is not a payment instruction.
+type ExportSummary struct {
+	From        string           `json:"from,omitempty"`
+	To          string           `json:"to,omitempty"`
+	GeneratedAt time.Time        `json:"generated_at"`
+	Totals      []PublisherTotal `json:"totals"`
+}
+
+// ExportPayable aggregates the ledger by publisher for an occurred_at window.
+// Net payable is billable minus reversals; nothing here is paid out.
+func (s *Store) ExportPayable(ctx context.Context, from, to time.Time) (ExportSummary, error) {
+	if !from.IsZero() && !to.IsZero() && to.Before(from) {
+		return ExportSummary{}, fmt.Errorf("%w: to must not precede from", ErrExportRange)
+	}
+	if !from.IsZero() && !to.IsZero() && to.Sub(from) > 400*24*time.Hour {
+		return ExportSummary{}, fmt.Errorf("%w: window must not exceed 400 days", ErrExportRange)
+	}
+	query := `SELECT publisher_id, currency,
+		COALESCE(SUM(CASE WHEN entry_type = 'billable' THEN amount_micros ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN entry_type = 'reversal' THEN -amount_micros ELSE 0 END), 0),
+		COUNT(*)
+		FROM publisher_payable_ledger WHERE tenant_id = ?`
+	args := []any{s.tenant}
+	if !from.IsZero() {
+		query += " AND occurred_at >= ?"
+		args = append(args, from.UTC())
+	}
+	if !to.IsZero() {
+		query += " AND occurred_at < ?"
+		args = append(args, to.UTC())
+	}
+	query += " GROUP BY publisher_id, currency ORDER BY publisher_id"
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return ExportSummary{}, fmt.Errorf("export payable ledger: %w", err)
+	}
+	defer rows.Close()
+
+	summary := ExportSummary{GeneratedAt: time.Now().UTC(), Totals: []PublisherTotal{}}
+	if !from.IsZero() {
+		summary.From = from.UTC().Format(time.RFC3339)
+	}
+	if !to.IsZero() {
+		summary.To = to.UTC().Format(time.RFC3339)
+	}
+	for rows.Next() {
+		var publisher []byte
+		var total PublisherTotal
+		if err := rows.Scan(&publisher, &total.Currency, &total.BillableMicros,
+			&total.ReversalMicros, &total.EntryCount); err != nil {
+			return ExportSummary{}, fmt.Errorf("scan payable export: %w", err)
+		}
+		total.PublisherID = hex.EncodeToString(publisher)
+		total.NetPayableMicros = total.BillableMicros - total.ReversalMicros
+		summary.Totals = append(summary.Totals, total)
+	}
+	return summary, rows.Err()
+}
+
+func appendReversalAudit(ctx context.Context, tx *sql.Tx, tenant, entryBytes, originalBytes []byte,
+	amount int64, reversal Reversal, now time.Time) error {
+	auditID, err := domain.NewUUIDv7()
+	if err != nil {
+		return fmt.Errorf("create audit id: %w", err)
+	}
+	auditBytes, _ := hex.DecodeString(auditID)
+	actor := strings.TrimSpace(reversal.Actor)
+	if actor == "" {
+		actor = "finance-operator"
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO publisher_payable_audit
+		(tenant_id, audit_id, entry_id, reverses_entry_id, action, amount_micros, reason, actor, request_id, recorded_at)
+		VALUES (?, ?, ?, ?, 'reversal', ?, ?, ?, ?, ?)`,
+		tenant, auditBytes, entryBytes, originalBytes, -amount, reversal.Reason, actor,
+		nullString(reversal.RequestID), now)
+	if err != nil {
+		return fmt.Errorf("insert payable reversal audit: %w", err)
+	}
+	return nil
+}
+
+// AuditEntry is one immutable ledger adjustment record.
+type AuditEntry struct {
+	AuditID      string    `json:"audit_id"`
+	EntryID      string    `json:"entry_id"`
+	Reverses     string    `json:"reverses_entry_id,omitempty"`
+	Action       string    `json:"action"`
+	AmountMicros int64     `json:"amount_micros"`
+	Reason       string    `json:"reason"`
+	Actor        string    `json:"actor"`
+	RequestID    string    `json:"request_id,omitempty"`
+	RecordedAt   time.Time `json:"recorded_at"`
+}
+
+// ListPayableAudit returns the newest adjustment audit rows.
+func (s *Store) ListPayableAudit(ctx context.Context, limit int) ([]AuditEntry, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT audit_id, entry_id, reverses_entry_id, action,
+		amount_micros, reason, actor, request_id, recorded_at
+		FROM publisher_payable_audit WHERE tenant_id = ? ORDER BY recorded_at DESC LIMIT ?`, s.tenant, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list payable audit: %w", err)
+	}
+	defer rows.Close()
+
+	entries := []AuditEntry{}
+	for rows.Next() {
+		var auditID, entryID []byte
+		var reverses []byte
+		var requestID sql.NullString
+		var entry AuditEntry
+		if err := rows.Scan(&auditID, &entryID, &reverses, &entry.Action, &entry.AmountMicros,
+			&entry.Reason, &entry.Actor, &requestID, &entry.RecordedAt); err != nil {
+			return nil, fmt.Errorf("scan payable audit: %w", err)
+		}
+		entry.AuditID = hex.EncodeToString(auditID)
+		entry.EntryID = hex.EncodeToString(entryID)
+		if len(reverses) > 0 {
+			entry.Reverses = hex.EncodeToString(reverses)
+		}
+		entry.RequestID = requestID.String
+		entries = append(entries, entry)
+	}
+	return entries, rows.Err()
+}
+
+func nullString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
 }
 
 func isDuplicate(err error) bool {

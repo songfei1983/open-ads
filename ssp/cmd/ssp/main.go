@@ -132,7 +132,7 @@ func main() {
 		if cfg.AdminToken != "" {
 			runtimeReader := &sspRuntime.Reader{Client: valkeyClient, Tenant: cfg.AdminTenantID}
 			adminMux := http.NewServeMux()
-			ledgerAdmin := ledger.NewAdminHandler(ledgerStore, cfg.AdminToken)
+			ledgerAdmin := ledger.NewAdminHandler(ledgerStore, cfg.AdminToken, cfg.FinanceToken)
 			// ServeMux matches a trailing-slash pattern as a subtree; the bare
 			// pattern only matches the collection path itself.
 			adminMux.Handle("/admin/v1/billable-outbox", ledgerAdmin)

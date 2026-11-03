@@ -26,8 +26,11 @@ type Config struct {
 	DBName     string
 
 	// Admin API is enabled only when both fields are configured.
-	AdminTenantID   string
-	AdminToken      string
+	AdminTenantID string
+	AdminToken    string
+	// FinanceToken optionally authorises the spend ledger surface. When unset
+	// the admin token also grants it (sandbox default).
+	FinanceToken    string
 	ConfigPublisher bool
 	AssetStoreRoot  string
 
@@ -105,6 +108,7 @@ func Load() (*Config, error) {
 		DBName:            getEnv("DSP_DB_NAME", "dsp_db"),
 		AdminTenantID:     getEnv("DSP_ADMIN_TENANT_ID", ""),
 		AdminToken:        getEnv("DSP_ADMIN_TOKEN", ""),
+		FinanceToken:      getEnv("DSP_FINANCE_TOKEN", ""),
 		ConfigPublisher:   configPublisher,
 		AssetStoreRoot:    getEnv("OPENADS_ASSET_STORE_ROOT", "/var/openads/assets/dsp-write"),
 		ValkeyAddr:        valkeyAddr,

@@ -45,6 +45,7 @@ func newStore(t *testing.T) (*ledger.Store, *sql.DB, string) {
 	t.Cleanup(func() {
 		for _, query := range []string{
 			`DELETE FROM ssp_billable_outbox WHERE tenant_id = UNHEX(?)`,
+			`DELETE FROM publisher_payable_audit WHERE tenant_id = UNHEX(?)`,
 			`DELETE FROM publisher_payable_ledger WHERE tenant_id = UNHEX(?) AND entry_type = 'reversal'`,
 			`DELETE FROM publisher_payable_ledger WHERE tenant_id = UNHEX(?)`,
 			`DELETE FROM ssp_delivery_event WHERE tenant_id = UNHEX(?)`,
@@ -319,7 +320,69 @@ func TestAdminHandlerRoutesLedgerEndpoints(t *testing.T) {
 	if code := do(http.MethodGet, "/admin/v1/billable-outbox?limit=5", "", true).Code; code != http.StatusOK {
 		t.Fatalf("list outbox = %d, want 200", code)
 	}
+	if code := do(http.MethodGet, "/admin/v1/publisher-payable/audit?limit=5", "", true).Code; code != http.StatusOK {
+		t.Fatalf("list audit = %d, want 200", code)
+	}
+	if code := do(http.MethodGet, "/admin/v1/publisher-payable/export", "", true).Code; code != http.StatusOK {
+		t.Fatalf("export = %d, want 200", code)
+	}
+	if code := do(http.MethodGet, "/admin/v1/publisher-payable/export?from=not-a-time", "", true).Code; code != http.StatusBadRequest {
+		t.Fatalf("invalid export range = %d, want 400", code)
+	}
 	if code := do(http.MethodGet, "/admin/v1/publisher-payable/unknown", "", true).Code; code != http.StatusNotFound {
 		t.Fatalf("unknown route = %d, want 404", code)
+	}
+}
+
+func TestPayableAuditAndExport(t *testing.T) {
+	store, _, _ := newStore(t)
+	ctx := context.Background()
+	imp := sampleImpression(t)
+	if _, err := store.RecordImpression(ctx, imp); err != nil {
+		t.Fatalf("record impression: %v", err)
+	}
+	entries, err := store.ListPayable(ctx, 10)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("list payable: %v (%d entries)", err, len(entries))
+	}
+	original := entries[0]
+
+	if _, err := store.AppendPayableReversal(ctx, ledger.Reversal{
+		EntryID: original.EntryID, AmountMicros: 1000, Reason: "operator correction",
+		Actor: "finance.sandbox", RequestID: "req-42",
+	}); err != nil {
+		t.Fatalf("append reversal: %v", err)
+	}
+
+	audit, err := store.ListPayableAudit(ctx, 10)
+	if err != nil {
+		t.Fatalf("list audit: %v", err)
+	}
+	if len(audit) != 1 {
+		t.Fatalf("audit rows = %d, want 1", len(audit))
+	}
+	if audit[0].Action != "reversal" || audit[0].AmountMicros != -1000 ||
+		audit[0].Actor != "finance.sandbox" || audit[0].RequestID != "req-42" ||
+		audit[0].Reverses != original.EntryID {
+		t.Fatalf("audit row = %+v", audit[0])
+	}
+
+	summary, err := store.ExportPayable(ctx, time.Time{}, time.Time{})
+	if err != nil {
+		t.Fatalf("export payable: %v", err)
+	}
+	if len(summary.Totals) != 1 {
+		t.Fatalf("export totals = %d, want 1", len(summary.Totals))
+	}
+	total := summary.Totals[0]
+	if total.BillableMicros != 2500 || total.ReversalMicros != 1000 || total.NetPayableMicros != 1500 {
+		t.Fatalf("export total = %+v, want billable 2500 / reversal 1000 / net 1500", total)
+	}
+	if total.PublisherID != imp.PublisherID {
+		t.Fatalf("export publisher = %q, want %q", total.PublisherID, imp.PublisherID)
+	}
+
+	if _, err := store.ExportPayable(ctx, time.Now().Add(time.Hour), time.Now()); !errors.Is(err, ledger.ErrExportRange) {
+		t.Fatalf("inverted range error = %v, want ErrExportRange", err)
 	}
 }

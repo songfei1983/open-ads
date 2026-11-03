@@ -40,6 +40,8 @@ migration-check:
 	@test -s ssp/migrations/000002_ssp_control_plane.down.sql
 	@test -s ssp/migrations/000003_ssp_ledger.up.sql
 	@test -s ssp/migrations/000003_ssp_ledger.down.sql
+	@test -s ssp/migrations/000004_ssp_ledger_audit.up.sql
+	@test -s ssp/migrations/000004_ssp_ledger_audit.down.sql
 	@test -s dsp/migrations/000001_init_dsp_schema.up.sql
 	@test -s dsp/migrations/000001_init_dsp_schema.down.sql
 	@test -s dsp/migrations/000002_add_dsp_creative_asset_registry.up.sql
@@ -50,6 +52,8 @@ migration-check:
 	@test -s dsp/migrations/000004_dsp_quarantine_resolution.down.sql
 	@test -s dsp/migrations/000005_dsp_spend_ledger_constraints.up.sql
 	@test -s dsp/migrations/000005_dsp_spend_ledger_constraints.down.sql
+	@test -s dsp/migrations/000006_dsp_spend_audit.up.sql
+	@test -s dsp/migrations/000006_dsp_spend_audit.down.sql
 	@test -s dmp/migrations/000001_init_dmp_schema.up.sql
 	@test -s dmp/migrations/000001_init_dmp_schema.down.sql
 	@test -s dmp/migrations/000002_dmp_control_plane.up.sql

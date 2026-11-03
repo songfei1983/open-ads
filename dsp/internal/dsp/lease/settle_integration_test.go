@@ -78,6 +78,7 @@ func seedLineItem(t *testing.T, ctx context.Context, db *sql.DB, tenant, adverti
 		tenantHex := hex.EncodeToString(tenant)
 		cleanup := []string{
 			`DELETE FROM dsp_notice_quarantine WHERE tenant_id = UNHEX(?)`,
+			`DELETE FROM advertiser_spend_audit WHERE tenant_id = UNHEX(?)`,
 			`DELETE FROM advertiser_spend_ledger WHERE tenant_id = UNHEX(?) AND entry_type = 'reversal'`,
 			`DELETE FROM advertiser_spend_ledger WHERE tenant_id = UNHEX(?)`,
 			`DELETE FROM dsp_delivery_event WHERE tenant_id = UNHEX(?)`,
@@ -497,5 +498,202 @@ func TestAppendSpendReversalRules(t *testing.T) {
 	}
 	if reversed != 2500 {
 		t.Fatalf("cumulative reversed = %d, want 2500", reversed)
+	}
+}
+
+func TestRecordWinNoticeIsIdempotentAndNeverSpends(t *testing.T) {
+	db := newIntegrationDB(t)
+	ctx := context.Background()
+
+	tenantBytes := randomHex(t, 16)
+	advertiserBytes := randomHex(t, 16)
+	campaignBytes := randomHex(t, 16)
+	lineItemBytes := randomHex(t, 16)
+	seedLineItem(t, ctx, db, tenantBytes, advertiserBytes, campaignBytes, lineItemBytes, "USD")
+
+	tenantID := hex.EncodeToString(tenantBytes)
+	store, err := lease.NewSQLBudgetStore(db, tenantID)
+	if err != nil {
+		t.Fatalf("new budget store: %v", err)
+	}
+	notice := lease.WinNotice{
+		ReservationID: randomUUIDString(t),
+		LineItemID:    hex.EncodeToString(lineItemBytes),
+		AuctionID:     "auction-win",
+		BidID:         "bid-win",
+		ImpID:         "1",
+		Currency:      "USD",
+		OccurredAt:    time.Now().UTC(),
+	}
+	if err := store.RecordWinNotice(ctx, notice); err != nil {
+		t.Fatalf("record win: %v", err)
+	}
+	if err := store.RecordWinNotice(ctx, notice); err != nil {
+		t.Fatalf("record win replay: %v", err)
+	}
+
+	var events int
+	var eventType string
+	var amount sql.NullInt64
+	var advertiserRead, lineItemRead []byte
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM dsp_delivery_event WHERE tenant_id = ?`, tenantBytes).Scan(&events); err != nil {
+		t.Fatalf("count win events: %v", err)
+	}
+	if events != 1 {
+		t.Fatalf("win events = %d, want 1", events)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT event_type, amount_micros, advertiser_id, line_item_id
+		FROM dsp_delivery_event WHERE tenant_id = ?`, tenantBytes).Scan(&eventType, &amount, &advertiserRead, &lineItemRead); err != nil {
+		t.Fatalf("read win event: %v", err)
+	}
+	if eventType != "win" || amount.Valid {
+		t.Fatalf("win event = %s amount valid=%v, want win with NULL amount", eventType, amount.Valid)
+	}
+	if hex.EncodeToString(advertiserRead) != hex.EncodeToString(advertiserBytes) ||
+		hex.EncodeToString(lineItemRead) != hex.EncodeToString(lineItemBytes) {
+		t.Fatalf("win event attribution does not match the seeded line item")
+	}
+
+	var spends, settlements int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM advertiser_spend_ledger WHERE tenant_id = ?`, tenantBytes).Scan(&spends); err != nil {
+		t.Fatalf("count spend ledger: %v", err)
+	}
+	if spends != 0 {
+		t.Fatalf("spend entries = %d, want 0 for a non-billable win", spends)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM budget_reservation_settlement WHERE tenant_id = ?`, tenantBytes).Scan(&settlements); err != nil {
+		t.Fatalf("count settlements: %v", err)
+	}
+	if settlements != 0 {
+		t.Fatalf("settlements = %d, want 0 for a non-billable win", settlements)
+	}
+}
+
+func TestSpendAuditRecordsOperatorAndReason(t *testing.T) {
+	db := newIntegrationDB(t)
+	ctx := context.Background()
+
+	tenantBytes := randomHex(t, 16)
+	advertiserBytes := randomHex(t, 16)
+	campaignBytes := randomHex(t, 16)
+	lineItemBytes := randomHex(t, 16)
+	seedLineItem(t, ctx, db, tenantBytes, advertiserBytes, campaignBytes, lineItemBytes, "USD")
+
+	tenantID := hex.EncodeToString(tenantBytes)
+	store, err := lease.NewSQLBudgetStore(db, tenantID)
+	if err != nil {
+		t.Fatalf("new budget store: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := store.EnsureAccount(ctx, hex.EncodeToString(lineItemBytes), "daily", now, "USD", 10_000_000); err != nil {
+		t.Fatalf("ensure account: %v", err)
+	}
+	grant, err := store.AllocateLease(ctx, hex.EncodeToString(lineItemBytes), "daily", now, "audit-test", 2500, 30*time.Second)
+	if err != nil {
+		t.Fatalf("allocate lease: %v", err)
+	}
+	if err := store.SettleReservation(ctx, lease.SettlementParams{
+		TenantID:       tenantID,
+		ReservationID:  randomUUIDString(t),
+		Outcome:        lease.OutcomeBillable,
+		ActualAmount:   domain.Micros(2500),
+		Currency:       "USD",
+		SourceEventKey: hex.EncodeToString(randomHex(t, 32)),
+		Demands:        []lease.Demand{{ScopeID: grant.ScopeID, AmountMicros: 2500}},
+		LeaseIDs:       map[string]string{grant.ScopeID: grant.LeaseID},
+		EventID:        randomUUIDString(t),
+		AuctionID:      "auction-audit",
+		BidID:          "bid-audit",
+		ImpID:          "1",
+		OccurredAt:     now,
+	}); err != nil {
+		t.Fatalf("settle billable: %v", err)
+	}
+	entries, err := store.ListSpendLedger(ctx, 10)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("list spend ledger: %v (%d entries)", err, len(entries))
+	}
+
+	if _, err := store.AppendSpendReversalWithAudit(ctx, entries[0].EntryID, domain.Micros(500),
+		"operator correction", "finance.sandbox", "req-7"); err != nil {
+		t.Fatalf("append reversal: %v", err)
+	}
+	audit, err := store.ListSpendAudit(ctx, 10)
+	if err != nil {
+		t.Fatalf("list spend audit: %v", err)
+	}
+	if len(audit) != 1 {
+		t.Fatalf("audit rows = %d, want 1", len(audit))
+	}
+	if audit[0].Action != "reversal" || audit[0].AmountMicros != -500 ||
+		audit[0].Actor != "finance.sandbox" || audit[0].RequestID != "req-7" {
+		t.Fatalf("audit row = %+v", audit[0])
+	}
+}
+
+func TestSettleReservationQuarantinesLeaseUnderflow(t *testing.T) {
+	db := newIntegrationDB(t)
+	ctx := context.Background()
+
+	tenantBytes := randomHex(t, 16)
+	advertiserBytes := randomHex(t, 16)
+	campaignBytes := randomHex(t, 16)
+	lineItemBytes := randomHex(t, 16)
+	seedLineItem(t, ctx, db, tenantBytes, advertiserBytes, campaignBytes, lineItemBytes, "USD")
+
+	tenantID := hex.EncodeToString(tenantBytes)
+	lineItemID := hex.EncodeToString(lineItemBytes)
+	store, err := lease.NewSQLBudgetStore(db, tenantID)
+	if err != nil {
+		t.Fatalf("new budget store: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := store.EnsureAccount(ctx, lineItemID, "daily", now, "USD", 10_000_000); err != nil {
+		t.Fatalf("ensure account: %v", err)
+	}
+	grant, err := store.AllocateLease(ctx, lineItemID, "daily", now, "drift-test", 2500, 30*time.Second)
+	if err != nil {
+		t.Fatalf("allocate lease: %v", err)
+	}
+	// Simulate Valkey/MariaDB drift: the account no longer carries the hold.
+	if _, err := db.ExecContext(ctx, `UPDATE budget_account SET leased_micros = 0
+		WHERE tenant_id = ? AND budget_scope = 'daily'`, tenantBytes); err != nil {
+		t.Fatalf("simulate drift: %v", err)
+	}
+
+	if err := store.SettleReservation(ctx, lease.SettlementParams{
+		TenantID:       tenantID,
+		ReservationID:  randomUUIDString(t),
+		Outcome:        lease.OutcomeBillable,
+		ActualAmount:   domain.Micros(2500),
+		Currency:       "USD",
+		SourceEventKey: hex.EncodeToString(randomHex(t, 32)),
+		Demands:        []lease.Demand{{ScopeID: grant.ScopeID, AmountMicros: 2500}},
+		LeaseIDs:       map[string]string{grant.ScopeID: grant.LeaseID},
+		EventID:        randomUUIDString(t),
+		AuctionID:      "auction-drift",
+		BidID:          "bid-drift",
+		ImpID:          "1",
+		OccurredAt:     now,
+	}); err != nil {
+		t.Fatalf("settle with drift: %v", err)
+	}
+
+	var quarantined int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM dsp_notice_quarantine
+		WHERE tenant_id = ? AND reason_code = 'leased_underflow'`, tenantBytes).Scan(&quarantined); err != nil {
+		t.Fatalf("count drift quarantine: %v", err)
+	}
+	if quarantined != 1 {
+		t.Fatalf("underflow quarantine rows = %d, want 1", quarantined)
+	}
+
+	var spent int64
+	if err := db.QueryRowContext(ctx, `SELECT spent_micros FROM budget_account
+		WHERE tenant_id = ? AND budget_scope = 'daily'`, tenantBytes).Scan(&spent); err != nil {
+		t.Fatalf("read spent: %v", err)
+	}
+	if spent != 2500 {
+		t.Fatalf("spent_micros = %d, want 2500 (money must still be recorded)", spent)
 	}
 }

@@ -89,10 +89,26 @@ CI（`.github/workflows/go.yml`）已加入上述真库账务测试与 filled-pa
 
 ## 6. 已知限制与后续项
 
-1. **Publisher 结算导出**：`publisher_payable_ledger` 只到应付金额；付款/开票/对账单导出属后续用例（D-05 仍限 sandbox）。
-2. **运行时 lease 与账本双写**：热路径租约仍在 Valkey，MariaDB 结算行按 reservation 物化。生产化建议把 lease 生命周期收敛到单一权威存储，或在结算前显式对账，避免两套状态长期并存。
-3. **nurl 无持久记录**：win notice 只返回 200 并计数，未写 `dsp_delivery_event`（非计费事件），如需投放归因报表需补。
-4. **Outbox 跨实例**：`FOR UPDATE SKIP LOCKED` + 60s claim 租约支持多实例，但未做多实例并发压测。
-5. **管理面授权**：SSP/DSP 账务管理接口仍是共享 bearer token；D-01 关闭后需按角色（finance-operator）与 mTLS 身份收敛。
-6. **冲正审计**：冲正记录 `reason` 仅进入账本引用的 `resolution_reason`/日志，尚无独立不可变审计表。
-7. **多币种**：仅支持单一币种精确匹配，无汇率换算。
+| # | 项 | 状态 | 说明 |
+|---|---|---|---|
+| 1 | Publisher 结算导出 | ✅ 只读导出已交付 | `GET /admin/v1/publisher-payable/export?from=&to=` 按 publisher/currency 汇总 billable、reversal 与 net payable；**不是付款指令**，无发票/付款状态（D-05 仍限 sandbox）。 |
+| 2 | 运行时 lease 与账本双写 | ⚠️ 已加防护，未收敛 | 结算前检查 `budget_account.leased_micros`，不足时仍记账但写 `dsp_notice_quarantine(reason_code=leased_underflow)`；彻底收敛（单一权威存储）需架构决策。 |
+| 3 | nurl 无持久记录 | ✅ 已补齐 | win notice 携带 `ref`，DSP 解析后写 `dsp_delivery_event(event_type='win', amount_micros=NULL)`，幂等且不动预算/账本。 |
+| 4 | Outbox 跨实例 | ✅ 已验证 | 新增两 sender 并发测试：12 个事件、5 轮抢占，每个事件恰好投递一次（`FOR UPDATE SKIP LOCKED` + 60s claim 租约）。 |
+| 5 | 管理面授权 | ⚠️ 部分 | 账务接口支持独立 `SSP_FINANCE_TOKEN`／`DSP_FINANCE_TOKEN`（未配置时回落到 admin token）；角色化 + mTLS 仍待 D-01。 |
+| 6 | 冲正审计 | ✅ 已交付 | 新增 `publisher_payable_audit`／`advertiser_spend_audit`（与分录同事务写入，含 amount/reason/actor/request_id），并提供只读 `GET .../audit`。 |
+| 7 | 多币种 | ❌ 未做 | 仍为单币种精确匹配；汇率与跨币种对账属产品/财务决策。 |
+| 8 | 付款/开票 | ❌ 未做 | 账本只到应付金额；实际 payout/remittance 与付款状态是独立用例。 |
+
+## 7. 后续收敛记录（2026-11-03 第二轮）
+
+在上述 §6 基础上继续收敛，均带真库或实机证据：
+
+| 项 | 变更 | 证据 |
+|---|---|---|
+| 冲正审计 | 迁移 [ssp/000004](../../../ssp/migrations/000004_ssp_ledger_audit.up.sql)、[dsp/000006](../../../dsp/migrations/000006_dsp_spend_audit.up.sql)；冲正与审计同事务写入；`GET /admin/v1/publisher-payable/audit`、`GET /admin/v1/spend-ledger/audit` | 真库测试断言 action/amount/actor/request_id；实机 `X-Actor: finance.sandbox` 写入并回读 |
+| 结算导出 | `Store.ExportPayable` + `GET /admin/v1/publisher-payable/export`（≤400 天窗口，倒置区间 400） | 真库测试断言 billable 2500 / reversal 1000 / net 1500；实机按月窗口返回各 publisher 汇总 |
+| win 归因 | `ReservationClaims.LineItemID`；nurl/lurl 均带 `ref`；`RecordWinNotice` 写非计费事件 | 真库测试断言 `win` + NULL 金额 + 正确归属，且无 spend/settlement |
+| lease 漂移 | 结算前读 `leased_micros`，不足即写 `leased_underflow` quarantine | 真库测试：注入漂移后仍记 spent=2500 且 quarantine=1 |
+| 多实例 outbox | 并发 sender 测试 | 12 事件 × 2 sender × 5 轮，投递次数严格为 1 |
+| 财务 token | `SSP_FINANCE_TOKEN`／`DSP_FINANCE_TOKEN` 可独立授权账务接口 | 配置项接入，未配置时回落 admin token（保持沙箱可用） |
