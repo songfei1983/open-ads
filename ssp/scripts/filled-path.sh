@@ -178,7 +178,13 @@ echo "$second" | grep -q '"status":"duplicate"'
 
 echo "==> publisher payable is booked exactly once"
 auction_id="$(echo "$sdk" | python3 -c 'import json,sys; print(json.load(sys.stdin)["diagnostics"]["auction_id"])')"
-expected_amount="$((BID_CPM_MICROS / 1000))"
+# Mirror domain.CalculateBillableFromCPM: round_half_even(cpm * 1 / 1000).
+expected_amount="$(python3 -c '
+import sys
+cpm = int(sys.argv[1])
+quotient, remainder = divmod(cpm, 1000)
+print(quotient + (1 if remainder > 500 or (remainder == 500 and quotient % 2) else 0))
+' "$BID_CPM_MICROS")"
 curl --fail --silent -H "Authorization: Bearer ${SSP_ADMIN_TOKEN}" \
   "$SSP_BASE/admin/v1/publisher-payable?limit=50" | python3 -c '
 import json, sys
