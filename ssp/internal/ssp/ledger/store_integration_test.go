@@ -6,7 +6,10 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -264,5 +267,59 @@ func TestAppendPayableReversalEnforcesAppendOnlyRules(t *testing.T) {
 	}
 	if _, err := store.AppendPayableReversal(ctx, ledger.Reversal{EntryID: reversal, AmountMicros: 1, Reason: "chained"}); !errors.Is(err, ledger.ErrReversalRejected) {
 		t.Fatalf("chained reversal error = %v, want ErrReversalRejected", err)
+	}
+}
+
+func TestAdminHandlerRoutesLedgerEndpoints(t *testing.T) {
+	store, _, _ := newStore(t)
+	ctx := context.Background()
+	imp := sampleImpression(t)
+	imp.BURLTarget = ""
+	if _, err := store.RecordImpression(ctx, imp); err != nil {
+		t.Fatalf("record impression: %v", err)
+	}
+	entries, err := store.ListPayable(ctx, 10)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("list payable: %v (%d entries)", err, len(entries))
+	}
+	entryID := entries[0].EntryID
+
+	handler := ledger.NewAdminHandler(store, "admin-secret")
+	do := func(method, path, body string, authorize bool) *httptest.ResponseRecorder {
+		t.Helper()
+		request := httptest.NewRequest(method, path, strings.NewReader(body))
+		if authorize {
+			request.Header.Set("Authorization", "Bearer admin-secret")
+		}
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	if code := do(http.MethodGet, "/admin/v1/publisher-payable", "", false).Code; code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated list = %d, want 401", code)
+	}
+	if code := do(http.MethodGet, "/admin/v1/publisher-payable", "", true).Code; code != http.StatusOK {
+		t.Fatalf("list payable = %d, want 200", code)
+	}
+	reversal := do(http.MethodPost, "/admin/v1/publisher-payable/"+entryID+":reversal",
+		`{"amount_micros":1000,"reason":"partial"}`, true)
+	if reversal.Code != http.StatusCreated {
+		t.Fatalf("reversal = %d (%s), want 201", reversal.Code, reversal.Body.String())
+	}
+	replay := do(http.MethodPost, "/admin/v1/publisher-payable/"+entryID+":reversal",
+		`{"amount_micros":1000,"reason":"partial"}`, true)
+	if replay.Code != http.StatusCreated || replay.Body.String() != reversal.Body.String() {
+		t.Fatalf("replayed reversal = %d (%s), want the first entry", replay.Code, replay.Body.String())
+	}
+	if over := do(http.MethodPost, "/admin/v1/publisher-payable/"+entryID+":reversal",
+		`{"amount_micros":9000,"reason":"too much"}`, true); over.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("over reversal = %d, want 422", over.Code)
+	}
+	if code := do(http.MethodGet, "/admin/v1/billable-outbox?limit=5", "", true).Code; code != http.StatusOK {
+		t.Fatalf("list outbox = %d, want 200", code)
+	}
+	if code := do(http.MethodGet, "/admin/v1/publisher-payable/unknown", "", true).Code; code != http.StatusNotFound {
+		t.Fatalf("unknown route = %d, want 404", code)
 	}
 }

@@ -78,7 +78,9 @@ func main() {
 			store.SetAssetStore(assetStore)
 			server.SetAssetStore(assetStore)
 			adminMux := http.NewServeMux()
-			adminMux.Handle("/admin/v1/spend-ledger", lease.NewAdminHandler(budgetStore, cfg.AdminToken))
+			spendLedgerAdmin := lease.NewAdminHandler(budgetStore, cfg.AdminToken)
+			adminMux.Handle("/admin/v1/spend-ledger", spendLedgerAdmin)
+			adminMux.Handle("/admin/v1/spend-ledger/", spendLedgerAdmin)
 			adminMux.Handle("/", control.NewHandler(store, cfg.AdminToken, control.SSPSyncConfig{
 				BaseURL: cfg.SSPInternalURL, Token: cfg.SSPInternalToken, EndpointID: cfg.SSPEndpointID,
 			}))
