@@ -43,6 +43,11 @@ type Config struct {
 	LeaseKeyVersion string
 	LeaseTokenKey   string
 
+	// SSP creative whitelist sync (DSP is the only writer).
+	SSPInternalURL   string
+	SSPInternalToken string
+	SSPEndpointID    string
+
 	// Bidder timeouts
 	BidTimeout time.Duration
 
@@ -108,6 +113,9 @@ func Load() (*Config, error) {
 		ValkeyTLS:         valkeyTLS,
 		CreativeWhitelist: creativeWhitelist,
 		BaseNoticeURL:     strings.TrimRight(getEnv("DSP_BASE_NOTICE_URL", fmt.Sprintf("http://127.0.0.1:%d", port)), "/"),
+		SSPInternalURL:    strings.TrimRight(getEnv("SSP_INTERNAL_URL", ""), "/"),
+		SSPInternalToken:  getEnv("SSP_INTERNAL_TOKEN", ""),
+		SSPEndpointID:     strings.ToLower(strings.ReplaceAll(getEnv("SSP_DSP_ENDPOINT_ID", ""), "-", "")),
 		LeaseKeyVersion:   leaseKeyVersion,
 		LeaseTokenKey:     leaseTokenKey,
 		BidTimeout:        time.Duration(bidTimeout) * time.Millisecond,
@@ -134,6 +142,16 @@ func Load() (*Config, error) {
 	}
 	if cfg.AdminToken != "" && (cfg.AdminTenantID == "" || len(cfg.AdminToken) < 32) {
 		return nil, fmt.Errorf("DSP_ADMIN_TOKEN requires DSP_ADMIN_TENANT_ID and must be at least 32 characters")
+	}
+	if cfg.SSPInternalURL != "" {
+		if cfg.SSPInternalToken == "" {
+			return nil, fmt.Errorf("SSP_INTERNAL_URL requires SSP_INTERNAL_TOKEN")
+		}
+		if cfg.SSPEndpointID != "" {
+			if err := domain.ValidateUUID32(cfg.SSPEndpointID); err != nil {
+				return nil, fmt.Errorf("invalid SSP_DSP_ENDPOINT_ID: %w", err)
+			}
+		}
 	}
 	if (adminEnabled || cfg.ConfigPublisher) && cfg.AdminTenantID == "" {
 		return nil, fmt.Errorf("DSP_ADMIN_TENANT_ID is required when enabling admin API or config publisher")

@@ -176,7 +176,7 @@ func TestOpenRTBBidReturnsValidBidWithReservation(t *testing.T) {
 		Creatives: map[string]domain.Creative{
 			"cr-1": {
 				ID: "cr-1", Active: true,
-				AssetMeta: domain.AssetMeta{MIMEType: "image/png", SizeKB: 50, Hash: "sha256:123", Host: "cdn.example.com"},
+				AssetMeta: domain.AssetMeta{MIMEType: "image/png", SizeKB: 50, Hash: "bbbb000000000000000000000000000000000000000000000000000000000000", Host: "cdn.example.com", AssetRef: "as:00000000000000000000000000000001:bbbb000000000000000000000000000000000000000000000000000000000000", Width: 728, Height: 90, LandingURL: "https://cdn.example.com/landing"},
 			},
 		},
 	}

@@ -70,7 +70,9 @@ func main() {
 			defer assetStore.Close()
 			store.SetAssetStore(assetStore)
 			server.SetAssetStore(assetStore)
-			server.SetAdminHandler(control.NewHandler(store, cfg.AdminToken))
+			server.SetAdminHandler(control.NewHandler(store, cfg.AdminToken, control.SSPSyncConfig{
+				BaseURL: cfg.SSPInternalURL, Token: cfg.SSPInternalToken, EndpointID: cfg.SSPEndpointID,
+			}))
 		}
 	}
 	if tenantID != "" {

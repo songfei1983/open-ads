@@ -53,10 +53,14 @@ type Creative struct {
 
 // AssetMeta describes static asset properties used for whitelist validation.
 type AssetMeta struct {
-	MIMEType string // e.g. "image/png"
-	SizeKB   int    // size in kilobytes
-	Hash     string // content hash for integrity checking
-	Host     string // allowed landing host for click‑through URLs
+	MIMEType   string // e.g. "image/png"
+	SizeKB     int    // size in kilobytes
+	Hash       string // SHA-256 hex of the immutable asset bytes
+	Host       string // allowed landing host for click-through URLs
+	AssetRef   string // content-addressed DSP reference shared with the SSP
+	Width      int    // decoded asset width in pixels
+	Height     int    // decoded asset height in pixels
+	LandingURL string // allowlisted landing page for the click
 }
 
 // WhiteListEntry defines a simple whitelist rule for asset delivery.
